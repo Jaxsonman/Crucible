@@ -1,0 +1,16 @@
+{
+  "name": "crucible",
+  "owner": {
+    "name": "Jaxson Mansouri"
+  },
+  "metadata": {
+    "description": "Crucible: benchmark Claude model and effort configurations on your own tasks."
+  },
+  "plugins": [
+    {
+      "name": "crucible",
+      "source": "./",
+      "description": "Benchmark Claude model and effort configurations on your own real tasks."
+    }
+  ]
+}

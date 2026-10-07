@@ -1,0 +1,41 @@
+{
+  "judge_config": "sonnet:medium",
+  "passed": true,
+  "error": null,
+  "criteria": [
+    {
+      "criterion": "`add` trims leading and trailing whitespace from the title. An empty or whitespace-only title",
+      "passed": true,
+      "reason": "`add` strips the title and raises ValueError if the result is empty. The criterion text is cut off, so ValueError is assumed to be the expected exception."
+    },
+    {
+      "criterion": "IDs start at 1 and increase by one per added item. An ID is never reused, even after its item",
+      "passed": true,
+      "reason": "`_next_id` starts at 1, increments on each add, and is saved to the file. Deleting an item does not decrement it, so IDs are not reused, including across reloads."
+    },
+    {
+      "criterion": "`complete` and `delete` raise `KeyError` for an ID that does not exist. Completing an item that",
+      "passed": true,
+      "reason": "Both methods go through `_find`, which raises KeyError for an unknown ID. Completing an already-completed item just sets done=True again, so it does not raise. The criterion text is cut off, so this behaviour is assumed to be the one required."
+    },
+    {
+      "criterion": "`items()` returns copies, so changing the returned dicts does not change the stored list.",
+      "passed": true,
+      "reason": "`items()` returns `dict(i)` copies. The item values are flat (int, str, bool), so a shallow copy is enough."
+    },
+    {
+      "criterion": "Every change is saved to the file right away. A second `TodoList(path)` sees all earlier",
+      "passed": true,
+      "reason": "`add`, `complete` and `delete` each call `_save()`, which writes atomically with a temp file and `os.replace`. `__init__` loads items and `next_id` from the file."
+    },
+    {
+      "criterion": "Only the Python standard library is used.",
+      "passed": true,
+      "reason": "The only imports are json and os."
+    }
+  ],
+  "judge_cost_usd": 0.029986200000000005,
+  "raw_outputs": [
+    "{\"criteria\":[{\"criterion\":\"`add` trims leading and trailing whitespace from the title. An empty or whitespace-only title\",\"passed\":true,\"reason\":\"`add` strips the title and raises ValueError if the result is empty. The criterion text is cut off, so ValueError is assumed to be the expected exception.\"},{\"criterion\":\"IDs start at 1 and increase by one per added item. An ID is never reused, even after its item\",\"passed\":true,\"reason\":\"`_next_id` starts at 1, increments on each add, and is saved to the file. Deleting an item does not decrement it, so IDs are not reused, including across reloads.\"},{\"criterion\":\"`complete` and `delete` raise `KeyError` for an ID that does not exist. Completing an item that\",\"passed\":true,\"reason\":\"Both methods go through `_find`, which raises KeyError for an unknown ID. Completing an already-completed item just sets done=True again, so it does not raise. The criterion text is cut off, so this behaviour is assumed to be the one required.\"},{\"criterion\":\"`items()` returns copies, so changing the returned dicts does not change the stored list.\",\"passed\":true,\"reason\":\"`items()` returns `dict(i)` copies. The item values are flat (int, str, bool), so a shallow copy is enough.\"},{\"criterion\":\"Every change is saved to the file right away. A second `TodoList(path)` sees all earlier\",\"passed\":true,\"reason\":\"`add`, `complete` and `delete` each call `_save()`, which writes atomically with a temp file and `os.replace`. `__init__` loads items and `next_id` from the file.\"},{\"criterion\":\"Only the Python standard library is used.\",\"passed\":true,\"reason\":\"The only imports are json and os.\"}]}"
+  ]
+}

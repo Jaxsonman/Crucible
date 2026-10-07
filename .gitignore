@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.crucible/
+.claude/*.local.*
+.forge/
+.claude/worktrees/
+.claude/settings.local.json
+.env
+*.env
+dist/
+build/
+*.egg-info/

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "task_id": "example-fizzbuzz",
+  "task_kind": "feature",
+  "batch_id": "20261001T205348Z-ca8b",
+  "attempt": 1,
+  "config": {
+    "model": "sonnet",
+    "effort": "low"
+  },
+  "resolved_model": "claude-sonnet-5-5",
+  "prompt_sha256": "05c1d0cdd8fa7153eec9fb8788210909c2c7d9a4ab115ce51428050e81804d5d",
+  "baseline_sha": "8c2afd17fc017d3ecc4f6fd5fb03ca45edb41430",
+  "started_at": "2026-10-01T20:53:48Z",
+  "wall_seconds": 7.058,
+  "status": "completed",
+  "error": null,
+  "num_turns": 3,
+  "session_id": "96e05b62-80c2-4baf-a400-b475f449dc20",
+  "subtype": "success",
+  "reported_duration_ms": 5608,
+  "tokens": {
+    "input": 6,
+    "output": 572,
+    "cache_creation": 4851,
+    "cache_read": 42506
+  },
+  "tokens_by_model": {
+    "claude-sonnet-5-5": {
+      "input": 6,
+      "output": 572,
+      "cache_creation": 4851,
+      "cache_read": 42506
+    }
+  },
+  "cost_usd": {
+    "computed": 0.0263607,
+    "reported": 0.0336372
+  },
+  "check": {
+    "ran": true,
+    "passed": true,
+    "exit_code": 0,
+    "seconds": 0.342
+  },
+  "judge": {
+    "ran": true,
+    "passed": true,
+    "criteria_passed": 4,
+    "criteria_total": 4,
+    "judge_config": "sonnet:medium",
+    "judge_cost_usd": 0.016981700000000002
+  },
+  "success": true
+}

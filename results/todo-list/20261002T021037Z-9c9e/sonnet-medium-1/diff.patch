@@ -1,0 +1,78 @@
+diff --git a/todo.py b/todo.py
+index 717514f..02f40ac 100644
+--- a/todo.py
++++ b/todo.py
+@@ -1,18 +1,68 @@
+ """To-do list stored in a JSON file."""
+ 
++import json
++import os
++import tempfile
++
+ 
+ class TodoList:
+     def __init__(self, path):
+-        raise NotImplementedError
++        self._path = os.fspath(path)
++        self._items = []
++        self._next_id = 1
++        if os.path.exists(self._path):
++            with open(self._path, encoding="utf-8") as f:
++                data = json.load(f)
++            self._items = [
++                {"id": i["id"], "title": i["title"], "done": i["done"]}
++                for i in data["items"]
++            ]
++            # next_id is stored so IDs are never reused after a delete.
++            self._next_id = max(
++                data.get("next_id", 1), max((i["id"] for i in self._items), default=0) + 1
++            )
++
++    def _save(self):
++        data = {"next_id": self._next_id, "items": self._items}
++        directory = os.path.dirname(os.path.abspath(self._path))
++        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8") as f:
++                json.dump(data, f)
++            os.replace(tmp, self._path)
++        except BaseException:
++            if os.path.exists(tmp):
++                os.unlink(tmp)
++            raise
++
++    def _find(self, item_id):
++        for item in self._items:
++            if item["id"] == item_id:
++                return item
++        raise KeyError(item_id)
+ 
+     def add(self, title):
+-        raise NotImplementedError
++        if not isinstance(title, str):
++            raise TypeError("title must be a string")
++        title = title.strip()
++        if not title:
++            raise ValueError("title must not be empty")
++        item = {"id": self._next_id, "title": title, "done": False}
++        self._items.append(item)
++        self._next_id += 1
++        self._save()
++        return item["id"]
+ 
+     def complete(self, item_id):
+-        raise NotImplementedError
++        item = self._find(item_id)
++        if not item["done"]:
++            item["done"] = True
++            self._save()
+ 
+     def delete(self, item_id):
+-        raise NotImplementedError
++        item = self._find(item_id)
++        self._items.remove(item)
++        self._save()
+ 
+     def items(self, include_done=True):
+-        raise NotImplementedError
++        return [dict(i) for i in self._items if include_done or not i["done"]]

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Crucible shim: run the bundled CLI through uv from any directory.
+# Plugin bin/ dirs are on Claude Code's Bash PATH, but CLAUDE_PLUGIN_ROOT is not exported there,
+# so derive the plugin root from this file's own (symlink-resolved) path.
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$(dirname "$self")/$target ;;
+  esac
+done
+root=$(cd "$(dirname "$self")/.." && pwd -P)
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "crucible: 'uv' is required but was not found on PATH." >&2
+  echo "Install it from https://docs.astral.sh/uv/ (for example: curl -LsSf https://astral.sh/uv/install.sh | sh), then retry." >&2
+  exit 127
+fi
+
+# The plugin root changes with every version, so the venv lives outside it, keyed by the root.
+key=$(printf '%s' "$root" | cksum | cut -d' ' -f1)
+venvs=${CRUCIBLE_VENV_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/crucible/venvs}
+UV_PROJECT_ENVIRONMENT=$venvs/$key
+export UV_PROJECT_ENVIRONMENT
+
+exec uv run --frozen --no-editable --project "$root" crucible "$@"

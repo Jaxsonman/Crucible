@@ -1,0 +1,36 @@
+name: Bug report
+description: Something in Crucible does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands run, and the task or config involved if relevant.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Crucible version or commit
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version (`claude --version`)
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Redact secrets, tokens and personal paths before pasting.
+      render: shell

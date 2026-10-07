@@ -1,0 +1,172 @@
+"""Aggregation math for reports. Works on any list of attempt records (one task or pooled).
+
+Costs are always re-priced from `tokens_by_model` with the current pricing table; the stored
+`cost_usd.computed` is never read. See docs/design.md (Tokens and cost).
+"""
+
+import statistics
+from typing import Any
+
+from crucible import pricing
+
+Record = dict[str, Any]
+Row = dict[str, Any]
+
+
+def config_label(record: Record) -> str:
+    cfg = record.get("config") or {}
+    return f"{cfg.get('model')}:{cfg.get('effort')}"
+
+
+def total_tokens(record: Record) -> int:
+    """Sum of every token kind over every model in the record."""
+    total = 0
+    for tokens in (record.get("tokens_by_model") or {}).values():
+        total += sum(int(tokens.get(k) or 0) for k in pricing.TOKEN_KEYS.values())
+    return total
+
+
+def reprice(record: Record) -> float | None:
+    """Current-price cost of one attempt, or None if any model is unpriced."""
+    cost, _unpriced = pricing.cost_usd(record.get("tokens_by_model") or {})
+    return cost
+
+
+def _median(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
+
+def summarize_config(label: str, records: list[Record]) -> Row:
+    """Aggregate the attempts of a single config."""
+    successes_flags = [r.get("success") for r in records]
+    known = [s for s in successes_flags if s is not None]
+    successes = sum(1 for s in known if s)
+    walls = [float(r["wall_seconds"]) for r in records if r.get("wall_seconds") is not None]
+    priced = [(reprice(r), r.get("success")) for r in records]
+    costs = [c for c, _ in priced if c is not None]
+    priced_successes = sum(1 for c, s in priced if c is not None and s)
+    cost_per_success = sum(costs) / priced_successes if priced_successes else None
+    return {
+        "config": label,
+        "attempts": len(records),
+        "successes": successes,
+        "unknown": len(records) - len(known),
+        "success_rate": successes / len(known) if known else None,
+        "median_wall_seconds": _median(walls),
+        "min_wall_seconds": min(walls) if walls else None,
+        "max_wall_seconds": max(walls) if walls else None,
+        "median_tokens": _median([total_tokens(r) for r in records]),
+        "median_cost": _median(costs),
+        "cost_per_success": cost_per_success,
+        "unpriced": len(records) - len(costs),
+    }
+
+
+def _sort_key(row: Row) -> tuple:
+    rate, cost = row["success_rate"], row["median_cost"]
+    return (
+        rate is None,
+        -(rate or 0.0),
+        cost is None,
+        cost if cost is not None else 0.0,
+        row["config"],
+    )
+
+
+def aggregate_configs(records: list[Record]) -> list[Row]:
+    """Group records by config and aggregate each; sorted by success rate desc, median cost asc."""
+    groups: dict[str, list[Record]] = {}
+    for r in records:
+        groups.setdefault(config_label(r), []).append(r)
+    return sorted((summarize_config(k, v) for k, v in groups.items()), key=_sort_key)
+
+
+def task_summary(task_id: str, records: list[Record]) -> dict[str, Any]:
+    """Header facts for a set of one task's records."""
+    kinds = sorted({r["task_kind"] for r in records if r.get("task_kind")})
+    shas = sorted({r["prompt_sha256"] for r in records if r.get("prompt_sha256")})
+    return {
+        "task_id": task_id,
+        "kind": ", ".join(kinds) if kinds else None,
+        "batches": len({r.get("batch_id") for r in records}),
+        "prompt_shas": shas,
+        "prompt_changed": len(shas) > 1,
+    }
+
+
+DEFAULT_MIN_ATTEMPTS = 3
+DEFAULT_THRESHOLD = 0.8
+NO_KIND = "(no kind)"
+
+
+def _known_attempts(row: Row) -> int:
+    return row["attempts"] - row["unknown"]
+
+
+def _cheapest_key(row: Row) -> tuple:
+    """Lower median cost, then lower median wall time; unknown values sort last."""
+    cost, wall = row["median_cost"], row["median_wall_seconds"]
+    return (cost is None, cost or 0.0, wall is None, wall or 0.0, row["config"])
+
+
+def _best_rate_key(row: Row) -> tuple:
+    return (-(row["success_rate"] or 0.0), *_cheapest_key(row))
+
+
+def recommend(
+    rows: list[Row],
+    min_attempts: int = DEFAULT_MIN_ATTEMPTS,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> dict[str, Any]:
+    """Pick a config from per-config rows (as produced by `summarize_config`, plus `tasks`).
+
+    A config qualifies with at least `min_attempts` attempts of known success, a success rate
+    of at least `threshold`, and a priceable median cost. The cheapest qualifier wins (ties go
+    to lower median wall time). If none qualifies, `best_effort` is the highest success rate.
+    `runner_up` is the next config in whichever ranking applied.
+    """
+    qualifiers = sorted(
+        (
+            r for r in rows
+            if _known_attempts(r) >= min_attempts
+            and r["success_rate"] is not None
+            and r["success_rate"] >= threshold
+            and r["median_cost"] is not None
+        ),
+        key=_cheapest_key,
+    )
+    base = {"min_attempts": min_attempts, "threshold": threshold}
+    if qualifiers:
+        win = qualifiers[0]
+        return {**base, "status": "recommended", "config": win["config"], "evidence": win,
+                "best_effort": None,
+                "runner_up": qualifiers[1] if len(qualifiers) > 1 else None}
+    rated = sorted((r for r in rows if r["success_rate"] is not None), key=_best_rate_key)
+    return {**base, "status": "none_qualify", "config": None, "evidence": None,
+            "best_effort": rated[0] if rated else None,
+            "runner_up": rated[1] if len(rated) > 1 else None}
+
+
+def kind_reports(
+    records: list[Record],
+    min_attempts: int = DEFAULT_MIN_ATTEMPTS,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Per task kind: pooled per-config rows (with `tasks` counts) and a recommendation."""
+    by_kind: dict[str, list[Record]] = {}
+    for r in records:
+        by_kind.setdefault(r.get("task_kind") or NO_KIND, []).append(r)
+    reports = []
+    for kind in sorted(by_kind):
+        recs = by_kind[kind]
+        rows = aggregate_configs(recs)
+        for row in rows:
+            row["tasks"] = len({r.get("task_id") for r in recs if config_label(r) == row["config"]})
+        reports.append({
+            "kind": kind,
+            "tasks": len({r.get("task_id") for r in recs}),
+            "attempts": len(recs),
+            "configs": rows,
+            "recommendation": recommend(rows, min_attempts, threshold),
+        })
+    return reports

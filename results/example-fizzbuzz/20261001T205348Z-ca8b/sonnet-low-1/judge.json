@@ -1,0 +1,31 @@
+{
+  "judge_config": "sonnet:medium",
+  "passed": true,
+  "error": null,
+  "criteria": [
+    {
+      "criterion": "`fizzbuzz(n)` returns a list of `n` strings, one per number from 1 to `n`.",
+      "passed": true,
+      "reason": "Loops over range(1, n+1) and appends one string per number to a list, which is returned."
+    },
+    {
+      "criterion": "Multiples of 3 give `\"Fizz\"`, multiples of 5 give `\"Buzz\"`, multiples of both give `\"FizzBuzz\"`.",
+      "passed": true,
+      "reason": "i % 15 gives FizzBuzz, then i % 3 gives Fizz, then i % 5 gives Buzz, so the checks are in the correct order."
+    },
+    {
+      "criterion": "Every other number is returned as its decimal string, for example `\"7\"`.",
+      "passed": true,
+      "reason": "The else branch appends str(i)."
+    },
+    {
+      "criterion": "`fizzbuzz(0)` returns an empty list and a negative `n` raises `ValueError`.",
+      "passed": true,
+      "reason": "n < 0 raises ValueError. For n == 0, range(1, 1) is empty, so an empty list is returned."
+    }
+  ],
+  "judge_cost_usd": 0.016981700000000002,
+  "raw_outputs": [
+    "{\"criteria\": [{\"criterion\": \"`fizzbuzz(n)` returns a list of `n` strings, one per number from 1 to `n`.\", \"passed\": true, \"reason\": \"Loops over range(1, n+1) and appends one string per number to a list, which is returned.\"}, {\"criterion\": \"Multiples of 3 give \\\"Fizz\\\", multiples of 5 give \\\"Buzz\\\", multiples of both give \\\"FizzBuzz\\\".\", \"passed\": true, \"reason\": \"i % 15 gives FizzBuzz, then i % 3 gives Fizz, then i % 5 gives Buzz, so the checks are in the correct order.\"}, {\"criterion\": \"Every other number is returned as its decimal string, for example \\\"7\\\".\", \"passed\": true, \"reason\": \"The else branch appends str(i).\"}, {\"criterion\": \"`fizzbuzz(0)` returns an empty list and a negative `n` raises `ValueError`.\", \"passed\": true, \"reason\": \"n < 0 raises ValueError. For n == 0, range(1, 1) is empty, so an empty list is returned.\"}]}"
+  ]
+}

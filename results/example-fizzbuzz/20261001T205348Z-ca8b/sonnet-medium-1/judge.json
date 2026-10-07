@@ -1,0 +1,31 @@
+{
+  "judge_config": "sonnet:medium",
+  "passed": true,
+  "error": null,
+  "criteria": [
+    {
+      "criterion": "`fizzbuzz(n)` returns a list of `n` strings, one per number from 1 to `n`.",
+      "passed": true,
+      "reason": "The loop runs over range(1, n+1) and appends one string per iteration to a list, which is returned."
+    },
+    {
+      "criterion": "Multiples of 3 give `\"Fizz\"`, multiples of 5 give `\"Buzz\"`, multiples of both give `\"FizzBuzz\"`.",
+      "passed": true,
+      "reason": "i % 15 gives FizzBuzz, then i % 3 gives Fizz, then i % 5 gives Buzz. The branch order is correct."
+    },
+    {
+      "criterion": "Every other number is returned as its decimal string, for example `\"7\"`.",
+      "passed": true,
+      "reason": "The else branch appends str(i), so 7 becomes \"7\"."
+    },
+    {
+      "criterion": "`fizzbuzz(0)` returns an empty list and a negative `n` raises `ValueError`.",
+      "passed": true,
+      "reason": "For n=0, range(1, 1) is empty, so the function returns []. For n<0 it raises ValueError."
+    }
+  ],
+  "judge_cost_usd": 0.0171267,
+  "raw_outputs": [
+    "{\"criteria\": [{\"criterion\": \"`fizzbuzz(n)` returns a list of `n` strings, one per number from 1 to `n`.\", \"passed\": true, \"reason\": \"The loop runs over range(1, n+1) and appends one string per iteration to a list, which is returned.\"}, {\"criterion\": \"Multiples of 3 give \\\"Fizz\\\", multiples of 5 give \\\"Buzz\\\", multiples of both give \\\"FizzBuzz\\\".\", \"passed\": true, \"reason\": \"i % 15 gives FizzBuzz, then i % 3 gives Fizz, then i % 5 gives Buzz. The branch order is correct.\"}, {\"criterion\": \"Every other number is returned as its decimal string, for example `\\\"7\\\"`.\", \"passed\": true, \"reason\": \"The else branch appends str(i), so 7 becomes \\\"7\\\".\"}, {\"criterion\": \"`fizzbuzz(0)` returns an empty list and a negative `n` raises `ValueError`.\", \"passed\": true, \"reason\": \"For n=0, range(1, 1) is empty, so the function returns []. For n<0 it raises ValueError.\"}]}"
+  ]
+}
