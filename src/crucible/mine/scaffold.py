@@ -49,13 +49,19 @@ def _suite_prelude(suite: Suite) -> list[str]:
     return lines
 
 
+def _collect_rc() -> str:
+    """The shell line that keeps the first non-zero exit code of the last command (`$code`)."""
+    return '[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code'
+
+
 def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
     """The task's `check.sh`: self-contained, run with the workspace as cwd. It installs the
     hidden tests once, then for each suite runs exactly the setup and test command `verify`
     ran (`bash -c`, same placeholder filling, only that suite's runnable files). One suite
     exec's its test command. Several suites each run in a subshell (own env and cwd); a setup
     failure exits 97 at once, test failures are collected so every suite runs, and the script
-    exits with the first failing code."""
+    exits with the first failing code. A suite's optional regression_command runs after its tests
+    in the same cwd and env."""
     suites = verify.as_suites(suites)
     plan = verify.suite_plan_for(suites, runnable)
     names = ", ".join(repr(s.name) for s in suites)
@@ -81,7 +87,15 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
         if suite.setup:
             lines.append(f'bash -c {shlex.quote(suite.setup)} || {{ echo "{SETUP_FAILED}" >&2; '
                          f"exit {SETUP_EXIT}; }}")
-        lines.append(f"exec bash -c {shlex.quote(verify.build_command(suite, runnable))}")
+        test_cmd = verify.build_command(suite, runnable)
+        if not suite.regression_command:
+            lines.append(f"exec bash -c {shlex.quote(test_cmd)}")
+            return "\n".join(lines) + "\n"
+        lines.append(f"bash -c {shlex.quote(test_cmd)}; rc=$?")
+        lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+        lines.append(f"bash -c {shlex.quote(suite.regression_command)}; code=$?")
+        lines.append(_collect_rc())
+        lines.append('exit "$rc"')
         return "\n".join(lines) + "\n"
     lines.append("rc=0")
     for suite, files in plan:
@@ -92,7 +106,12 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
                          f'echo {shlex.quote(f"{SETUP_FAILED} ({suite.name})")} >&2; exit {SETUP_EXIT}; }}')
         cmd = verify.build_command(suite, files)
         lines.append(f"( {pre}; bash -c {shlex.quote(cmd)} ); code=$?")
-        lines.append('[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code')
+        lines.append(_collect_rc())
+        if suite.regression_command:
+            lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+            lines.append(
+                f"( {pre}; bash -c {shlex.quote(suite.regression_command)} ); code=$?")
+            lines.append(_collect_rc())
     lines.append('exit "$rc"')
     return "\n".join(lines) + "\n"
 

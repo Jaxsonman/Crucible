@@ -18,7 +18,8 @@ DEFAULT_EXCLUDE = [
     "**/package-lock.json", "**/*.lock", "**/migrations/**", "docs/**", "*.md",
 ]
 SUITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env"}
+_SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env",
+               "regression_command"}
 _TOP_KEYS = {"suites", "exclude_paths", "max_changed_lines"}
 
 
@@ -39,6 +40,7 @@ class Suite:
     setup: str = ""
     module_root: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    regression_command: str = ""  # optional whole-suite command run after the PR's tests
 
     def to_dict(self) -> dict:
         """Plain-data form (stable key order), e.g. for hashing a suite's settings."""
@@ -46,6 +48,8 @@ class Suite:
         if self.setup:
             d["setup"] = self.setup
         d["test_command"] = self.test_command
+        if self.regression_command:
+            d["regression_command"] = self.regression_command
         if self.module_root is not None:
             d["module_root"] = self.module_root
         if self.env:
@@ -182,6 +186,18 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
             errors.append(f"{where}.test_command: must contain {{tests}} or {{modules}}")
         if "modules" in used and module_root is None:
             errors.append(f"{where}.test_command: {{modules}} needs {where}.module_root")
+    regression = raw.get("regression_command") or ""
+    if not isinstance(regression, str):
+        errors.append(f"{where}.regression_command: must be a string")
+        regression = ""
+    else:
+        found = sorted(set(re.findall(r"\{(tests|modules)\}", regression)))
+        if found:
+            errors.append(
+                f"{where}.regression_command: must not contain placeholders "
+                f"({', '.join('{' + p + '}' for p in found)}); it runs the whole suite"
+            )
+        regression = regression.strip()
     env = raw.get("env") or {}
     if not isinstance(env, dict):
         errors.append(f"{where}.env: must be a mapping of NAME: value")
@@ -206,7 +222,7 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         clean_env[str(k)] = v
     if len(errors) > start:
         return None
-    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env)
+    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env, regression)
 
 
 def load_config(path: Path) -> MineConfig:
@@ -347,6 +363,19 @@ def detect_suites(repo_root: Path) -> list[Suite]:
     return suites
 
 
+REGRESSION_SUGGESTIONS = {
+    "python -m pytest {tests}": "python -m pytest -q",
+    "python manage.py test {modules}": "python manage.py test",
+    "npx vitest run {tests}": "npx vitest run",
+    "npx jest {tests}": "npx jest",
+}
+
+
+def suggest_regression(suite: Suite) -> str:
+    """The whole-suite `regression_command` suggested for a detected stack ('' if none)."""
+    return REGRESSION_SUGGESTIONS.get(suite.test_command, "")
+
+
 _DETECTED_HEADER = """\
 # AUTO-DETECTED by `crucible mine`. Check every line before relying on it:
 # the test_paths globs, the setup and test commands, and env (names + dummy values only,
@@ -362,6 +391,7 @@ _TEMPLATE_HEADER = """\
 #     cwd: backend                       # where setup and test commands run (relative to repo root)
 #     setup: pip install -q -r requirements.txt
 #     test_command: python manage.py test {modules}   # {tests}: file paths relative to cwd
+#     regression_command: python manage.py test   # optional; whole suite, no placeholders
 #     module_root: backend               # optional; enables {modules} (dotted paths, .py stripped)
 #     env: {DJANGO_SECRET_KEY: dummy-not-secret}      # dummy values only
 """
@@ -371,16 +401,28 @@ exclude_paths: {exclude}
 # Candidates changing more lines than this are excluded.
 max_changed_lines: {max_lines}
 """
+_REGRESSION_NOTE = """\
+  # regression_command: {cmd}
+  #   optional: runs the whole suite at check time, after the PR's tests (no placeholders);
+  #   the check fails if it fails. `crucible mine prove` rejects a task whose regression fails
+  #   at the merge commit, so exclude pre-existing failures in the command or remove the line.
+"""
 
 
 def render_default(suites: list[Suite]) -> str:
-    """The commented mine.yaml text `crucible mine` writes on first use."""
+    """The commented mine.yaml text `crucible mine` writes on first use. Each detected suite
+    is followed by its suggested `regression_command`, commented out."""
     exclude = json.dumps(DEFAULT_EXCLUDE)
     tail = _TAIL.format(exclude=exclude, max_lines=DEFAULT_MAX_LINES)
     if not suites:
         return _TEMPLATE_HEADER + "suites: []\n" + tail
-    body = yaml.safe_dump({"suites": [s.to_dict() for s in suites]}, sort_keys=False,
-                          default_flow_style=None, width=100)
+    body = "suites:\n"
+    for s in suites:
+        body += yaml.safe_dump([s.to_dict()], sort_keys=False, default_flow_style=None,
+                               width=100)
+        cmd = suggest_regression(s)
+        if cmd:
+            body += _REGRESSION_NOTE.format(cmd=cmd)
     return _DETECTED_HEADER + body + tail
 
 

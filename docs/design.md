@@ -246,6 +246,7 @@ suites:                         # one per test stack; a repo may have several
     cwd: backend                # where setup and test commands run, relative to repo root
     setup: pip install -q -r requirements.txt   # optional
     test_command: python manage.py test {modules}
+    regression_command: python manage.py test   # optional; whole suite, no placeholders
     module_root: backend        # optional; enables {modules} (dotted paths, .py stripped)
     env: {DJANGO_SECRET_KEY: dummy-not-secret}   # names + dummy values only
   - name: frontend
@@ -260,9 +261,10 @@ max_changed_lines: 800
 Loaded and validated by `mine/config.py` (`load_config`, raising `MineConfigError` with one
 message per problem, each naming its field, e.g. `suites[0].test_command: required`).
 `test_command` must contain `{tests}` and/or `{modules}`; any other placeholder is an error, and
-`{modules}` needs `module_root`. `cwd` and `module_root` must stay inside the repo. `env`
-values longer than 7 characters whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
-`PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
+`{modules}` needs `module_root`. `regression_command` is optional, a plain command with no
+placeholders (`{tests}` or `{modules}` in it is an error). `cwd` and `module_root` must stay
+inside the repo. `env` values longer than 7 characters whose names contain `KEY`, `TOKEN`,
+`SECRET`, `PASSWORD`, `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
 start with `dummy`; and any value that is a URL with embedded credentials
 (`scheme://user:pass@host`) is rejected unless the password starts with `dummy` (guard against
 pasting real secrets). Unknown fields are errors (non-string keys are reported too).
@@ -277,6 +279,12 @@ Vitest and Jest (`package.json` dependencies), and returns suites with sensible 
 first `crucible mine` writes a commented `mine.yaml` saying it was auto-detected and must be
 checked (or, with nothing detected, a commented template with empty `suites`), prints the path
 and exits 0 without overwriting an existing file; an invalid file prints its errors and exits 1.
+Each detected stack gets a suggested `regression_command` (`config.suggest_regression`: pytest
+`python -m pytest -q`, Django `python manage.py test`, Vitest `npx vitest run`, Jest
+`npx jest`), written commented out under its suite with a note that it runs the whole suite at
+check time and that `prove` rejects a task whose regression fails at the merge commit (so
+pre-existing failures must be excluded or the line removed). Detected suites themselves keep an
+empty `regression_command`, so the written file loads back to exactly the detected suites.
 
 ### Candidates (`mine/candidates.py`)
 
@@ -388,6 +396,13 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   in its own subshell (own `env` and `cwd`), printing `== suite <name> ==` before each. A setup
   failure exits 97 immediately; test failures are collected so every suite runs, and the
   script exits with the first failing code. `prove` is unchanged.
+- **Regression suite.** When a suite has `regression_command`, `check.sh` runs it after that
+  suite's PR tests, in the same `cwd` and `env`, printing `== regression <name> ==` first. Its
+  exit code is collected like a test failure (the script exits with the first failing code,
+  and every suite still runs); a setup failure still exits 97 before anything else. A
+  single-suite task without one still `exec`s its test command, byte for byte as before.
+  `prove` needs no change: a regression that fails at the merge commit shows up as
+  `fails at merge`.
 - **`check.sh`** (mode 755), generated from the suite, run by `checker.run_check` with the
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
   copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
