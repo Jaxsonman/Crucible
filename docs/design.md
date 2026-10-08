@@ -188,6 +188,12 @@ cheap per attempt but fails often can lose to a pricier one that passes every ti
 rate (ties by the same key). Evidence lines show the interval, median cost and cost per
 success.
 
+**Resolved models.** Rows are grouped by the `model:effort` label, never by `resolved_model`
+(errored attempts have none and must stay in their label's row). Each row lists
+`resolved_models`, the sorted distinct non-null `resolved_model` values. When there is more than
+one, the report prints `warning: <label> pools N models: a, b` after the table (on stderr with
+`--json`), because an alias such as `sonnet` can move to a newer model between batches.
+
 ## Mining
 
 PR mining turns merged PRs into tasks.

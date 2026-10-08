@@ -79,6 +79,9 @@ def summarize_config(label: str, records: list[Record]) -> Row:
         "cost_per_success": cost_per_success,
         "unpriced": len(records) - len(costs),
         "judge_disagreements": sum(1 for r in records if judge_disagrees(r)),
+        "resolved_models": sorted(
+            {r["resolved_model"] for r in records if r.get("resolved_model")}
+        ),
     }
 
 

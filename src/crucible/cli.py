@@ -249,6 +249,21 @@ def format_report_table(rows: list[dict], columns=REPORT_COLUMNS) -> str:
     return "\n".join(lines)
 
 
+def _pool_warnings(rows: list[dict]) -> list[str]:
+    """One line per row whose label pooled attempts from more than one resolved model."""
+    return [
+        f"warning: {r['config']} pools {len(r['resolved_models'])} models: "
+        f"{', '.join(r['resolved_models'])}"
+        for r in rows if len(r.get("resolved_models") or []) > 1
+    ]
+
+
+def _print_pool_warnings(rows: list[dict], file=None) -> None:
+    """Print the pooling warnings; `file` defaults to the current sys.stdout (resolved per call)."""
+    for line in _pool_warnings(rows):
+        print(line, file=file or sys.stdout)
+
+
 def _evidence(row: dict) -> str:
     known = row["attempts"] - row["unknown"]
     cost = "—" if row["median_cost"] is None else f"${row['median_cost']:.4f}"
@@ -311,6 +326,8 @@ def _cross_task_report(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"min_attempts": args.min_attempts, "threshold": args.threshold,
                           "kinds": reports}, indent=2))
+        for rep in reports:
+            _print_pool_warnings(rep["configs"], sys.stderr)
         return 0
     for i, rep in enumerate(reports):
         if i:
@@ -320,6 +337,7 @@ def _cross_task_report(args: argparse.Namespace) -> int:
         print("\n".join(_format_recommendation(rep["recommendation"])))
         print()
         print(format_report_table(rep["configs"], KIND_COLUMNS))
+        _print_pool_warnings(rep["configs"])
     return 0
 
 
@@ -353,6 +371,7 @@ def _report(args: argparse.Namespace) -> int:
         print(json.dumps({**summary, "configs": rows}, indent=2))
         if warning:
             print(warning, file=sys.stderr)
+        _print_pool_warnings(rows, sys.stderr)
         return 0
     print(
         f"Task: {summary['task_id']}  kind: {summary['kind'] or '—'}  "
@@ -362,6 +381,7 @@ def _report(args: argparse.Namespace) -> int:
         print(warning)
     print()
     print(format_report_table(rows))
+    _print_pool_warnings(rows)
     return 0
 
 

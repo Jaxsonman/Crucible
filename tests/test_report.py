@@ -11,7 +11,7 @@ M = 1_000_000
 
 def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:medium", n=1,
                 success=True, wall=10.0, tokens_by_model=None, sha="sha-one", kind="feature",
-                computed=999.0, check=None, judge=None):
+                computed=999.0, check=None, judge=None, resolved_model=None, status="completed"):
     model, effort = config.split(":")
     slug = f"{model}-{effort}-{n}"
     d = home / "results" / task / batch / slug
@@ -25,7 +25,7 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
     rec = {
         "schema_version": 1, "task_id": task, "task_kind": kind, "batch_id": batch, "attempt": n,
         "config": {"model": model, "effort": effort}, "prompt_sha256": sha,
-        "wall_seconds": wall, "status": "completed",
+        "resolved_model": resolved_model, "wall_seconds": wall, "status": status,
         "tokens": {"input": sum(t["input"] for t in tbm.values()), "output": 0,
                    "cache_creation": 0, "cache_read": 0},
         "tokens_by_model": tbm, "cost_usd": {"computed": computed, "reported": 0.0},
@@ -294,3 +294,27 @@ def test_single_attempt_shows_wide_interval(crucible_home, capsys):
     by = {c["config"]: c for c in json.loads(jout)["configs"]}
     assert by["haiku:low"]["success_ci"] is None
     assert by["sonnet:low"]["success_ci"][1] == 1.0
+
+
+def test_label_pooling_several_models_warns(crucible_home, capsys):
+    make_record(crucible_home, config="sonnet:low", n=1, resolved_model="claude-sonnet-5-5")
+    make_record(crucible_home, config="sonnet:low", n=2, resolved_model="claude-sonnet-5-6")
+    make_record(crucible_home, config="sonnet:low", n=3, resolved_model=None, status="error",
+                success=False)
+    make_record(crucible_home, config="opus:high", n=1, resolved_model="claude-opus-5-5")
+    _, out, _ = run_report(capsys, "t1")
+    rows = {r["Config"]: r for r in parse_table(out)}
+    assert set(rows) == {"sonnet:low", "opus:high"}  # the errored attempt forms no group
+    assert rows["sonnet:low"]["Attempts"] == "3"
+    warnings = [ln for ln in out.splitlines() if ln.startswith("warning:")]
+    assert warnings == [
+        "warning: sonnet:low pools 2 models: claude-sonnet-5-5, claude-sonnet-5-6"
+    ]
+    assert out.index("warning:") > out.rindex("|")
+    _, jout, err = run_report(capsys, "t1", "--json")
+    by = {c["config"]: c for c in json.loads(jout)["configs"]}
+    assert by["sonnet:low"]["resolved_models"] == ["claude-sonnet-5-5", "claude-sonnet-5-6"]
+    assert by["opus:high"]["resolved_models"] == ["claude-opus-5-5"]
+    assert "warning: sonnet:low pools 2 models" in err
+    _, out, _ = run_report(capsys)  # cross-task report warns too
+    assert "warning: sonnet:low pools 2 models" in out
