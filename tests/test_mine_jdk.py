@@ -108,6 +108,8 @@ def test_required_none_when_nothing_says(tmp_path):
 def make_jdk(path: Path, version: str) -> Path:
     path.mkdir(parents=True)
     (path / "release").write_text(f'IMPLEMENTOR="x"\nJAVA_VERSION="{version}"\n')
+    (path / "bin").mkdir()
+    (path / "bin" / "javac").write_text("")
     return path
 
 
@@ -245,3 +247,25 @@ def test_gradle_falls_back_to_buildsrc_when_nothing_else_says(tmp_path):
     (tmp_path / "buildSrc" / "build.gradle.kts").write_text("kotlin { jvmToolchain(11) }\n")
     req = jdk.required_java(tmp_path, tmp_path, "gradle")
     assert req and req.version == 11
+
+
+def test_unreadable_candidates_never_crash_detection(tmp_path):
+    locked = tmp_path / "locked"
+    make_jdk(locked / "jdk17", "17.0.9")
+    locked.chmod(0)
+    try:
+        env = {"JAVA_HOME_17_X64": str(locked / "jdk17")}
+        assert jdk.local_jdks(env=env, java_home_tool=None, roots=[str(locked / "*")]) == []
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_jre_without_javac_is_not_a_jdk(tmp_path):
+    jre = tmp_path / "jre8"
+    jre.mkdir()
+    (jre / "release").write_text('JAVA_VERSION="1.8.0_411"\n')  # a JRE: no bin/javac
+    full = make_jdk(tmp_path / "jdk11", "11.0.20")
+    found = jdk.local_jdks(env={}, java_home_tool=None, roots=[str(tmp_path / "*")])
+    homes = [str(j.home) if hasattr(j, "home") else str(j) for j in found]
+    assert not any(str(jre) in h for h in homes)
+    assert jdk.pick_jdk(8, found) is not None and str(full) in str(jdk.pick_jdk(8, found))

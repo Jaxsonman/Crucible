@@ -350,7 +350,9 @@ literal `java-version:` of a `.github/workflows` `actions/setup-java` step. The 
 source file are written as a comment above the suite. Local JDKs are enumerated
 (`JAVA_HOME_<N>_*` variables, macOS `java_home -V`, `/Library/Java/JavaVirtualMachines/*`,
 Homebrew `openjdk*`, `/usr/lib/jvm/*`, `~/.sdkman/candidates/java/*`) and each one's major is
-read from its `release` file, never from its directory name; the exact major is picked, else the
+read from its `release` file, never from its directory name. Only full JDKs count (a `bin/javac`
+must exist, so a bare JRE is skipped), and unreadable candidates are ignored rather than
+failing detection. The exact major is picked, else the
 lowest newer one (never the newest: a build pinned to 21 can break on 26). The lookup function
 is injectable: `detect(..., jdk_lookup=)`. If one is found, the suite gets `env: {JAVA_HOME: <path>}`
 (`JAVA_HOME` is not secret-like, so the secret guard allows it); otherwise the comment suggests

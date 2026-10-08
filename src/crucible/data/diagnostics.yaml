@@ -14,7 +14,7 @@
 
 # Patterns showing that tests really ran (pass/fail counts).
 ran_tests:
-  - '^ok\s+\S+\s+(?:[\d.]+s(?!.*no tests to run)|\(cached\))'   # go test (not "[no tests to run]")
+  - '^ok\s+\S+\s+(?:[\d.]+s|\(cached\))(?!.*no tests to run)'   # go test (not "[no tests to run]")
   - '^--- (?:PASS|FAIL):'                           # go test: a test ran (not "[build failed]")
   - 'Tests run: [1-9]'                               # maven surefire
   - '^Tests:\s+.*\b[1-9]\d* (?:passed|failed)'      # jest (the Tests: line, not Test Suites:)
@@ -136,7 +136,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'no test files'
-    unless: '^ok\s+\S+\s+(?:[\d.]+s(?!.*no tests to run)|\(cached\))|^--- (?:PASS|FAIL):'
+    unless: '^ok\s+\S+\s+(?:[\d.]+s|\(cached\))(?!.*no tests to run)|^--- (?:PASS|FAIL):'
     hint: >-
       go found no test files in the package: check `runnable` (`**/*_test.go`) and that
       `test_command` passes the package directories (`{tests|dir|unique|prefix:./}`) from the
@@ -284,9 +284,10 @@ rules:
   - id: lombok-accessors-missing
     category: toolchain
     suppresses: [java-class-missing]
-    pattern: '(?s)cannot find symbol.{0,300}?symbol:\s+method (?:(?:get|set|is)[A-Z]\w*\(\)|builder\(\))'
+    # main code only: a hidden test calling a getter the fix adds is the normal fail-before case
+    pattern: '(?s)src/main/[^\n]*cannot find symbol.{0,300}?symbol:\s+method (?:(?:get|set|is)[A-Z]\w*\(\)|builder\(\))'
     hint: >-
-      Lombok-generated accessors missing: the JDK is probably newer than the build supports;
+      Accessors missing in main code: if they come from Lombok, the JDK is probably newer than the build supports;
       set `JAVA_HOME` in `env` to the JDK version the project targets (see the comment in
       `mine.yaml`).
 

@@ -29,6 +29,8 @@ def ids_of(text, code=1, stage="test"):
 def fake_jdk(root: Path, version="21.0.2") -> Path:
     root.mkdir(parents=True)
     (root / "release").write_text(f'JAVA_VERSION="{version}"\n')
+    (root / "bin").mkdir()
+    (root / "bin" / "javac").write_text("")
     return root
 
 
@@ -293,3 +295,18 @@ def warn(tmp_path, name, text):
 ])
 def test_skip_markers_are_precise(tmp_path, name, text, flagged):
     assert bool(warn(tmp_path, name, text)) is flagged
+
+
+# --- final review fixes ---
+
+def test_accessor_hint_ignores_missing_methods_in_test_code():
+    # a hidden test calling a getter the fix adds is the normal fail-before case, not Lombok
+    log = ("[ERROR] /w/src/test/java/com/acme/DiffTest.java:[12,9] cannot find symbol\n"
+           "  symbol:   method getTotal()\n  location: class com.acme.Diff\n")
+    assert "lombok-accessors-missing" not in ids_of(log)
+
+
+def test_go_cached_no_tests_to_run_is_not_a_test_run():
+    log = "ok  \texample.com/pkg\t(cached) [no tests to run]\n"
+    assert not dg.ran_tests(log)
+    assert "go-no-tests-to-run" in ids_of(log)

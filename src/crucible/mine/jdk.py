@@ -209,10 +209,20 @@ def release_major(home: str | Path) -> int | None:
     return int(parts.group(1)) if parts else None
 
 
+def _is_jdk_home(home: Path) -> bool:
+    """A full JDK: a `release` file and a compiler (a bare JRE has no `javac`). Never raises:
+    unreadable or vanished candidates simply don't count."""
+    try:
+        return (os.path.isfile(home / "release")
+                and any(os.path.isfile(home / "bin" / exe) for exe in ("javac", "javac.exe")))
+    except OSError:
+        return False
+
+
 def _resolve_home(path: str | Path) -> str | None:
     for sub in _HOME_SUBDIRS:
         home = Path(path) / sub if sub else Path(path)
-        if (home / "release").is_file():
+        if _is_jdk_home(home):
             return str(home)
     return None
 

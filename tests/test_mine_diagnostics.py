@@ -43,7 +43,8 @@ SAMPLES = {
         "java.lang.ExceptionInInitializerError\nCaused by: lombok.javac.apt.LombokProcessor\n",
         1, "test"),
     "lombok-accessors-missing": (
-        "cannot find symbol\n  symbol:   method getUrl()\n  location: class a.B\n", 1, "test"),
+        ("[ERROR] /w/src/main/java/a/C.java:[3,9] cannot find symbol\n"
+         "  symbol:   method getUrl()\n  location: class a.B\n"), 1, "test"),
     "ruby-load-error": ("LoadError: cannot load such file -- rails/all\n", 1, "test"),
     "node-engine-mismatch": (
         'error foo@1.0.0: The engine "node" is incompatible with this module.\n', 1, "setup"),
