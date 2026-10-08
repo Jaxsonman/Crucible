@@ -20,6 +20,14 @@ def config_label(record: Record) -> str:
     return f"{cfg.get('model')}:{cfg.get('effort')}"
 
 
+STOP_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
+
+
+def is_stopped(record: Record) -> bool:
+    """The attempt was ended by a limit (timeout, turn cap, budget cap), not by the model."""
+    return record.get("status") == "timeout" or record.get("subtype") in STOP_SUBTYPES
+
+
 def total_tokens(record: Record) -> int:
     """Sum of every token kind over every model in the record."""
     total = 0
@@ -69,6 +77,7 @@ def summarize_config(label: str, records: list[Record]) -> Row:
         "attempts": len(records),
         "successes": successes,
         "unknown": len(records) - len(known),
+        "stopped": sum(1 for r in records if is_stopped(r)),
         "success_rate": successes / len(known) if known else None,
         "success_ci": wilson_interval(successes, len(known)),
         "median_wall_seconds": _median(walls),

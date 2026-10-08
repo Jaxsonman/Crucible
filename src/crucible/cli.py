@@ -118,6 +118,20 @@ def _task_new(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_MAX_BUDGET_USD = 5.0
+
+
+def _budget(args: argparse.Namespace, task) -> tuple[float, str]:
+    """Per-attempt cap and where it came from: the flag when given on the command line (its
+    argparse default is None, so `--max-budget-usd 5` still counts as given), else the task's
+    `max_budget_usd`, else the default."""
+    if args.max_budget_usd is not None:
+        return args.max_budget_usd, "--max-budget-usd"
+    if task.max_budget_usd is not None:
+        return float(task.max_budget_usd), "task"
+    return DEFAULT_MAX_BUDGET_USD, "default"
+
+
 def _run(args: argparse.Namespace) -> int:
     try:
         task = load_task(Path(args.task_dir))
@@ -146,7 +160,8 @@ def _run(args: argparse.Namespace) -> int:
     if args.repeat < 1:
         print("--repeat must be at least 1", file=sys.stderr)
         return 1
-    if args.max_budget_usd <= 0:
+    budget, budget_from = _budget(args, task)
+    if budget <= 0:
         print("--max-budget-usd must be positive", file=sys.stderr)
         return 1
     if args.check_timeout <= 0:
@@ -158,6 +173,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"task {task.id}  prompt sha256 {sha}")
         print(f"check: {task.check or 'none'}")
+        print(f"max budget per attempt: ${budget:g} ({budget_from})")
         for a in attempts:
             print(f"planned: {a.config.label} #{a.n}")
         return 0
@@ -166,7 +182,7 @@ def _run(args: argparse.Namespace) -> int:
     for a in attempts:
         try:
             rec, interrupted = runner.run_attempt(
-                task, batch_id, a, prompt_text, sha, args.max_budget_usd, args.keep_workspaces,
+                task, batch_id, a, prompt_text, sha, budget, args.keep_workspaces,
                 args.check_timeout, judge_cfg,
             )
         except FileExistsError as e:
@@ -226,6 +242,7 @@ REPORT_COLUMNS = [
     ("Successes", lambda r: str(r["successes"])),
     ("Success rate", _fmt_rate),
     ("Unknown", lambda r: str(r["unknown"])),
+    ("Stopped", lambda r: str(r["stopped"])),
     ("Median time (s)", lambda r: _fmt_num(r["median_wall_seconds"], ".1f")),
     ("Time range (s)", lambda r: "—" if r["min_wall_seconds"] is None
         else f"{r['min_wall_seconds']:.1f}–{r['max_wall_seconds']:.1f}"),
@@ -697,7 +714,9 @@ def build_parser() -> argparse.ArgumentParser:
             group.add_argument("--configs", help="comma-separated model:effort list")
             group.add_argument("--matrix", help="named matrix (configs/<name>.yaml)")
             p.add_argument("--repeat", type=int, default=1, help="attempts per config")
-            p.add_argument("--max-budget-usd", type=float, default=5.0)
+            p.add_argument("--max-budget-usd", type=float, default=None,
+                           help="per-attempt spend cap in USD (default: the task's "
+                                "max_budget_usd, else 5.0)")
             p.add_argument("--check-timeout", type=float, default=checker.DEFAULT_TIMEOUT_S,
                            help="seconds before a hanging check is killed (default 300)")
             p.add_argument("--judge", action="store_true",

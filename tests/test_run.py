@@ -299,3 +299,49 @@ def test_dry_run_says_whether_task_has_a_check(crucible_home, capsys):
     md.write_text(md.read_text().replace("check: ./check.sh\n", ""))
     assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run"]) == 0
     assert "check: none" in capsys.readouterr().out.splitlines()
+
+
+def set_front(home, extra: str) -> None:
+    """Add front-matter lines to the copied example task (after `max_turns: 30`)."""
+    md = home / "tasks" / "example-fizzbuzz" / "task.md"
+    md.write_text(md.read_text().replace("max_turns: 30\n", f"max_turns: 30\n{extra}"))
+
+
+def test_task_max_budget_used_unless_flag_given(crucible_home, tmp_path, monkeypatch):
+    set_front(crucible_home, "max_budget_usd: 1.25\n")
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.25"
+    # an explicit flag wins, even when it equals the CLI default
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium",
+                 "--max-budget-usd", "5"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_default_budget_without_task_value(crucible_home, tmp_path, monkeypatch):
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_dry_run_shows_effective_budget(crucible_home, capsys):
+    def dry(*extra):
+        assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run",
+                     *extra]) == 0
+        return capsys.readouterr().out.splitlines()
+
+    assert "max budget per attempt: $5 (default)" in dry()
+    set_front(crucible_home, "max_budget_usd: 1.25\n")
+    assert "max budget per attempt: $1.25 (task)" in dry()
+    assert "max budget per attempt: $0.5 (--max-budget-usd)" in dry("--max-budget-usd", "0.5")
+
+
+def test_non_positive_budget_flag_rejected(crucible_home, capsys):
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low",
+                 "--max-budget-usd", "0"]) == 1
+    assert "--max-budget-usd must be positive" in capsys.readouterr().err

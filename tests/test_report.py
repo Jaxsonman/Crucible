@@ -11,7 +11,8 @@ M = 1_000_000
 
 def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:medium", n=1,
                 success=True, wall=10.0, tokens_by_model=None, sha="sha-one", kind="feature",
-                computed=999.0, check=None, judge=None, resolved_model=None, status="completed"):
+                computed=999.0, check=None, judge=None, resolved_model=None, status="completed",
+                subtype="success"):
     model, effort = config.split(":")
     slug = f"{model}-{effort}-{n}"
     d = home / "results" / task / batch / slug
@@ -26,6 +27,7 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
         "schema_version": 1, "task_id": task, "task_kind": kind, "batch_id": batch, "attempt": n,
         "config": {"model": model, "effort": effort}, "prompt_sha256": sha,
         "resolved_model": resolved_model, "wall_seconds": wall, "status": status,
+        "subtype": subtype,
         "tokens": {"input": sum(t["input"] for t in tbm.values()), "output": 0,
                    "cache_creation": 0, "cache_read": 0},
         "tokens_by_model": tbm, "cost_usd": {"computed": computed, "reported": 0.0},
@@ -318,3 +320,21 @@ def test_label_pooling_several_models_warns(crucible_home, capsys):
     assert "warning: sonnet:low pools 2 models" in err
     _, out, _ = run_report(capsys)  # cross-task report warns too
     assert "warning: sonnet:low pools 2 models" in out
+
+
+def test_stopped_column(crucible_home, capsys):
+    make_record(crucible_home, n=1, success=True)
+    make_record(crucible_home, n=2, success=False, status="timeout", subtype=None)
+    make_record(crucible_home, n=3, success=False, status="error", subtype="error_max_turns")
+    make_record(crucible_home, n=4, success=False, status="error",
+                subtype="error_max_budget_usd")
+    make_record(crucible_home, n=5, success=False, status="error", subtype=None)  # crash
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Stopped"] == "3" and row["Attempts"] == "5" and row["Successes"] == "1"
+    assert row["Success rate"].startswith("20% ")  # stopped attempts still count as failures
+    header_line = next(ln for ln in out.splitlines() if ln.startswith("|"))
+    header = [c.strip() for c in header_line.strip("|").split("|")]
+    assert header.index("Stopped") == header.index("Unknown") + 1
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    assert json.loads(jout)["configs"][0]["stopped"] == 3

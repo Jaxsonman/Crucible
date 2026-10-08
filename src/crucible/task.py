@@ -1,5 +1,6 @@
 """Task document parsing and validation. See docs/design.md (Task document)."""
 
+import math
 import os
 import re
 import subprocess
@@ -18,6 +19,7 @@ id: {id}
 kind: feature
 repo: fixture
 # check: ./check.sh
+# max_budget_usd: 2.0   # optional per-attempt cap in USD; --max-budget-usd overrides it
 ---
 
 ## What
@@ -52,6 +54,7 @@ class Task:
     criteria: list[str]
     task_dir: Path
     source: str | None = None  # mined tasks: PR URL, or `commit:<merge sha>`
+    max_budget_usd: float | None = None  # per-attempt cap; `crucible run --max-budget-usd` wins
 
     @property
     def repo_path(self) -> Path:
@@ -181,6 +184,13 @@ def load_task(path: str | Path) -> Task:
     if source is not None and (not isinstance(source, str) or not source.strip()):
         fail(f"`source` must be a non-empty string, got {source!r}")
 
+    max_budget = fm.get("max_budget_usd")
+    if max_budget is not None and (
+        isinstance(max_budget, bool) or not isinstance(max_budget, (int, float))
+        or not math.isfinite(max_budget) or max_budget <= 0
+    ):
+        fail(f"`max_budget_usd` must be a positive number, got {max_budget!r}")
+
     timeout = _positive_int(fm, "timeout_minutes", 30, fail)
     max_turns = _positive_int(fm, "max_turns", 100, fail)
 
@@ -213,6 +223,7 @@ def load_task(path: str | Path) -> Task:
         criteria=criteria,
         task_dir=task_dir,
         source=source,
+        max_budget_usd=None if max_budget is None else float(max_budget),
     )
 
 
@@ -234,7 +245,8 @@ id: {id}
 kind: {kind}
 repo: {repo}
 ref: {ref}
-{extra}check: ./check.sh
+{extra}# max_budget_usd: 2.0   # optional per-attempt cap in USD; --max-budget-usd overrides it
+check: ./check.sh
 ---
 
 ## What

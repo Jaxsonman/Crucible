@@ -22,7 +22,8 @@ attempts yourself.
    their count. Each attempt is a real `claude` run, and `--judge` adds a judge run per attempt.
    When the task has a check and `--judge` is on, say that the judge is advisory: the check
    decides success and the report shows judge disagreements beside it. State the per-attempt
-   budget cap (`--max-budget-usd`, default 5.0) so the user sees the worst case.
+   budget cap from the dry run's `max budget per attempt` line (the flag, else the task's
+   `max_budget_usd`, else 5.0) so the user sees the worst case.
 3. **Confirm.** Ask the user whether to start. Do not run anything paid until they say yes. If
    they decline or change flags, redo step 2.
 4. **Run in the background.** Run the real command (without `--dry-run`) with the Bash tool's

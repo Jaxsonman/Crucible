@@ -293,3 +293,28 @@ def test_committed_todo_list_criteria_are_whole():
         "whitespace-only title raises `ValueError`."
     )
     assert "- " + t.criteria[0] in build_prompt(t)
+
+
+def test_max_budget_usd_optional_positive_number(crucible_home):
+    assert load_task(make_task(crucible_home)).max_budget_usd is None
+    d = make_task(crucible_home, name="t2",
+                  front="id: t2\nkind: x\nrepo: fixture\nmax_budget_usd: 1.5")
+    assert load_task(d).max_budget_usd == 1.5
+    d = make_task(crucible_home, name="t3",
+                  front="id: t3\nkind: x\nrepo: fixture\nmax_budget_usd: 2")
+    assert load_task(d).max_budget_usd == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "lots", "true", ".nan", ".inf"])
+def test_max_budget_usd_must_be_positive_number(crucible_home, value):
+    d = make_task(crucible_home, front=f"id: t1\nkind: x\nrepo: fixture\nmax_budget_usd: {value}")
+    with pytest.raises(TaskError, match="max_budget_usd"):
+        load_task(d)
+
+
+def test_templates_show_commented_budget(crucible_home):
+    from crucible.task import repo_task_md
+
+    assert main(["task", "new", "demo"]) == 0
+    assert "# max_budget_usd:" in (crucible_home / "tasks" / "demo" / "task.md").read_text()
+    assert "# max_budget_usd:" in repo_task_md("x", "../..", "abc123")

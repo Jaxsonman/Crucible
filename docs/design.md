@@ -54,6 +54,7 @@ ref: main                     # git ref; required when repo is not "fixture"
 check: ./check.sh             # optional; run from the workspace root, relative to the task dir
 timeout_minutes: 30           # optional, default 30
 max_turns: 100                # optional, default 100
+max_budget_usd: 2.0           # optional per-attempt spend cap (USD); --max-budget-usd overrides it
 ---
 
 ## What
@@ -193,6 +194,15 @@ success.
 `resolved_models`, the sorted distinct non-null `resolved_model` values. When there is more than
 one, the report prints `warning: <label> pools N models: a, b` after the table (on stderr with
 `--json`), because an alias such as `sonnet` can move to a newer model between batches.
+
+**Stopped attempts.** `stopped` counts attempts that a limit ended: `status` `timeout`, or
+`subtype` `error_max_turns` or `error_max_budget_usd` (`aggregate.is_stopped`). The `Stopped`
+column follows `Unknown`. Stopped attempts still count as failures in the success rate (the
+config did not deliver), but the reader can see that a limit, not the model, ended them.
+`crucible run` caps each attempt at `--max-budget-usd` when the flag is given, else at the
+task's `max_budget_usd`, else at 5.0; `--dry-run` prints the effective cap and its source
+(`max budget per attempt: $1.25 (task)`). `crucible task new` templates show the field
+commented out.
 
 ## Mining
 
