@@ -165,8 +165,9 @@ separately from the attempt's cost. To judge attempts that were recorded without
 uv run crucible judge example-fizzbuzz [--batch <batch-id>]
 ```
 
-An attempt's `success` is true only if every verdict produced (check, judge) passed, and is
-unknown if neither produced a verdict.
+An attempt's `success` is the check's verdict when the check produced one, else the judge's, and
+is unknown if neither did. When a check exists the judge is advisory: the report counts the
+attempts where the two disagree in its `Judge≠check` column.
 
 ## Report
 

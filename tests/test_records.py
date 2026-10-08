@@ -101,3 +101,4 @@ def test_judge_disagrees_needs_two_verdicts():
     no_verdict = {"ran": True, "passed": None, "exit_code": None}
     assert records.judge_disagrees(rec(check=no_verdict, judge=jdg(False))) is False
     assert records.judge_disagrees({"status": "completed"}) is False  # old record, no blocks
+    assert records.judge_disagrees(rec(status="error", check=chk(True), judge=jdg(False))) is False
