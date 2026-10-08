@@ -95,6 +95,33 @@ def _positive_int(fm: dict, key: str, default: int, fail) -> int:
     return value
 
 
+def _criteria(text: str) -> tuple[list[str], bool]:
+    """Parse the Acceptance criteria section. Returns (criteria, stray).
+
+    A bullet (`-` or `*`) at column 0, or any bullet while none is open, starts a criterion.
+    Any other non-blank line continues the open criterion (Markdown lazy continuation), joined
+    with one space after stripping its whitespace; an indented nested bullet (`  - sub`) is a
+    continuation too and keeps its `- ` text. A blank line closes the open criterion. `stray`
+    is True when a non-blank line had no open criterion to continue.
+    """
+    criteria: list[str] = []
+    is_open = False
+    stray = False
+    for line in text.splitlines():
+        if not line.strip():
+            is_open = False
+            continue
+        m = BULLET_RE.match(line)
+        if m and (not is_open or not line[:1].isspace()):
+            criteria.append(m.group(1))
+            is_open = True
+        elif is_open:
+            criteria[-1] += " " + line.strip()
+        else:
+            stray = True
+    return criteria, stray
+
+
 def load_task(path: str | Path) -> Task:
     """Load a task from a task directory or its task.md. Raises TaskError."""
     path = Path(path)
@@ -163,10 +190,11 @@ def load_task(path: str | Path) -> Task:
             fail(f"missing section '## {name}'")
         if not sections[name]:
             fail(f"section '## {name}' is empty")
-    criteria = [m.group(1) for line in sections["Acceptance criteria"].splitlines()
-                if (m := BULLET_RE.match(line))]
+    criteria, stray = _criteria(sections["Acceptance criteria"])
     if not criteria:
         fail("section '## Acceptance criteria' has no bullet criteria")
+    if stray:
+        fail("section '## Acceptance criteria' has text outside bullets")
     placeholders = [n for n in SECTIONS if PLACEHOLDER_RE.search(sections[n])]
     if placeholders:
         names = ", ".join(f"'## {n}'" for n in placeholders)

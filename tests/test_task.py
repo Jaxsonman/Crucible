@@ -236,3 +236,60 @@ def test_example_check_passes_on_correct_solution(crucible_home, tmp_path):
 def test_example_hidden_script_not_in_fixture():
     assert not (EXAMPLE / "fixture" / "hidden_test.py").exists()
     assert sys.version_info >= (3, 12)
+
+
+def criteria_body(criteria_text: str) -> str:
+    return f"\n## What\n\nDo it.\n\n## Why\n\nBecause.\n\n## Acceptance criteria\n\n{criteria_text}"
+
+
+def test_wrapped_bullet_is_one_criterion(crucible_home):
+    body = criteria_body(
+        "- `add` trims the title. An empty title\n"
+        "  raises `ValueError`.\n"
+        "- Second bullet\n"
+        "continues lazily here.\n"
+    )
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == [
+        "`add` trims the title. An empty title raises `ValueError`.",
+        "Second bullet continues lazily here.",
+    ]
+
+
+def test_nested_bullet_is_a_continuation(crucible_home):
+    body = criteria_body("- Parent text\n  - sub one\n  * sub two\n- Next\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["Parent text - sub one * sub two", "Next"]
+
+
+def test_blank_line_ends_a_bullet(crucible_home):
+    body = criteria_body("- First\n\n- Second\n  wrapped\n")
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["First", "Second wrapped"]
+
+
+def test_text_before_first_bullet_is_error(crucible_home):
+    body = criteria_body("Some intro prose.\n- First\n")
+    with pytest.raises(TaskError, match="'## Acceptance criteria' has text outside bullets"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_text_after_blank_line_is_error(crucible_home):
+    body = criteria_body("- First\n\nA trailing paragraph.\n")
+    with pytest.raises(TaskError, match="text outside bullets"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_criteria_only_continuation_text_has_no_bullets(crucible_home):
+    body = criteria_body("  indented prose\n  more prose\n")
+    with pytest.raises(TaskError, match="has no bullet criteria"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_committed_todo_list_criteria_are_whole():
+    t = load_task(REPO_ROOT / "tasks" / "todo-list")
+    assert len(t.criteria) == 6
+    assert t.criteria[0] == (
+        "`add` trims leading and trailing whitespace from the title. An empty or "
+        "whitespace-only title raises `ValueError`."
+    )
+    assert "- " + t.criteria[0] in build_prompt(t)

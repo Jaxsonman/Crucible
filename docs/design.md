@@ -68,6 +68,16 @@ The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) 
 What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
 stored in every attempt record so identical input can be proven.
 
+Acceptance criteria are the section's bullets (`-` or `*`), used by both the agent prompt and
+the judge. A non-blank line that does not start a bullet continues the bullet before it
+(Markdown lazy continuation) and is joined to it with one space after stripping its leading
+whitespace; an indented nested bullet (`  - sub`) is a continuation too and keeps its `- `
+text. A blank line ends a bullet. A section with no bullet fails validation (`has no bullet
+criteria`); text that continues no bullet (before the first bullet, or after a blank line)
+fails with `has text outside bullets`. Fixing the old first-line-only parsing changed the
+prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed warning
+covers that and no attempt was rerun.
+
 ## Results layout
 
 ```
