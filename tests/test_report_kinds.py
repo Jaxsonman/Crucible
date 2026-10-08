@@ -119,3 +119,13 @@ def test_bad_flags(crucible_home, capsys):
     assert run(capsys, "--threshold", "1.5")[0] == 1
     assert run(capsys, "--batch", "x")[0] == 1
     assert run(capsys, "b1", "--kind", "bugfix")[0] == 1
+
+
+def test_evidence_shows_interval(crucible_home, capsys):
+    for n in (1, 2, 3):
+        make_record(crucible_home, task="r1", kind="refactor", config="sonnet:low", n=n,
+                    success=True)
+    _, out, _ = run(capsys)
+    assert "Recommendation: sonnet:low" in out
+    assert "success 100% (3/3 known, 95% CI 44–100%)" in out
+    assert "| 100% (44–100%) |" in out

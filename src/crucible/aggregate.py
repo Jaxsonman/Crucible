@@ -4,6 +4,7 @@ Costs are always re-priced from `tokens_by_model` with the current pricing table
 `cost_usd.computed` is never read. See docs/design.md (Tokens and cost).
 """
 
+import math
 import statistics
 from typing import Any
 
@@ -37,6 +38,20 @@ def _median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+Z95 = 1.96
+
+
+def wilson_interval(successes: int, n: int, z: float = Z95) -> tuple[float, float] | None:
+    """95% Wilson score interval of `successes / n`, clamped to [0, 1]; None when n is 0."""
+    if n <= 0:
+        return None
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
 def summarize_config(label: str, records: list[Record]) -> Row:
     """Aggregate the attempts of a single config. Success is recomputed from each record with
     `compute_success` (the stored `success` is never read), the same way cost is re-priced
@@ -55,6 +70,7 @@ def summarize_config(label: str, records: list[Record]) -> Row:
         "successes": successes,
         "unknown": len(records) - len(known),
         "success_rate": successes / len(known) if known else None,
+        "success_ci": wilson_interval(successes, len(known)),
         "median_wall_seconds": _median(walls),
         "min_wall_seconds": min(walls) if walls else None,
         "max_wall_seconds": max(walls) if walls else None,

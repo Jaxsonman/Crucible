@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import yaml
 
 from crucible import aggregate
@@ -75,13 +76,13 @@ def test_two_configs_three_attempts(crucible_home, capsys):
     assert [r["Config"] for r in rows] == ["sonnet:medium", "opus:high"]
     s, o = rows
     assert (s["Attempts"], s["Successes"], s["Unknown"], s["Unpriced"]) == ("3", "2", "0", "0")
-    assert s["Success rate"] == "67%"
+    assert s["Success rate"] == "67% (21–94%)"
     assert s["Median time (s)"] == "20.0" and s["Time range (s)"] == "10.0–30.0"
     assert s["Median tokens"] == "2,000,000"
     assert s["Median cost"] == "$4.0000"
     assert s["Cost/success"] == "$6.0000"  # (2+4+6) / 2 successes
     assert (o["Attempts"], o["Successes"]) == ("3", "0")
-    assert o["Success rate"] == "0%"
+    assert o["Success rate"] == "0% (0–56%)"
     assert o["Median time (s)"] == "30.0" and o["Time range (s)"] == "10.0–40.0"
     assert o["Median tokens"] == "2,000,000"
     assert o["Median cost"] == "$8.0000"
@@ -132,7 +133,7 @@ def test_unknown_success_rate(crucible_home, capsys):
     assert h["Success rate"] == "—" and h["Unknown"] == "3" and h["Successes"] == "0"
     assert h["Cost/success"] == "—"
     s = rows["sonnet:low"]
-    assert s["Success rate"] == "50%" and s["Unknown"] == "1" and s["Attempts"] == "3"
+    assert s["Success rate"] == "50% (9–91%)" and s["Unknown"] == "1" and s["Attempts"] == "3"
 
 
 def test_unpriced_excluded_from_cost(crucible_home, capsys):
@@ -225,7 +226,9 @@ def test_json_matches_table(crucible_home, capsys):
     rows = parse_table(out)
     assert rows[0]["Median cost"] == f"${s['median_cost']:.4f}"
     assert rows[0]["Cost/success"] == f"${s['cost_per_success']:.4f}"
-    assert rows[0]["Success rate"] == f"{s['success_rate']:.0%}"
+    assert rows[0]["Success rate"] == f"{s['success_rate']:.0%} (21–94%)"
+    assert s["success_ci"] == pytest.approx([0.2076549551264879, 0.9385096847238394])
+    assert o["success_ci"] == pytest.approx([0.0, 0.5615060804490177])
     assert rows[1]["Median cost"] == f"${o['median_cost']:.4f}"
 
 
@@ -259,3 +262,35 @@ def test_success_recomputed_check_decides_and_disagreement_counted(crucible_home
     _, jout, _ = run_report(capsys, "t1", "--json")
     (cfg,) = json.loads(jout)["configs"]
     assert cfg["judge_disagreements"] == 1 and cfg["successes"] == 2
+
+
+@pytest.mark.parametrize("k,n,low,high", [
+    (3, 3, 0.43849391955098227, 1.0),
+    (2, 3, 0.2076549551264879, 0.9385096847238394),
+    (1, 1, 0.20654329147389294, 1.0),
+    (0, 1, 0.0, 0.7934567085261071),
+    (4, 5, 0.3755282641185388, 0.9637768390302125),
+])
+def test_wilson_interval(k, n, low, high):
+    lo, hi = aggregate.wilson_interval(k, n)
+    assert lo == pytest.approx(low) and hi == pytest.approx(high)
+    assert 0.0 <= lo <= k / n <= hi <= 1.0
+
+
+def test_wilson_interval_empty_is_none():
+    assert aggregate.wilson_interval(0, 0) is None
+
+
+def test_single_attempt_shows_wide_interval(crucible_home, capsys):
+    make_record(crucible_home, config="sonnet:low", n=1, success=True)
+    make_record(crucible_home, config="opus:low", n=1, success=False)
+    make_record(crucible_home, config="haiku:low", n=1, success=None)
+    _, out, _ = run_report(capsys, "t1")
+    rows = {r["Config"]: r for r in parse_table(out)}
+    assert rows["sonnet:low"]["Success rate"] == "100% (21–100%)"
+    assert rows["opus:low"]["Success rate"] == "0% (0–79%)"
+    assert rows["haiku:low"]["Success rate"] == "—"
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    by = {c["config"]: c for c in json.loads(jout)["configs"]}
+    assert by["haiku:low"]["success_ci"] is None
+    assert by["sonnet:low"]["success_ci"][1] == 1.0

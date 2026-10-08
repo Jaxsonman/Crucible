@@ -164,6 +164,19 @@ whose ID is the longest prefix of `model_id` (handles date or variant suffixes),
 unpriced. `cost_usd.reported` is whatever
 the `claude` CLI reported, kept for cross-checking.
 
+## Reports
+
+`crucible report` aggregates attempt records per config (`aggregate.summarize_config`),
+grouped by the `model:effort` label. Every number is recomputed from the records: cost from
+`tokens_by_model`, success from `compute_success`.
+
+**Success-rate interval.** Each row carries `success_ci`, the 95% Wilson score interval
+`[low, high]` of successes over attempts with a known result (null when there are none). With
+z = 1.96 and p = k/n: centre = (p + z²/2n) / (1 + z²/n), half = z·√(p(1−p)/n + z²/4n²) /
+(1 + z²/n), and the interval is centre ± half clamped to [0, 1]. Tables show it in the
+`Success rate` cell (`100% (44–100%)`) and recommendation evidence repeats it, so 3 passes out
+of 3 reads as "somewhere between 44% and 100%", not as certainty. Pure stdlib (`math.sqrt`).
+
 ## Mining
 
 PR mining turns merged PRs into tasks.

@@ -207,11 +207,24 @@ def _fmt_num(value, fmt: str) -> str:
     return "—" if value is None else format(value, fmt)
 
 
+def _fmt_ci(row: dict) -> str | None:
+    ci = row.get("success_ci")
+    return None if not ci else f"{ci[0] * 100:.0f}–{ci[1] * 100:.0f}%"
+
+
+def _fmt_rate(row: dict) -> str:
+    """`100% (44–100%)`: the success rate and its 95% Wilson interval; `—` when unknown."""
+    if row["success_rate"] is None:
+        return "—"
+    ci = _fmt_ci(row)
+    return f"{row['success_rate']:.0%}" + (f" ({ci})" if ci else "")
+
+
 REPORT_COLUMNS = [
     ("Config", lambda r: r["config"]),
     ("Attempts", lambda r: str(r["attempts"])),
     ("Successes", lambda r: str(r["successes"])),
-    ("Success rate", lambda r: _fmt_num(r["success_rate"], ".0%")),
+    ("Success rate", _fmt_rate),
     ("Unknown", lambda r: str(r["unknown"])),
     ("Median time (s)", lambda r: _fmt_num(r["median_wall_seconds"], ".1f")),
     ("Time range (s)", lambda r: "—" if r["min_wall_seconds"] is None
@@ -241,7 +254,8 @@ def _evidence(row: dict) -> str:
     cost = "—" if row["median_cost"] is None else f"${row['median_cost']:.4f}"
     return (
         f"{row['tasks']} tasks, {row['attempts']} attempts, "
-        f"success {_fmt_num(row['success_rate'], '.0%')} ({row['successes']}/{known} known), "
+        f"success {_fmt_num(row['success_rate'], '.0%')} ({row['successes']}/{known} known, "
+        f"95% CI {_fmt_ci(row) or '—'}), "
         f"median cost {cost}, median time {_fmt_num(row['median_wall_seconds'], '.1f')}s"
     )
 
