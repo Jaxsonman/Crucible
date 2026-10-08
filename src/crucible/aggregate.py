@@ -124,9 +124,12 @@ def _known_attempts(row: Row) -> int:
 
 
 def _cheapest_key(row: Row) -> tuple:
-    """Lower median cost, then lower median wall time; unknown values sort last."""
-    cost, wall = row["median_cost"], row["median_wall_seconds"]
-    return (cost is None, cost or 0.0, wall is None, wall or 0.0, row["config"])
+    """Lower cost per success, then lower median wall time, then label; unknown values sort
+    last. Cost per success (total priced cost ÷ priced successes) answers "what does a passing
+    result cost": failed attempts are part of that cost, so a config that is cheap per attempt
+    but often fails does not win on price alone."""
+    cps, wall = row["cost_per_success"], row["median_wall_seconds"]
+    return (cps is None, cps or 0.0, wall is None, wall or 0.0, row["config"])
 
 
 def _best_rate_key(row: Row) -> tuple:
@@ -141,9 +144,9 @@ def recommend(
     """Pick a config from per-config rows (as produced by `summarize_config`, plus `tasks`).
 
     A config qualifies with at least `min_attempts` attempts of known success, a success rate
-    of at least `threshold`, and a priceable median cost. The cheapest qualifier wins (ties go
-    to lower median wall time). If none qualifies, `best_effort` is the highest success rate.
-    `runner_up` is the next config in whichever ranking applied.
+    of at least `threshold`, and a priceable cost per success. The lowest cost per success
+    wins (ties go to lower median wall time, then label). If none qualifies, `best_effort` is
+    the highest success rate. `runner_up` is the next config in whichever ranking applied.
     """
     qualifiers = sorted(
         (
@@ -151,7 +154,7 @@ def recommend(
             if _known_attempts(r) >= min_attempts
             and r["success_rate"] is not None
             and r["success_rate"] >= threshold
-            and r["median_cost"] is not None
+            and r["cost_per_success"] is not None
         ),
         key=_cheapest_key,
     )

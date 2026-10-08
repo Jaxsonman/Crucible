@@ -74,8 +74,13 @@ def test_under_min_attempts_never_recommended(crucible_home, capsys):
 
 def test_threshold_flag(crucible_home, capsys):
     build(crucible_home)
+    _, out, _ = run(capsys)
+    assert "no config meets the bar" in kind_section(out, "feature")
     _, out, _ = run(capsys, "--threshold", "0.3")
-    assert "Recommendation: sonnet:low" in kind_section(out, "feature")
+    feat = kind_section(out, "feature")
+    # sonnet:low (1/3) now qualifies too; it and opus:high (2/3) both cost $6.0000 per
+    # success and take the same time, so the tie goes to the label
+    assert "Recommendation: opus:high" in feat and "Runner-up: sonnet:low" in feat
 
 
 def test_kind_filter(crucible_home, capsys):
@@ -129,3 +134,18 @@ def test_evidence_shows_interval(crucible_home, capsys):
     assert "Recommendation: sonnet:low" in out
     assert "success 100% (3/3 known, 95% CI 44–100%)" in out
     assert "| 100% (44–100%) |" in out
+
+
+def test_recommendation_ranks_by_cost_per_success(crucible_home, capsys):
+    # sonnet:low: $2.00 a run, 4/5 pass -> $2.50 per success (median $2.00)
+    # opus:high:  $2.20 a run, 3/3 pass -> $2.20 per success (median $2.20)
+    for n in range(1, 6):
+        make_record(crucible_home, task="r1", kind="refactor", config="sonnet:low", n=n,
+                    success=n != 5, tokens_by_model=sonnet(M))
+    for n in (1, 2, 3):
+        make_record(crucible_home, task="r1", kind="refactor", config="opus:high", n=n,
+                    success=True, tokens_by_model=opus(550_000))
+    _, out, _ = run(capsys)
+    assert "Recommendation: opus:high" in out
+    assert "Runner-up: sonnet:low" in out
+    assert "cost per success $2.2000" in out

@@ -177,6 +177,17 @@ z = 1.96 and p = k/n: centre = (p + z²/2n) / (1 + z²/n), half = z·√(p(1−p
 `Success rate` cell (`100% (44–100%)`) and recommendation evidence repeats it, so 3 passes out
 of 3 reads as "somewhere between 44% and 100%", not as certainty. Pure stdlib (`math.sqrt`).
 
+**Recommendation.** `aggregate.recommend` picks from per-config rows. A config qualifies with
+at least `min_attempts` (default 3) attempts of known result, a success rate of at least
+`threshold` (default 0.8) and a non-null `cost_per_success`. Qualifiers are ranked by
+`cost_per_success` (total priced cost of every attempt ÷ priced successes), then median wall
+time, then label; unknown values sort last. The question a recommendation answers is "what
+does a passing result cost", and failed attempts are part of that cost, so a config that is
+cheap per attempt but fails often can lose to a pricier one that passes every time.
+`median_cost` stays in the table. If nothing qualifies, `best_effort` is the highest success
+rate (ties by the same key). Evidence lines show the interval, median cost and cost per
+success.
+
 ## Mining
 
 PR mining turns merged PRs into tasks.

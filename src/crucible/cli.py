@@ -252,11 +252,13 @@ def format_report_table(rows: list[dict], columns=REPORT_COLUMNS) -> str:
 def _evidence(row: dict) -> str:
     known = row["attempts"] - row["unknown"]
     cost = "—" if row["median_cost"] is None else f"${row['median_cost']:.4f}"
+    cps = "—" if row["cost_per_success"] is None else f"${row['cost_per_success']:.4f}"
     return (
         f"{row['tasks']} tasks, {row['attempts']} attempts, "
         f"success {_fmt_num(row['success_rate'], '.0%')} ({row['successes']}/{known} known, "
         f"95% CI {_fmt_ci(row) or '—'}), "
-        f"median cost {cost}, median time {_fmt_num(row['median_wall_seconds'], '.1f')}s"
+        f"median cost {cost}, cost per success {cps}, "
+        f"median time {_fmt_num(row['median_wall_seconds'], '.1f')}s"
     )
 
 

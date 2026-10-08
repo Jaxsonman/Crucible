@@ -3,12 +3,16 @@ from crucible import aggregate
 M = 1_000_000
 
 
-def row(config, attempts=5, successes=5, unknown=0, cost=1.0, wall=10.0, tasks=1):
+_SAME = object()
+
+
+def row(config, attempts=5, successes=5, unknown=0, cost=1.0, wall=10.0, tasks=1, cps=_SAME):
     known = attempts - unknown
     return {
         "config": config, "attempts": attempts, "successes": successes, "unknown": unknown,
         "success_rate": successes / known if known else None,
         "median_cost": cost, "median_wall_seconds": wall, "tasks": tasks,
+        "cost_per_success": cost if cps is _SAME else cps,
     }
 
 
@@ -117,3 +121,24 @@ def test_kind_reports_group_pool_and_recommend():
     assert bug["configs"][0]["tasks"] == 2 and bug["configs"][0]["attempts"] == 3
     assert bug["recommendation"]["config"] == "a:low"
     assert feat["recommendation"]["status"] == "none_qualify"
+
+
+def test_ranks_by_cost_per_success_not_median_cost():
+    # flaky is cheaper per attempt but fails 1 in 5, so each pass costs more
+    out = aggregate.recommend([row("flaky:low", successes=4, cost=1.0, cps=1.25),
+                               row("steady:high", cost=1.1, cps=1.1)])
+    assert out["config"] == "steady:high"
+    assert out["runner_up"]["config"] == "flaky:low"
+
+
+def test_qualifier_needs_cost_per_success():
+    out = aggregate.recommend([row("n:low", cost=0.5, cps=None), row("p:low", cost=9.0)])
+    assert out["config"] == "p:low" and out["runner_up"] is None
+
+
+def test_cost_per_success_tie_broken_by_wall_time():
+    # same cost per success but different median cost: the tie must be on cost per success
+    out = aggregate.recommend([row("slow:low", cost=1.0, cps=2.0, wall=50.0),
+                               row("fast:low", cost=3.0, cps=2.0, wall=5.0)])
+    assert out["config"] == "fast:low"
+    assert out["runner_up"]["config"] == "slow:low"
