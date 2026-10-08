@@ -17,6 +17,7 @@ from crucible import (
     runner,
     workspace,
 )
+from crucible.mine import calibrate as mine_calibrate
 from crucible.mine import candidates as mine_candidates
 from crucible.mine import config as mine_config
 from crucible.mine import gh as mine_gh
@@ -433,6 +434,9 @@ def _mine(args: argparse.Namespace) -> int:
     if args.verify is not None and not args.verify:
         print("--verify needs at least one candidate id", file=sys.stderr)
         return 2
+    note = mine_calibrate.note(cfg.suites)
+    if note:
+        print(note, file=sys.stderr)
     try:
         kept, excluded = _mine_collect(args, top, cfg)
         if args.verify:
@@ -454,6 +458,62 @@ def _mine(args: argparse.Namespace) -> int:
         _print_candidates([e.candidate for e in excluded], [e.reason for e in excluded])
     print(f"\n{len(kept)} candidate(s), {len(excluded)} excluded")
     return 0
+
+
+def _print_calibration(report) -> None:
+    rows = [["suite", "status", "setup", "samples", "detail"]]
+    for s in report.suites:
+        setup = ("none" if not s.setup.log and s.setup.ok
+                 else f"{'ok' if s.setup.ok else 'FAILED'} {s.setup.seconds:.1f}s")
+        done = sum(x.outcome == "verified" for x in s.samples)
+        rows.append([s.name, s.status, setup, f"{done}/{len(s.samples)} verified", s.detail])
+    widths = [max(len(r[j]) for r in rows) for j in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(cell.ljust(w) for cell, w in zip(r, widths)).rstrip())
+    for s in report.suites:
+        if s.status == "ok":
+            continue
+        print(f"\n{s.name}: {s.status}")
+        if not s.setup.ok:
+            print(f"  setup log: {s.setup.log}")
+        for x in s.samples:
+            if x.outcome != "verified":
+                log = list(x.logs.values())[-1] if x.logs else "-"
+                print(f"  {x.id}: {x.reason} (log {log})")
+        for h in s.hints:
+            print(f"  hint [{h.id}]: {h.hint}")
+        if s.status == "no-candidates":
+            print("  warning: nothing to sample; the suite is untested")
+
+
+def _mine_calibrate(args: argparse.Namespace) -> int:
+    setup = _mine_setup(args)
+    if isinstance(setup, int):
+        return setup
+    top, _, cfg = setup
+    if not cfg.suites:
+        print("no suites configured in mine.yaml; nothing to calibrate", file=sys.stderr)
+        return 1
+    unknown = [n for n in args.suite or [] if n not in {s.name for s in cfg.suites}]
+    if unknown:
+        print(f"unknown suite(s): {', '.join(unknown)} (configured: "
+              f"{', '.join(s.name for s in cfg.suites)})", file=sys.stderr)
+        return 2
+    try:
+        kept, _ = _mine_collect(args, top, cfg)
+        report = mine_calibrate.calibrate(
+            top, cfg.suites, kept, names=args.suite, n=args.candidates, timeout=args.timeout,
+            force=args.force)
+    except (mine_candidates.MineGitError, workspace.WorkspaceError,
+            mine_verify.ScriptsLinkError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    mine_calibrate.save(report, cfg.suites)
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        _print_calibration(report)
+    return 0 if report.ok else 1
 
 
 def _mine_verify(args, top: Path, cfg, kept, excluded) -> int:
@@ -717,7 +777,22 @@ def build_parser() -> argparse.ArgumentParser:
                            help="with --verify: seconds allowed for each test step, overriding "
                                 "the suites' `timeout` (default: per suite, 600)")
             p.set_defaults(func=_mine)
-            mine_sub = p.add_subparsers(dest="mine_command", metavar="{show,scaffold,prove,leakcheck}")
+            mine_sub = p.add_subparsers(
+                dest="mine_command", metavar="{calibrate,show,scaffold,prove,leakcheck}")
+            ca = mine_sub.add_parser(
+                "calibrate", help="Prove each suite's config runs the repo's tests; diagnose it")
+            ca.add_argument("--candidates", type=_positive_int,
+                            default=mine_calibrate.DEFAULT_CANDIDATES, metavar="N",
+                            help="candidates to verify per suite (default 3)")
+            ca.add_argument("--suite", action="append", metavar="NAME",
+                            help="only this suite (repeatable; default all)")
+            ca.add_argument("--timeout", type=float, default=argparse.SUPPRESS,
+                            help="seconds allowed for each test step, overriding the suites' "
+                                 "`timeout` (setup keeps `setup_timeout`)")
+            ca.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
+                            help="ignore cached verification results and run again")
+            common(ca, hidden=True)
+            ca.set_defaults(func=_mine_calibrate)
             sh = mine_sub.add_parser("show", help="One candidate with its test and non-test diffs")
             sh.add_argument("id", help="candidate id (PR number or short SHA)")
             common(sh, hidden=True)

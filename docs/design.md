@@ -153,7 +153,7 @@ PR mining turns merged PRs into tasks.
 
 - Code lives in the `src/crucible/mine/` package: `config.py` (mine.yaml, path globs), `presets.py`
   and `detect.py` (framework presets, stack detection), `candidates.py` (model, filters, local-git source), `gh.py`, `verify.py`,
-  `scaffold.py`, `leak.py`.
+  `calibrate.py` and `diagnostics.py` (setup check, status and hints), `scaffold.py`, `leak.py`.
 - A candidate's **base** is the first parent of its merge commit (works for merge, squash and
   single-commit rebase merges). Its **merge** is the merge commit SHA. Both are full SHAs.
 - A file is a **test file** if it matches a suite's `test_paths` globs; everything else is
@@ -425,7 +425,7 @@ local source; `--local` forces it.
 
 `crucible mine show <id> [--json]` prints one candidate (listed or excluded, either source) plus
 `test_diff` and `non_test_diff` (the diffs base->merge of its test and non-test files) and
-`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional subcommand (`show`, `scaffold`,
+`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional subcommand (`calibrate`, `show`, `scaffold`,
 `prove`, `leakcheck`) and shares `--branch --limit --max-lines --local --json` with it.
 
 ### Verification (`mine/verify.py`)
@@ -483,6 +483,51 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   are still written), so a rerun with a longer `--timeout` or fixed setup really runs.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
   (the same string, or null) read from the cache.
+
+### Calibration (`mine/calibrate.py`, `mine/diagnostics.py`)
+
+Detection only guesses. `crucible mine calibrate [--candidates N] [--suite NAME]... [--json]
+[--timeout S] [--force]` (plus `--branch --limit --max-lines --local`) proves, per suite, that
+the config really runs the repo's tests:
+
+1. **Setup at HEAD.** `setup` runs in a fresh export of HEAD (`workspace.export_tree`, same step
+   runner and env as verify, limit `setup_timeout`); log `<home>/mine/calibrate/<suite>.setup.log`.
+   A suite without `setup` skips this. Failure: `setup-failed` (`timeout` if it hit the limit),
+   and no candidates are run.
+2. **Samples.** The N (default 3) newest candidates owned by the suite that carry a runnable file
+   for it are verified with `verify_candidate`: results already in the verify cache count toward
+   the sample without running (`--force` reruns), others run and are cached under verify's own
+   rules, so `timeout` and `setup failed ...` are never cached. `--timeout S` overrides the test
+   step as in verify.
+3. **Status** per suite: `ok` (at least one sample verified), `setup-failed`, `no-tests-ran`
+   (every sample's log matches a diagnostics row with `status: no-tests-ran`, for example pytest
+   exit 5), `not-selective` (every sample "passes at base"), `failing` (every sample fails at
+   merge), `timeout`, `no-candidates` (nothing to sample; not a failure, but the table warns that
+   the suite is untested) and `mixed` (samples fail in different ways; `detail` counts them).
+   Exit code 0 only when every selected suite is `ok` or `no-candidates`.
+
+**Diagnostics** are data: `src/crucible/data/diagnostics.yaml` (shipped in the wheel). A rule has
+`id`, `category`, `hint` (names the mine.yaml field to change), `pattern` (regex over the log
+body, header line excluded, last 64 KiB) and/or `exit` (both given: both must match), optional
+`stage` (`setup`/`test`) and `status: no-tests-ran`. The step runner appends `exit code: N` to
+every log, which is where the exit code is read from. Rows cover missing runner (127, "command
+not found", missing script), permission, "no tests" messages of pytest, jest, vitest, mocha,
+maven, gradle, go, cargo, rspec, phpunit, dotnet and mix, Python/Java/Node import errors, missing
+environment variables, refused service connections and timeouts. `status_hints` gives a generic
+hint per status. A test requires a sample log for every row, so contributors adding a row add its
+sample to `tests/test_mine_diagnostics.py`.
+
+**`--json`** (stable): `{"config_hash", "ok", "suites": [{"name", "status", "detail",
+"setup": {"ok", "seconds", "log", "tail"}, "samples": [{"id", "outcome" (verified | rejected |
+error), "reason", "cached", "logs", "tail"}], "hints": [{"id", "category", "hint"}]}]}`. `tail` is
+the last 20 lines of the setup log, or of the last step of that sample.
+
+**State.** `<home>/mine/calibration.json` holds `{"config_hash", "suites": {name: <suite
+report> + "calibrated_at"}}`. The hash covers every suite's `settings_hash()` (so editing a
+suite, or a wrapper script, which `scripts_digest()` is mixed into, makes the file stale) but not
+the timeouts. A `--suite` run merges into a file of the same hash; a different hash replaces it.
+`crucible mine` (listing, also `--json`) and `--verify` print one warning line on stderr when the
+current config is uncalibrated or its last calibration was not ok; they never fail because of it.
 
 ### Scaffold and prove (`mine/scaffold.py`)
 

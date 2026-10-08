@@ -80,7 +80,9 @@ def world(tmp_path, monkeypatch, crucible_home):
 def run(capsys, *argv, code=0):
     assert main(["mine", *argv]) == code
     cap = capsys.readouterr()
-    return cap.out, cap.err
+    # the "not calibrated" note is covered in test_mine_calibrate.py
+    err = "".join(ln for ln in cap.err.splitlines(keepends=True) if "calibrat" not in ln)
+    return cap.out, err
 
 
 def listing(capsys, *argv):

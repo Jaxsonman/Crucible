@@ -64,6 +64,14 @@ test case; no Python changes.
    malformed one fails with `<file>: <field>: ...`.
 3. Run `uv run pytest -q tests/test_mine_presets.py` and `uv run ruff check .`.
 
+## Adding a calibration hint
+
+`crucible mine calibrate` explains failures from `src/crucible/data/diagnostics.yaml`. To teach it
+a new log pattern, add a row (`id`, `category`, `pattern` and/or `exit`, `hint` naming the
+`mine.yaml` field to change; `status: no-tests-ran` for a "runner found no tests" message) and a
+sample log for its `id` in `SAMPLES` in `tests/test_mine_diagnostics.py`. A test fails for a row
+without a sample.
+
 ## Pull requests
 
 1. Fork the repository and create a branch (`feat/...`, `fix/...`, `docs/...`, `chore/...`).

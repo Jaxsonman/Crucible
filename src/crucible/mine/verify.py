@@ -255,10 +255,11 @@ def _run_step(command: str, cwd: Path, env: dict, timeout: float, log: Path) -> 
                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
             )
         except OSError as e:
-            out.write(f"could not start: {e}\n".encode())
+            out.write(f"could not start: {e}\nexit code: 127\n".encode())
             return 127, time.monotonic() - start
         try:
             code = proc.wait(timeout=timeout)
+            out.write(f"\nexit code: {code}\n".encode())
         except subprocess.TimeoutExpired:
             executor._terminate_group(proc)
             out.write(f"\ntimed out after {timeout}s and was killed\n".encode())
