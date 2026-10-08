@@ -10,7 +10,7 @@ M = 1_000_000
 
 def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:medium", n=1,
                 success=True, wall=10.0, tokens_by_model=None, sha="sha-one", kind="feature",
-                computed=999.0):
+                computed=999.0, check=None, judge=None):
     model, effort = config.split(":")
     slug = f"{model}-{effort}-{n}"
     d = home / "results" / task / batch / slug
@@ -18,6 +18,9 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
     tbm = tokens_by_model or {"claude-sonnet-5-5": {"input": M}}
     tbm = {m: {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0, **t}
            for m, t in tbm.items()}
+    if check is None:  # reports recompute success from the check, so derive it from `success`
+        check = {"ran": success is not None, "passed": success,
+                 "exit_code": None if success is None else (0 if success else 1)}
     rec = {
         "schema_version": 1, "task_id": task, "task_kind": kind, "batch_id": batch, "attempt": n,
         "config": {"model": model, "effort": effort}, "prompt_sha256": sha,
@@ -25,6 +28,7 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
         "tokens": {"input": sum(t["input"] for t in tbm.values()), "output": 0,
                    "cache_creation": 0, "cache_read": 0},
         "tokens_by_model": tbm, "cost_usd": {"computed": computed, "reported": 0.0},
+        "check": check, "judge": judge or {"ran": False, "passed": None},
         "success": success,
     }
     (d / "record.json").write_text(json.dumps(rec))
@@ -228,11 +232,30 @@ def test_json_matches_table(crucible_home, capsys):
 def test_sort_by_rate_then_cost():
     def rec(cfg, ok, inp):
         m, e = cfg.split(":")
-        return {"config": {"model": m, "effort": e}, "success": ok, "wall_seconds": 1.0,
-                "tokens_by_model": sonnet(inp)}
+        return {"config": {"model": m, "effort": e}, "status": "completed",
+                "check": {"ran": ok is not None, "passed": ok}, "success": ok,
+                "wall_seconds": 1.0, "tokens_by_model": sonnet(inp)}
 
     recs = [rec("a:low", True, 3 * M), rec("b:low", True, M), rec("c:low", False, M),
             rec("d:low", None, M)]
     order = [r["config"] for r in aggregate.aggregate_configs(recs)]
     assert order == ["b:low", "a:low", "c:low", "d:low"]
 
+
+
+def test_success_recomputed_check_decides_and_disagreement_counted(crucible_home, capsys):
+    passed = {"ran": True, "passed": True, "exit_code": 0}
+    # stored success=False is what the old AND rule wrote; the report must ignore it
+    make_record(crucible_home, n=1, success=False, check=passed,
+                judge={"ran": True, "passed": False})
+    make_record(crucible_home, n=2, success=True, check=passed, judge={"ran": True, "passed": True})
+    make_record(crucible_home, n=3, success=False,
+                check={"ran": False, "passed": None, "exit_code": None},
+                judge={"ran": True, "passed": False})
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Successes"] == "2" and row["Unknown"] == "0" and row["Attempts"] == "3"
+    assert row["Judge≠check"] == "1"
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    (cfg,) = json.loads(jout)["configs"]
+    assert cfg["judge_disagreements"] == 1 and cfg["successes"] == 2

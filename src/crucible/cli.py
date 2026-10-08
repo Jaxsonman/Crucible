@@ -157,6 +157,7 @@ def _run(args: argparse.Namespace) -> int:
     attempts = runner.plan(cfgs, args.repeat)
     if args.dry_run:
         print(f"task {task.id}  prompt sha256 {sha}")
+        print(f"check: {task.check or 'none'}")
         for a in attempts:
             print(f"planned: {a.config.label} #{a.n}")
         return 0
@@ -220,6 +221,7 @@ REPORT_COLUMNS = [
     ("Cost/success", lambda r: "—" if r["cost_per_success"] is None
         else f"${r['cost_per_success']:.4f}"),
     ("Unpriced", lambda r: str(r["unpriced"])),
+    ("Judge≠check", lambda r: str(r["judge_disagreements"])),
 ]
 
 

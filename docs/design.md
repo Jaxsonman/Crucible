@@ -130,9 +130,22 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
 
 `success` (`records.compute_success`), evaluated in this order:
 1. `status` is not `completed` → `false`.
-2. Neither check nor judge produced a verdict (`check.ran` false and `judge.passed` null or
-   judge not run) → `null` (unknown), never `true`.
-3. Otherwise `true` only if every verdict produced is a pass.
+2. The check ran and produced a verdict (`check.ran` and `check.passed` not null) →
+   `check.passed`.
+3. Else the judge ran and produced a verdict (`judge.ran` and `judge.passed` not null) →
+   `judge.passed`.
+4. Else `null` (unknown), never `true`.
+
+When a check produced a verdict it decides; the judge is advisory beside it, because it is an
+uncalibrated model grade and ANDing it in let a judge false negative fail a passing check.
+Reports recompute `success` from each record with `compute_success` and never read the stored
+field (the same way they re-price cost from tokens), so older records follow this rule without
+being edited; `judge.apply` and `runner.build_record` still store it for convenience. Report
+rows count `judge_disagreements` (`records.judge_disagrees`: the check and the judge both
+produced a verdict and they differ), shown in the `Judge≠check` column. The judge's own verdict
+stays in `judge.json` and in the record's `judge` block. `crucible run --dry-run` prints
+`check: <path>` or `check: none`, and the run skill adds `--judge` only for tasks without a
+check or when the user asks.
 
 ## Tokens and cost
 

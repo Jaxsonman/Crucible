@@ -68,16 +68,25 @@ def load_records(task_id: str | None = None) -> list[Record]:
 
 
 def compute_success(record: Record) -> bool | None:
-    """docs/design.md success rule: false if not completed, null if no verdict, else all pass."""
+    """docs/design.md success rule: false if not completed; else the check's verdict when the
+    check produced one; else the judge's verdict; else null (unknown)."""
     if record.get("status") != "completed":
         return False
     check = record.get("check") or {}
-    judge = record.get("judge") or {}
-    verdicts = []
     if check.get("ran") and check.get("passed") is not None:
-        verdicts.append(bool(check["passed"]))
+        return bool(check["passed"])
+    judge = record.get("judge") or {}
     if judge.get("ran") and judge.get("passed") is not None:
-        verdicts.append(bool(judge["passed"]))
-    if not verdicts:
-        return None
-    return all(verdicts)
+        return bool(judge["passed"])
+    return None
+
+
+def judge_disagrees(record: Record) -> bool:
+    """True when the check and the judge both produced a verdict and the verdicts differ."""
+    check = record.get("check") or {}
+    judge = record.get("judge") or {}
+    if not (check.get("ran") and check.get("passed") is not None):
+        return False
+    if not (judge.get("ran") and judge.get("passed") is not None):
+        return False
+    return bool(check["passed"]) != bool(judge["passed"])

@@ -37,7 +37,7 @@ def test_success_follows_verdicts():
     assert records.compute_success(rec(judge=jdg(True))) is True
     assert records.compute_success(rec(judge=jdg(False))) is False
     assert records.compute_success(rec(check=chk(True), judge=jdg(True))) is True
-    assert records.compute_success(rec(check=chk(True), judge=jdg(False))) is False
+    assert records.compute_success(rec(check=chk(True), judge=jdg(False))) is True  # check wins
     assert records.compute_success(rec(check=chk(False), judge=jdg(True))) is False
 
 
@@ -81,3 +81,23 @@ def test_write_record_refuses_existing_dir(crucible_home):
     else:
         raise AssertionError("expected FileExistsError")
     assert json.loads((d / "record.json").read_text()) == {"a": 1}
+
+
+def test_check_ran_without_verdict_falls_back_to_judge():
+    no_verdict = {"ran": True, "passed": None, "exit_code": None}
+    assert records.compute_success(rec(check=no_verdict, judge={"ran": True, "passed": True})) is True
+    assert records.compute_success(rec(check=no_verdict, judge={"ran": True, "passed": False})) is False
+    assert records.compute_success(rec(check=no_verdict)) is None
+
+
+def test_judge_disagrees_needs_two_verdicts():
+    chk = lambda p: {"ran": True, "passed": p, "exit_code": 0 if p else 1}
+    jdg = lambda p: {"ran": True, "passed": p}
+    assert records.judge_disagrees(rec(check=chk(True), judge=jdg(False))) is True
+    assert records.judge_disagrees(rec(check=chk(False), judge=jdg(True))) is True
+    assert records.judge_disagrees(rec(check=chk(True), judge=jdg(True))) is False
+    assert records.judge_disagrees(rec(check=chk(True))) is False  # judge did not run
+    assert records.judge_disagrees(rec(check=chk(True), judge=jdg(None))) is False
+    no_verdict = {"ran": True, "passed": None, "exit_code": None}
+    assert records.judge_disagrees(rec(check=no_verdict, judge=jdg(False))) is False
+    assert records.judge_disagrees({"status": "completed"}) is False  # old record, no blocks

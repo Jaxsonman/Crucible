@@ -8,6 +8,7 @@ import statistics
 from typing import Any
 
 from crucible import pricing
+from crucible.records import compute_success, judge_disagrees
 
 Record = dict[str, Any]
 Row = dict[str, Any]
@@ -37,12 +38,14 @@ def _median(values: list[float]) -> float | None:
 
 
 def summarize_config(label: str, records: list[Record]) -> Row:
-    """Aggregate the attempts of a single config."""
-    successes_flags = [r.get("success") for r in records]
-    known = [s for s in successes_flags if s is not None]
+    """Aggregate the attempts of a single config. Success is recomputed from each record with
+    `compute_success` (the stored `success` is never read), the same way cost is re-priced
+    from tokens, so older records follow the current success rule without being edited."""
+    flags = [compute_success(r) for r in records]
+    known = [s for s in flags if s is not None]
     successes = sum(1 for s in known if s)
     walls = [float(r["wall_seconds"]) for r in records if r.get("wall_seconds") is not None]
-    priced = [(reprice(r), r.get("success")) for r in records]
+    priced = [(reprice(r), s) for r, s in zip(records, flags)]
     costs = [c for c, _ in priced if c is not None]
     priced_successes = sum(1 for c, s in priced if c is not None and s)
     cost_per_success = sum(costs) / priced_successes if priced_successes else None
@@ -59,6 +62,7 @@ def summarize_config(label: str, records: list[Record]) -> Row:
         "median_cost": _median(costs),
         "cost_per_success": cost_per_success,
         "unpriced": len(records) - len(costs),
+        "judge_disagreements": sum(1 for r in records if judge_disagrees(r)),
     }
 
 

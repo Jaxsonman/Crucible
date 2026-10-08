@@ -15,6 +15,7 @@ def row(config, attempts=5, successes=5, unknown=0, cost=1.0, wall=10.0, tasks=1
 def rec(task, kind, cfg, ok, inp=M, wall=10.0):
     m, e = cfg.split(":")
     return {"task_id": task, "task_kind": kind, "config": {"model": m, "effort": e},
+            "status": "completed", "check": {"ran": ok is not None, "passed": ok},
             "success": ok, "wall_seconds": wall,
             "tokens_by_model": {"claude-sonnet-5-5": {"input": inp}}}
 

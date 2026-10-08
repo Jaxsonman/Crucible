@@ -290,3 +290,12 @@ def test_unexpected_exception_is_recorded_and_batch_continues(crucible_home, mon
     assert by["sonnet"]["status"] == "completed"
     (batch,) = batches(crucible_home)
     assert (batch / "opus-high-1" / "output.json").is_file()
+
+
+def test_dry_run_says_whether_task_has_a_check(crucible_home, capsys):
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run"]) == 0
+    assert "check: ./check.sh" in capsys.readouterr().out.splitlines()
+    md = crucible_home / "tasks" / "example-fizzbuzz" / "task.md"
+    md.write_text(md.read_text().replace("check: ./check.sh\n", ""))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run"]) == 0
+    assert "check: none" in capsys.readouterr().out.splitlines()
