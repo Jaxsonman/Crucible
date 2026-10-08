@@ -69,11 +69,13 @@ def test_record_schema_and_order(crucible_home):
     (batch,) = batches(crucible_home)
     r = json.loads((batch / "opus-high-1" / "record.json").read_text())
     assert list(r) == [
-        "schema_version", "task_id", "task_kind", "batch_id", "attempt", "config",
-        "resolved_model", "prompt_sha256", "baseline_sha", "started_at", "wall_seconds",
-        "status", "error", "num_turns", "session_id", "subtype", "reported_duration_ms",
-        "tokens", "tokens_by_model", "cost_usd", "check", "judge", "success",
+        "schema_version", "task_id", "task_kind", "task_source_lines", "batch_id", "attempt",
+        "config", "resolved_model", "prompt_sha256", "baseline_sha", "started_at",
+        "wall_seconds", "status", "error", "num_turns", "session_id", "subtype",
+        "reported_duration_ms", "tokens", "tokens_by_model", "cost_usd", "check", "judge",
+        "success",
     ]
+    assert r["task_source_lines"] is None
     assert r["schema_version"] == 1 and r["task_id"] == "example-fizzbuzz"
     assert r["task_kind"] == "feature" and r["batch_id"] == batch.name
     assert r["attempt"] == 1 and r["config"] == {"model": "opus", "effort": "high"}
@@ -345,3 +347,10 @@ def test_non_positive_budget_flag_rejected(crucible_home, capsys):
     assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low",
                  "--max-budget-usd", "0"]) == 1
     assert "--max-budget-usd must be positive" in capsys.readouterr().err
+
+
+def test_record_carries_task_source_lines(crucible_home):
+    set_front(crucible_home, "source_lines: 42\n")
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low"]) == 0
+    (r,) = records.load_records("example-fizzbuzz")
+    assert r["task_source_lines"] == 42

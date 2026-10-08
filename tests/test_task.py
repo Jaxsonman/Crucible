@@ -318,3 +318,29 @@ def test_templates_show_commented_budget(crucible_home):
     assert main(["task", "new", "demo"]) == 0
     assert "# max_budget_usd:" in (crucible_home / "tasks" / "demo" / "task.md").read_text()
     assert "# max_budget_usd:" in repo_task_md("x", "../..", "abc123")
+
+
+def test_source_lines_optional_positive_int(crucible_home):
+    assert load_task(make_task(crucible_home)).source_lines is None
+    front = "id: t2\nkind: x\nrepo: fixture\nsource_lines: 120"
+    d = make_task(crucible_home, name="t2", front=front)
+    assert load_task(d).source_lines == 120
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "many", "true", "1.5"])
+def test_source_lines_must_be_positive_int(crucible_home, value):
+    d = make_task(crucible_home, front=f"id: t1\nkind: x\nrepo: fixture\nsource_lines: {value}")
+    with pytest.raises(TaskError, match="source_lines"):
+        load_task(d)
+
+
+def test_uniformly_indented_bullets_are_separate_criteria(crucible_home):
+    body = criteria_body("  - First\n  - Second\n    wrapped\n  * Third\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["First", "Second wrapped", "Third"]
+
+
+def test_nested_bullet_under_indented_parent_still_joins(crucible_home):
+    body = criteria_body("  - Parent\n    - sub one\n  - Next\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["Parent - sub one", "Next"]

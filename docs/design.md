@@ -55,6 +55,7 @@ check: ./check.sh             # optional; run from the workspace root, relative 
 timeout_minutes: 30           # optional, default 30
 max_turns: 100                # optional, default 100
 max_budget_usd: 2.0           # optional per-attempt spend cap (USD); --max-budget-usd overrides it
+source_lines: 42              # optional; written by mine scaffold (counted changed lines)
 ---
 
 ## What
@@ -73,11 +74,12 @@ Acceptance criteria are the section's bullets (`-` or `*`), used by both the age
 the judge. A non-blank line that does not start a bullet continues the bullet before it
 (Markdown lazy continuation) and is joined to it with one space after stripping its leading
 whitespace; an indented nested bullet (`  - sub`) is a continuation too and keeps its `- `
-text. A blank line ends a bullet. A section with no bullet fails validation (`has no bullet
-criteria`); text that continues no bullet (before the first bullet, or after a blank line)
-fails with `has text outside bullets`. Fixing the old first-line-only parsing changed the
-prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed warning
-covers that and no attempt was rerun.
+text. The section is dedented first, so bullets that are all indented alike are still one
+criterion each. A blank line ends a bullet. A section with no bullet fails validation
+(`has no bullet criteria`); text that continues no bullet (before the first bullet, or after a
+blank line) fails with `has text outside bullets`. Fixing the old first-line-only parsing
+changed the prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed
+warning covers that and no attempt was rerun.
 
 ## Results layout
 
@@ -106,6 +108,7 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
   "schema_version": 1,
   "task_id": "example-fizzbuzz",
   "task_kind": "feature",
+  "task_source_lines": null,
   "batch_id": "20261001T143000Z-a1b2",
   "attempt": 1,
   "config": {"model": "sonnet", "effort": "medium"},
@@ -128,6 +131,9 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
   "success": true
 }
 ```
+
+`task_source_lines` copies the task's optional `source_lines` (null when absent), so results
+can later be broken down by task size; no report uses it yet.
 
 `success` (`records.compute_success`), evaluated in this order:
 1. `status` is not `completed` → `false`.
@@ -386,7 +392,9 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   homes; `repo` from `task.repo_relative`, here the relative path from the task dir to the repo
   root, so it also works when the home is not inside the repo). Front matter: `id`, `kind`
   (given or suggested), `repo`, `ref` = base SHA, `source` (PR URL or `commit:<merge>`),
-  `timeout_minutes: 30`, `max_turns: 100`, `check: ./check.sh`, and `_(...)_` placeholders in the
+  `source_lines` (the candidate's counted lines, the same number the `max_changed_lines` filter
+  used; omitted when 0), `timeout_minutes: 30`, `max_turns: 100`, `check: ./check.sh`, and
+  `_(...)_` placeholders in the
   three sections, so an unedited task fails `crucible task validate`.
 - **`hidden_tests/`.** The PR's test files (all changed test files, runnable or not) at their
   merge versions at repo-relative paths (git modes kept: exec bit, symlinks; `check.sh`'s `tar`

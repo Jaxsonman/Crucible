@@ -4,6 +4,7 @@ import math
 import os
 import re
 import subprocess
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class Task:
     task_dir: Path
     source: str | None = None  # mined tasks: PR URL, or `commit:<merge sha>`
     max_budget_usd: float | None = None  # per-attempt cap; `crucible run --max-budget-usd` wins
+    source_lines: int | None = None  # mined tasks: counted changed lines of the source change
 
     @property
     def repo_path(self) -> Path:
@@ -88,7 +90,9 @@ def _sections(body: str) -> dict[str, str]:
             out.setdefault(current, [])
         elif current is not None:
             out[current].append(line)
-    return {k: "\n".join(v).strip() for k, v in out.items()}
+    # Strip blank lines and trailing space but keep the first line's own indent: `_criteria`
+    # needs it to tell a uniformly indented list from a nested one.
+    return {k: re.sub(r"\A(?:[ \t]*\n)+", "", "\n".join(v).rstrip()) for k, v in out.items()}
 
 
 def _positive_int(fm: dict, key: str, default: int, fail) -> int:
@@ -106,7 +110,13 @@ def _criteria(text: str) -> tuple[list[str], bool]:
     with one space after stripping its whitespace; an indented nested bullet (`  - sub`) is a
     continuation too and keeps its `- ` text. A blank line closes the open criterion. `stray`
     is True when a non-blank line had no open criterion to continue.
+
+    The text is dedented first (`textwrap.dedent`, common leading whitespace of the non-blank
+    lines), so a list whose top-level bullets are all indented alike still has one criterion
+    per bullet. This relies on `_sections` keeping the first line's indent: a bullet nested
+    deeper than the first one is still a continuation.
     """
+    text = textwrap.dedent(text)
     criteria: list[str] = []
     is_open = False
     stray = False
@@ -190,6 +200,11 @@ def load_task(path: str | Path) -> Task:
         or not math.isfinite(max_budget) or max_budget <= 0
     ):
         fail(f"`max_budget_usd` must be a positive number, got {max_budget!r}")
+    source_lines = fm.get("source_lines")
+    if source_lines is not None and (
+        isinstance(source_lines, bool) or not isinstance(source_lines, int) or source_lines <= 0
+    ):
+        fail(f"`source_lines` must be a positive integer, got {source_lines!r}")
 
     timeout = _positive_int(fm, "timeout_minutes", 30, fail)
     max_turns = _positive_int(fm, "max_turns", 100, fail)
@@ -198,7 +213,7 @@ def load_task(path: str | Path) -> Task:
     for name in SECTIONS:
         if name not in sections:
             fail(f"missing section '## {name}'")
-        if not sections[name]:
+        if not sections[name].strip():
             fail(f"section '## {name}' is empty")
     criteria, stray = _criteria(sections["Acceptance criteria"])
     if not criteria:
@@ -218,12 +233,13 @@ def load_task(path: str | Path) -> Task:
         check=check,
         timeout_minutes=timeout,
         max_turns=max_turns,
-        what=sections["What"],
-        why=sections["Why"],
+        what=sections["What"].strip(),
+        why=sections["Why"].strip(),
         criteria=criteria,
         task_dir=task_dir,
         source=source,
         max_budget_usd=None if max_budget is None else float(max_budget),
+        source_lines=source_lines,
     )
 
 

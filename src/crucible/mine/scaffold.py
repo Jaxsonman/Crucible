@@ -150,7 +150,8 @@ def scaffold_task_dir(
     task_dir.mkdir()
     try:
         extra = (f"source: {json.dumps(c.source)}\n"
-                 f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
+                 + (f"source_lines: {c.size}\n" if c.size > 0 else "")
+                 + f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
         (task_dir / "task.md").write_text(
             repo_task_md(slug, repo_relative(repo.resolve(), task_dir), c.base,
                          kind or c.suggested_kind, extra),

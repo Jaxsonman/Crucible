@@ -75,6 +75,9 @@ def test_scaffold_writes_task_and_validate_fails_only_on_placeholders(
     assert fm["source"] == f"commit:{repo.sha['fix']}"
     assert fm["check"] == "./check.sh" and fm["kind"] == "bugfix"
     assert fm["timeout_minutes"] == 30 and fm["max_turns"] == 100
+    # counted lines of the `fix add` commit: src/calc.py 1+1, tests/test_calc.py 4,
+    # tests/helpers.py 1
+    assert fm["source_lines"] == 7
     assert (d / fm["repo"]).resolve() == repo.path
     assert (d / "hidden_tests/tests/test_calc.py").is_file()
     assert (d / "hidden_tests/tests/helpers.py").is_file()
@@ -90,6 +93,7 @@ def test_scaffold_writes_task_and_validate_fails_only_on_placeholders(
     assert main(["task", "validate", str(d)]) == 0
     assert capsys.readouterr().out.strip() == f"ok: {d.name}"
     assert load_task(d).source == f"commit:{repo.sha['fix']}"
+    assert load_task(d).source_lines == 7
 
 
 def test_prove_passes_then_always_green_check_fails(mined, capsys):
