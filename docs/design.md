@@ -75,11 +75,13 @@ stored in every attempt record so identical input can be proven.
 Acceptance criteria are the section's bullets (`-` or `*`), used by both the agent prompt and
 the judge. A non-blank line that does not start a bullet continues the bullet before it
 (Markdown lazy continuation) and is joined to it with one space after stripping its leading
-whitespace; an indented nested bullet (`  - sub`) is a continuation too and keeps its `- `
-text. The section is dedented first, so bullets that are all indented alike are still one
-criterion each. A blank line ends a bullet. A section with no bullet fails validation
-(`has no bullet criteria`); text that continues no bullet (before the first bullet, or after a
-blank line) fails with `has text outside bullets`. Fixing the old first-line-only parsing
+whitespace. A bullet nested at least 2 columns deeper than the open criterion's own bullet
+(`  - sub` under `- parent`) is a continuation too and keeps its `- ` text; a bullet indented
+less than that (a sibling off by one space) starts a new criterion. Tabs are expanded to 4
+columns and the section is then dedented, so bullets that are all indented alike, with spaces
+or tabs, are still one criterion each. A blank line ends a bullet. A section with no bullet fails
+validation (`has no bullet criteria`); text that continues no bullet (before the first bullet,
+or after a blank line) fails with `has text outside bullets`. Fixing the old first-line-only parsing
 changed the prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed
 warning covers that and no attempt was rerun.
 
@@ -140,7 +142,7 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
   "tokens": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0},
   "tokens_by_model": {"claude-sonnet-5-5": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}},
   "cost_usd": {"computed": 0.0, "reported": 0.0},
-  "check": {"ran": true, "passed": true, "exit_code": 0},
+  "check": {"ran": true, "passed": true, "exit_code": 0, "seconds": 41.2, "timed_out": false},
   "judge": {"ran": true, "passed": true, "criteria_passed": 4, "criteria_total": 4, "judge_config": "sonnet:medium", "judge_cost_usd": 0.0},
   "success": true
 }
@@ -216,7 +218,9 @@ one, the report prints `warning: <label> pools N models: a, b` after the table (
 `--json`), because an alias such as `sonnet` can move to a newer model between batches.
 
 **Stopped attempts.** `stopped` counts attempts that a limit ended: `status` `timeout`, or
-`subtype` `error_max_turns` or `error_max_budget_usd` (`aggregate.is_stopped`). The `Stopped`
+`subtype` `error_max_turns` or `error_max_budget_usd`, or a check killed by `--check-timeout`
+(`check.timed_out`, additive and optional: older records read as not timed out; the attempt
+is otherwise an ordinary completion) (`aggregate.is_stopped`). The `Stopped`
 column follows `Unknown`. Stopped attempts still count as failures in the success rate (the
 config did not deliver), but the reader can see that a limit, not the model, ended them.
 `crucible run` caps each attempt at `--max-budget-usd` when the flag is given, else at the
@@ -432,8 +436,10 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   exit code is collected like a test failure (the script exits with the first failing code,
   and every suite still runs); a setup failure still exits 97 before anything else. A
   single-suite task without one still `exec`s its test command, byte for byte as before.
-  `prove` needs no change: a regression that fails at the merge commit shows up as
-  `fails at merge`.
+  A regression that fails at the merge commit shows up in `prove` as `fails at merge`. At run
+  time the check is killed after `--check-timeout` (default 300 s, `prove` allows 600 s), so a
+  whole-suite regression must finish within it or the timeout must be raised; `prove` prints
+  the merge check's duration and warns when it exceeds the default.
 - **`check.sh`** (mode 755), generated from the suite, run by `checker.run_check` with the
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
   copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
@@ -454,9 +460,12 @@ filled), exports `ref` with `workspace.export_tree` into a fresh dir under `path
 and runs the task's own `check.sh` through `checker.run_check`: it must fail. It then does the
 same on the merge commit, where it must pass. The merge SHA comes from `.mine.json`, else a
 `commit:` source, else (tasks without `.mine.json` and a PR-URL source) the verify cache entry
-whose `id` is the PR number in the URL and whose `base` equals `ref`. Prints `proven: <id>` and
-exits 0; otherwise prints `not proven: <id>: <reason>` and the last 40 log lines on stderr and
-exits 1. Reasons: `passes at base`, `fails at merge`, `setup failed at base|merge`,
+whose `id` is the PR number in the URL and whose `base` equals `ref`. Prints
+`proven: <id> (merge check 12.3s)` and exits 0, with `warning: merge check took 612.0s, over the
+default --check-timeout of 300s; raise --check-timeout when running this task` on stderr when
+the merge check outlasted `checker.DEFAULT_TIMEOUT_S`; otherwise prints
+`not proven: <id>: <reason>` and the last 40 log lines on stderr and exits 1. Reasons:
+`passes at base`, `fails at merge`, `setup failed at base|merge`,
 `check did not finish at base` (timeout). `task.py` accepts an optional `source:` string and
 exposes it as `Task.source`.
 

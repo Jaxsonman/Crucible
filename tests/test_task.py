@@ -262,6 +262,16 @@ def test_nested_bullet_is_a_continuation(crucible_home):
     assert t.criteria == ["Parent text - sub one * sub two", "Next"]
 
 
+def test_tab_indented_bullet_stay_separate(crucible_home):
+    body = criteria_body("\t- a\n    - b\n")  # a tab counts as 4 columns
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["a", "b"]
+
+
+def test_sibling_indented_one_space_is_a_new_criterion(crucible_home):
+    body = criteria_body("- a\n - b\n- c\n")  # one space is not a nested level (needs 2)
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["a", "b", "c"]
+
+
 def test_blank_line_ends_a_bullet(crucible_home):
     body = criteria_body("- First\n\n- Second\n  wrapped\n")
     assert load_task(make_task(crucible_home, body=body)).criteria == ["First", "Second wrapped"]

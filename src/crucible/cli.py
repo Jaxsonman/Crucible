@@ -666,7 +666,12 @@ def _mine_prove(args: argparse.Namespace) -> int:
                   f"({len(flags)} flag(s)); rewrite it or pass --allow-leaks", file=sys.stderr)
             return 1
     if result.ok:
-        print(f"proven: {result.task_id}")
+        secs = result.merge_seconds
+        print(f"proven: {result.task_id}" + ("" if secs is None else f" (merge check {secs:.1f}s)"))
+        if secs is not None and secs > checker.DEFAULT_TIMEOUT_S:
+            print(f"warning: merge check took {secs:.1f}s, over the default --check-timeout of "
+                  f"{checker.DEFAULT_TIMEOUT_S:g}s; raise --check-timeout when running this task",
+                  file=sys.stderr)
         return 0
     print(f"not proven: {result.task_id}: {result.failure}", file=sys.stderr)
     if result.log:

@@ -58,10 +58,12 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
     """The task's `check.sh`: self-contained, run with the workspace as cwd. It installs the
     hidden tests once, then for each suite runs exactly the setup and test command `verify`
     ran (`bash -c`, same placeholder filling, only that suite's runnable files). One suite
-    exec's its test command. Several suites each run in a subshell (own env and cwd); a setup
-    failure exits 97 at once, test failures are collected so every suite runs, and the script
-    exits with the first failing code. A suite's optional regression_command runs after its tests
-    in the same cwd and env."""
+    without a regression_command exec's its test command; with one, the test command runs via
+    `bash -c` with its exit code kept and the regression command follows. Several suites each
+    run in a subshell (own env and cwd); a setup failure exits 97 at once, test failures are
+    collected so every suite runs, and the script exits with the first failing code. A suite's
+    optional regression_command runs after its tests in the same cwd and env. A failed copy of
+    the hidden tests exits 98."""
     suites = verify.as_suites(suites)
     plan = verify.suite_plan_for(suites, runnable)
     names = ", ".join(repr(s.name) for s in suites)
@@ -177,6 +179,7 @@ class ProveResult:
     task_id: str
     failure: str = ""  # e.g. "passes at base"
     log: str = ""
+    merge_seconds: float | None = None  # how long the check took at the merge commit
 
     def tail(self) -> str:
         return "\n".join(self.log.rstrip("\n").splitlines()[-LOG_TAIL:])
@@ -239,7 +242,7 @@ def prove_task(task: Task, timeout: float = verify.DEFAULT_TIMEOUT_S) -> ProveRe
     if not after.passed:
         why = "setup failed at merge" if SETUP_FAILED in after.log else "fails at merge"
         return ProveResult(False, task.id, why, after.log)
-    return ProveResult(True, task.id)
+    return ProveResult(True, task.id, merge_seconds=after.seconds)
 
 
 __all__ = [

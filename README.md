@@ -61,6 +61,7 @@ suites:
     setup: pip install -q -r requirements.txt
     test_command: python manage.py test {modules}   # {tests} and/or {modules}
     module_root: backend
+    # regression_command: python manage.py test   # optional: whole suite, runs at check time
 exclude_paths: ["**/*.lock", "docs/**", "*.md"]
 max_changed_lines: 800
 ```
@@ -186,8 +187,10 @@ config the report says "no config meets the bar" and lists the best candidates i
 Reports re-price every attempt from the recorded tokens and the current `pricing.yaml`.
 
 Reading the table: `Success rate` shows a 95% Wilson interval (`100% (44–100%)` for 3 of 3),
-`Stopped` counts attempts ended by a timeout, turn cap or budget cap (still failures), and
-`Judge≠check` counts judge/check disagreements. A warning follows the table when one config
+`Stopped` counts attempts ended by a timeout, turn cap or budget cap, or whose check was killed
+by `--check-timeout` (default 300 s; a whole-suite `regression_command` must finish within it, or
+raise the timeout); stopped attempts are still failures. `Judge≠check` counts judge/check
+disagreements. A warning follows the table when one config
 label pooled several model versions. The recommendation ranks configs that clear the bar by
 cost per success (failed attempts included). The cross-task report compares configs only on
 the tasks every config attempted and says so (`Compared on N of M tasks attempted by every

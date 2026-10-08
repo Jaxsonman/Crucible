@@ -100,10 +100,23 @@ def test_prove_passes_then_always_green_check_fails(mined, capsys):
     fill(mined)
     capsys.readouterr()
     assert main(["mine", "prove", str(mined)]) == 0
-    assert capsys.readouterr().out.strip() == f"proven: {mined.name}"
+    cap = capsys.readouterr()
+    assert re.fullmatch(rf"proven: {mined.name} \(merge check \d+\.\ds\)", cap.out.strip())
+    assert "warning" not in cap.err  # well under the default --check-timeout
     (mined / "check.sh").write_text("#!/bin/sh\nexit 0\n")
     assert main(["mine", "prove", str(mined)]) == 1
     assert "passes at base" in capsys.readouterr().err
+
+
+def test_prove_warns_when_merge_check_exceeds_default_check_timeout(mined, monkeypatch, capsys):
+    fill(mined)
+    monkeypatch.setattr(checker, "DEFAULT_TIMEOUT_S", 0.0)
+    capsys.readouterr()
+    assert main(["mine", "prove", str(mined)]) == 0
+    cap = capsys.readouterr()
+    assert re.fullmatch(rf"proven: {mined.name} \(merge check \d+\.\ds\)", cap.out.strip())
+    assert re.search(r"warning: merge check took \d+\.\ds, over the default --check-timeout "
+                     r"of 0s; raise --check-timeout when running this task", cap.err)
 
 
 def test_prove_fails_at_merge_and_shows_log_tail(mined, capsys):

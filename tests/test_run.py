@@ -82,7 +82,7 @@ def test_record_schema_and_order(crucible_home):
     assert r["resolved_model"] == "claude-opus-5-5"
     assert r["status"] == "completed" and r["error"] is None
     assert r["success"] is False  # stub fizzbuzz fails the example check (see test_check.py)
-    assert list(r["check"]) == ["ran", "passed", "exit_code", "seconds"]
+    assert list(r["check"]) == ["ran", "passed", "exit_code", "seconds", "timed_out"]
     assert r["check"]["ran"] is True and r["check"]["passed"] is False
     assert r["judge"]["ran"] is False and r["judge"]["passed"] is None
     assert r["tokens"] == {"input": 1200, "output": 600, "cache_creation": 2400, "cache_read": 3600}

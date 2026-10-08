@@ -406,6 +406,8 @@ _REGRESSION_NOTE = """\
   #   optional: runs the whole suite at check time, after the PR's tests (no placeholders);
   #   the check fails if it fails. `crucible mine prove` rejects a task whose regression fails
   #   at the merge commit, so exclude pre-existing failures in the command or remove the line.
+  #   The check is killed after --check-timeout (default 300 s) at run time, so the whole suite
+  #   must finish within it, or raise the timeout.
 """
 
 

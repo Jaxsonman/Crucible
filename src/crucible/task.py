@@ -105,29 +105,33 @@ def _positive_int(fm: dict, key: str, default: int, fail) -> int:
 def _criteria(text: str) -> tuple[list[str], bool]:
     """Parse the Acceptance criteria section. Returns (criteria, stray).
 
-    A bullet (`-` or `*`) at column 0, or any bullet while none is open, starts a criterion.
-    Any other non-blank line continues the open criterion (Markdown lazy continuation), joined
-    with one space after stripping its whitespace; an indented nested bullet (`  - sub`) is a
-    continuation too and keeps its `- ` text. A blank line closes the open criterion. `stray`
-    is True when a non-blank line had no open criterion to continue.
+    A bullet (`-` or `*`) starts a criterion unless it is nested: a bullet indented at least
+    2 columns more than the open criterion's own bullet (`  - sub` under `- parent`) is a
+    continuation and keeps its `- ` text. Any other non-blank line also continues the open
+    criterion (Markdown lazy continuation), joined with one space after stripping its
+    whitespace. A blank line closes the open criterion. `stray` is True when a non-blank line
+    had no open criterion to continue.
 
-    The text is dedented first (`textwrap.dedent`, common leading whitespace of the non-blank
-    lines), so a list whose top-level bullets are all indented alike still has one criterion
-    per bullet. This relies on `_sections` keeping the first line's indent: a bullet nested
-    deeper than the first one is still a continuation.
+    Tabs are expanded to 4 columns (`expandtabs`) and the text is then dedented
+    (`textwrap.dedent`, common leading whitespace of the non-blank lines), so a list whose
+    top-level bullets are all indented alike, with spaces or tabs, still has one criterion per
+    bullet. This relies on `_sections` keeping the first line's indent.
     """
-    text = textwrap.dedent(text)
+    text = textwrap.dedent(text.expandtabs(4))
     criteria: list[str] = []
     is_open = False
+    open_indent = 0  # indent of the open criterion's own bullet
     stray = False
     for line in text.splitlines():
         if not line.strip():
             is_open = False
             continue
         m = BULLET_RE.match(line)
-        if m and (not is_open or not line[:1].isspace()):
+        indent = len(line) - len(line.lstrip())
+        if m and (not is_open or indent < open_indent + 2):
             criteria.append(m.group(1))
             is_open = True
+            open_indent = indent
         elif is_open:
             criteria[-1] += " " + line.strip()
         else:

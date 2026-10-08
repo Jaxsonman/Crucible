@@ -20,12 +20,17 @@ def config_label(record: Record) -> str:
     return f"{cfg.get('model')}:{cfg.get('effort')}"
 
 
+# Limits that end the agent (`status` / `subtype`). A check killed by --check-timeout is the
+# fourth limit; it is recorded on the check (`check.timed_out`), not on the attempt's status.
 STOP_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
 
 
 def is_stopped(record: Record) -> bool:
-    """The attempt was ended by a limit (timeout, turn cap, budget cap), not by the model."""
-    return record.get("status") == "timeout" or record.get("subtype") in STOP_SUBTYPES
+    """A limit ended the attempt, not the model: the attempt timeout, the turn cap, the budget
+    cap, or the check being killed by --check-timeout (records without `check.timed_out`, i.e.
+    older ones, read as not timed out)."""
+    return (record.get("status") == "timeout" or record.get("subtype") in STOP_SUBTYPES
+            or bool((record.get("check") or {}).get("timed_out")))
 
 
 def total_tokens(record: Record) -> int:

@@ -12,7 +12,7 @@ M = 1_000_000
 def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:medium", n=1,
                 success=True, wall=10.0, tokens_by_model=None, sha="sha-one", kind="feature",
                 computed=999.0, check=None, judge=None, resolved_model=None, status="completed",
-                subtype="success"):
+                subtype="success", check_timed_out=False):
     model, effort = config.split(":")
     slug = f"{model}-{effort}-{n}"
     d = home / "results" / task / batch / slug
@@ -23,6 +23,8 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
     if check is None:  # reports recompute success from the check, so derive it from `success`
         check = {"ran": success is not None, "passed": success,
                  "exit_code": None if success is None else (0 if success else 1)}
+        if check_timed_out:  # a killed check has no exit code
+            check.update(passed=False, exit_code=None, timed_out=True)
     rec = {
         "schema_version": 1, "task_id": task, "task_kind": kind, "batch_id": batch, "attempt": n,
         "config": {"model": model, "effort": effort}, "prompt_sha256": sha,
@@ -320,6 +322,18 @@ def test_label_pooling_several_models_warns(crucible_home, capsys):
     assert "warning: sonnet:low pools 2 models" in err
     _, out, _ = run_report(capsys)  # cross-task report warns too
     assert "warning: sonnet:low pools 2 models" in out
+
+
+def test_check_timeout_counts_as_stopped_and_failed(crucible_home, capsys):
+    make_record(crucible_home, n=1, success=True)
+    make_record(crucible_home, n=2, success=False, check_timed_out=True)  # ordinary completion
+    make_record(crucible_home, n=3, success=False)  # plain failure, no timed_out key at all
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Stopped"] == "1" and row["Attempts"] == "3" and row["Successes"] == "1"
+    assert row["Success rate"].startswith("33% ")
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    assert json.loads(jout)["configs"][0]["stopped"] == 1
 
 
 def test_stopped_column(crucible_home, capsys):
