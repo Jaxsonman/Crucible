@@ -1,0 +1,21 @@
+# PHPUnit. The CLI takes ONE path argument, so several files are selected with --filter, a
+# regular expression matched against "Namespace\Class::method"; the file stem is the class name
+# (PSR-4), and alternatives are joined with `|`. (PHPUnit wraps a pattern that is not a valid
+# regex in /.../i.)
+name: phpunit
+markers:
+  - {glob: phpunit.xml}
+  - {glob: phpunit.xml.dist}
+  - {glob: composer.json, contains: '"phpunit/phpunit"'}
+evidence: ["**/*Test.php"]
+test_paths:
+  - "{suite_dir}/tests/**"
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/*Test.php"
+runnable:
+  - "*Test.php"
+setup: composer install --no-interaction --no-progress --quiet
+test_command: 'vendor/bin/phpunit --filter {tests|stem|join:\|}'
+notes: >-
+  The filter also matches classes whose name merely contains the stem (FooTest vs FooTestCase),
+  which can run a few extra tests.

@@ -1,0 +1,28 @@
+# .NET (xUnit, NUnit, MSTest). `dotnet test --filter` selects by property; FullyQualifiedName~X
+# means "contains X", and `|` ORs clauses, so each changed test class file selects its class by
+# the file stem (convention: one class per file, named like the file). The whole expression is
+# one shell word.
+name: dotnet
+markers:
+  # a solution builds all of its projects from the root
+  - {glob: "*.sln", aggregator: true}
+  - {glob: "*.slnx", aggregator: true}
+  - {glob: "*.csproj", contains: 'Microsoft\.NET\.Test\.Sdk'}
+evidence: ["**/*Test.cs", "**/*Tests.cs"]
+test_paths:
+  - "{suite_dir}/**/*Tests.cs"
+  - "{suite_dir}/**/*Test.cs"
+  - "{suite_dir}/**/*.Tests/**"
+  - "{suite_dir}/**/*.Test/**"
+  - "{suite_dir}/**/Tests/**"
+  - "{suite_dir}/**/tests/**"
+runnable:
+  - "*Tests.cs"
+  - "*Test.cs"
+timeout: 1200
+setup_timeout: 3600
+setup: dotnet restore
+test_command: 'dotnet test --filter {tests|stem|prefix:FullyQualifiedName~|join:\|}'
+notes: >-
+  F# and VB test projects need their own runnable globs. A class whose name differs from its
+  file name is not selected.

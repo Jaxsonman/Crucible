@@ -1,0 +1,40 @@
+# Gradle (Java and Kotlin). `test --tests <pattern>` filters by class name and may be repeated.
+# We pass `*.SimpleName`: Gradle's filter wildcards match any package, so no package/FQCN has
+# to be derived from a source-set root (src/test/java vs src/test/kotlin vs a sub-project).
+# The `\*` keeps the shell from globbing. Prefer the repo's wrapper when it has one.
+name: gradle
+markers:
+  # a settings file that includes sub-projects builds them from the root: not separate suites
+  - {glob: "settings.gradle*", contains: '^\s*include\b', aggregator: true}
+  - {glob: build.gradle}
+  - {glob: build.gradle.kts}
+supersedes: [maven]
+evidence: ["**/src/test/**", "**/src/integrationTest/**"]
+test_paths:
+  - "{suite_dir}/**/src/test/**"
+  - "{suite_dir}/**/src/integrationTest/**"
+runnable:
+  - "*Test.java"
+  - "*Tests.java"
+  - "*TestCase.java"
+  - "Test*.java"
+  - "*IT.java"
+  - "*ITCase.java"
+  - "*Test.kt"
+  - "*Tests.kt"
+  - "*TestCase.kt"
+  - "Test*.kt"
+  - "*IT.kt"
+  - "*ITCase.kt"
+timeout: 1200
+setup_timeout: 3600
+setup: gradle testClasses --console=plain
+test_command: gradle test --console=plain {tests|stem|prefix:--tests \*.}
+variants:
+  - when: [gradlew]
+    setup: ./gradlew testClasses --console=plain
+    test_command: ./gradlew test --console=plain {tests|stem|prefix:--tests \*.}
+notes: >-
+  In a multi-project build Gradle fails a sub-project whose test task matches nothing ("No
+  tests found for given includes"); if calibration shows that, run one project
+  (./gradlew :sub:test ...) or set filter.failOnNoMatchingTests = false in the build.

@@ -1,0 +1,39 @@
+# Maven + Surefire. `-Dtest=` takes comma-separated class SIMPLE names (or patterns), so the
+# file stem is enough, and it works for Java and Kotlin alike and for any module of a reactor
+# build without deriving a package. `-Dsurefire.failIfNoSpecifiedTests=false` (Surefire 2.12+/3.x)
+# and `-DfailIfNoTests=false` (older Surefire) stop modules that do not contain a named class from
+# failing the build. An explicit -Dtest also runs *IT classes that Surefire would normally skip.
+name: maven
+markers:
+  # a parent pom with <modules> builds the children too: they are not separate suites
+  - {glob: pom.xml, contains: '<modules>', aggregator: true}
+  - {glob: pom.xml}
+# only a project that has test sources is worth a suite
+evidence: ["**/src/test/**"]
+test_paths:
+  - "{suite_dir}/**/src/test/**"
+runnable:
+  - "*Test.java"
+  - "*Tests.java"
+  - "*TestCase.java"
+  - "Test*.java"
+  - "*IT.java"
+  - "*ITCase.java"
+  - "*Test.kt"
+  - "*Tests.kt"
+  - "*TestCase.kt"
+  - "Test*.kt"
+  - "*IT.kt"
+  - "*ITCase.kt"
+timeout: 1200
+setup_timeout: 3600
+setup: mvn -B -q -DskipTests test-compile
+test_command: mvn -B test -Dtest={tests|stem|join:,} -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false
+variants:
+  - when: [mvnw]
+    setup: ./mvnw -B -q -DskipTests test-compile
+    test_command: ./mvnw -B test -Dtest={tests|stem|join:,} -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false
+notes: >-
+  Multi-module repos get one suite at the root (mvn runs every module). Two classes with the
+  same simple name in different modules both run. Tests needing a database or network need
+  a setup step or wrapper script.

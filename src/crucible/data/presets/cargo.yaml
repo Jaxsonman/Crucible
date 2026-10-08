@@ -1,0 +1,21 @@
+# Cargo. Unit tests live inside src/ files and cannot be selected by file, but each top-level
+# file in a tests/ directory is its own integration-test target named after the file, so
+# `cargo test --test <stem>` runs exactly that file. --workspace makes it work from a workspace
+# root (including a root that is also a package); the target name is looked up in every member.
+name: cargo
+markers:
+  - {glob: Cargo.toml, contains: '^\[workspace\]', aggregator: true}
+  - {glob: Cargo.toml}
+evidence: ["**/tests/*.rs"]
+test_paths:
+  - "{suite_dir}/**/tests/**"
+runnable:
+  # top-level files only: tests/common/mod.rs and other sub-directories are shared helpers
+  - "**/tests/*.rs"
+timeout: 1200
+setup_timeout: 3600
+setup: cargo test --workspace --no-run
+test_command: cargo test --workspace {tests|stem|prefix:--test }
+notes: >-
+  Only tests/*.rs integration files are selectable; a change to inline #[cfg(test)] modules is
+  not a runnable test file. Use a wrapper script for whole-suite runs.

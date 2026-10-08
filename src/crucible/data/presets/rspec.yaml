@@ -1,0 +1,23 @@
+# RSpec. `rspec <file> ...` runs the named spec files. With a Gemfile the command runs under
+# `bundle exec` so the locked gem versions are used.
+name: rspec
+markers:
+  - {glob: .rspec}
+  - {glob: Gemfile, contains: '\brspec'}
+  - {glob: spec/spec_helper.rb}
+supersedes: [minitest]
+evidence: ["spec/**/*_spec.rb", "**/spec/**/*_spec.rb"]
+test_paths:
+  - "{suite_dir}/spec/**"
+  - "{suite_dir}/**/*_spec.rb"
+runnable:
+  - "*_spec.rb"
+setup: ""
+test_command: rspec {tests}
+variants:
+  - when: [Gemfile]
+    setup: bundle install --quiet
+    test_command: bundle exec rspec {tests}
+notes: >-
+  Rails apps usually need a database: set it up in setup (e.g. bin/rails db:prepare) with
+  dummy credentials in env.

@@ -145,8 +145,8 @@ the `claude` CLI reported, kept for cross-checking.
 
 PR mining turns merged PRs into tasks.
 
-- Code lives in the `src/crucible/mine/` package: `config.py` (mine.yaml, stack detection, path
-  globs), `candidates.py` (model, filters, local-git source), `gh.py`, `verify.py`,
+- Code lives in the `src/crucible/mine/` package: `config.py` (mine.yaml, path globs), `presets.py`
+  and `detect.py` (framework presets, stack detection), `candidates.py` (model, filters, local-git source), `gh.py`, `verify.py`,
   `scaffold.py`, `leak.py`.
 - A candidate's **base** is the first parent of its merge commit (works for merge, squash and
   single-commit rebase merges). Its **merge** is the merge commit SHA. Both are full SHAs.
@@ -201,15 +201,82 @@ start with `dummy`; and any value that is a URL with embedded credentials
 pasting real secrets). Unknown fields are errors (non-string keys are reported too).
 `exclude_paths` and `max_changed_lines` default to the values above when omitted.
 
-`detect_suites(repo_root)` looks in the repo root and one level down for pytest (`pytest.ini`,
-`pyproject.toml [tool.pytest*]`, or `conftest.py` without `manage.py`; a directory holding only
-a `conftest.py` is not its own project when the repo root has a python marker (`pytest.ini`,
-`pyproject.toml`, `setup.cfg`, `setup.py`, `requirements*.txt`, `manage.py`): the root becomes the
-pytest suite instead), Django (`manage.py`),
-Vitest and Jest (`package.json` dependencies), and returns suites with sensible commands. The
-first `crucible mine` writes a commented `mine.yaml` saying it was auto-detected and must be
-checked (or, with nothing detected, a commented template with empty `suites`), prints the path
-and exits 0 without overwriting an existing file; an invalid file prints its errors and exits 1.
+#### Presets and detection
+
+Language knowledge lives in data, not code: `src/crucible/data/presets/<name>.yaml` (one file
+per test runner; shipped in the wheel and read with `importlib.resources`, so it works from an
+installed plugin). Shipped: pytest, django, jest, vitest, mocha, maven, gradle (Java and
+Kotlin), go, cargo, rspec, minitest, phpunit, dotnet, mix. `mine/presets.py` loads and validates
+them (a bad file is an error naming `<file>: <field>`; a test loads every shipped preset).
+
+A preset has `name` (= file name), `markers`, `test_paths`, `test_command`, `notes` (why the
+command is right) and optionally `runnable`, `setup`, `module_root`, `env`, `timeout`,
+`setup_timeout`, `evidence`, `supersedes`, `project_files` and `variants`:
+
+- `markers`: `{glob, contains?, weak?, aggregator?, wins_over?}`. `glob` names files in the
+  directory itself (`pom.xml`, `*.sln`, `test/test_helper.rb`); `contains` is a regex searched in
+  the file. A directory matches the preset when any marker matches.
+- `{suite_dir}` (in `test_paths`, `runnable`, `module_root`, `test_command`) is the suite's
+  directory relative to the repo root, substituted at detection time; for the root it is `.`
+  and a following `/` vanishes (`{suite_dir}/src/test/**` becomes `src/test/**`). This is how a
+  preset yields correct repo-relative globs and `module:` roots for a suite in `backend/`.
+  Inside a `test_command` placeholder argument the directory is escaped (`\`, `|`, `}`).
+- `variants`: `[{when: [file globs], setup?, test_command?, module_root?}]`; the first whose
+  file exists in the directory overrides those fields (`mvnw`/`gradlew` wrappers, `package-lock.json`
+  for `npm ci`, `Gemfile` for `bundle exec`).
+- `evidence`: globs (relative to the suite dir, searched recursively) of which one must match
+  some file, so a `pom.xml` or `go.mod` without any test source is not a suite.
+- `supersedes` / marker `wins_over` / `weak`: see precedence below. `project_files` lists what
+  makes a directory a project of the ecosystem. `aggregator`: see below.
+
+`detect_suites(repo_root)` (`mine/detect.py`) scans the repo root and up to two levels below
+it, skipping dot directories, `node_modules`, `vendor`, `target`, `build`, `dist`, `out`, `bin`,
+`obj`, `deps`, `_build`, virtualenvs (`venv`, `env`, any directory with `pyvenv.cfg`), `testdata`,
+`fixtures`, and directory names containing control characters or `*`/`?`. It makes one suite per
+(directory, preset). Suite names are the directory name (the preset name for the root),
+sanitised to `[A-Za-z0-9_.-]`; a clash appends `-<preset>` (then a counter). Suites are listed
+deepest directory first, so a nested suite owns its files (first suite whose `test_paths`
+match) before an enclosing suite's `**` globs can.
+
+Precedence in one directory: a strong (`pytest.ini`, `[tool.pytest]`, `[tool:pytest]`, tox
+`[pytest]`) pytest marker beats Django, since a Django project with an explicit pytest config
+runs pytest (pytest-django); a bare `conftest.py` is a weak marker and Django wins; Vitest
+supersedes Jest (a repo listing both is usually mid-migration); Gradle supersedes Maven
+(a leftover `pom.xml` beside a build that migrated is likelier than the reverse); RSpec
+supersedes Minitest. A weak-only match in a directory without the ecosystem's project files
+(a `tests/` holding only `conftest.py`) folds into the nearest enclosing directory that has
+them (the python project at the repo root), as it always did. Nothing else is exclusive, so a Django
+backend next to a Vitest frontend are two suites; Jest and Mocha in one `package.json` are two.
+
+Multi-module builds: a marker with `aggregator: true` (Maven parent pom containing
+`<modules>`, Gradle `settings.gradle[.kts]` with `include`, a Cargo `[workspace]`, a `.sln`,
+an Elixir umbrella `apps_path`) means the directory builds everything below it, so same-preset
+matches in sub-directories are not separate suites; the one suite at the aggregator runs from
+the root and its `test_paths` (`**/src/test/**`) cover every module. A Maven or Gradle child
+module is a suite of its own only when no such parent exists.
+
+How each preset selects tests (exact commands and the reasoning are in the preset files):
+
+| preset | selection |
+| --- | --- |
+| pytest, rspec, minitest, mocha, jest, vitest, mix | the changed file paths (`python -m pytest`, `rspec`, `ruby -Itest ...`, `npx mocha`, `npx jest`, `npx vitest run`, `mix test`) |
+| django | dotted module labels for `manage.py test`, from `module_root: {suite_dir}` |
+| maven | Surefire `-Dtest=` with comma-joined class simple names plus `-Dsurefire.failIfNoSpecifiedTests=false` |
+| gradle | one `--tests \*.<Class>` per changed class |
+| go | one `go test -count=1 ./<dir>` per package directory (unique) |
+| cargo | `cargo test --workspace --test <stem>` per changed `tests/*.rs` file (inline unit tests are not selectable) |
+| phpunit | `--filter 'A\|B'`, a class-name regex, because the CLI takes a single path |
+| dotnet | `--filter 'FullyQualifiedName~A\|FullyQualifiedName~B'` |
+
+Gradle matches by simple name with a wildcard instead of deriving a fully qualified class name:
+that works for Java and Kotlin source sets and multi-project builds without a package root.
+`./mvnw`, `./gradlew` replace `mvn`/`gradle` when the wrapper is in the suite directory.
+
+The first `crucible mine` writes a commented `mine.yaml`: a header saying it was auto-detected,
+and above every suite a comment naming the preset and marker that produced it, saying it is a
+guess to be checked with `crucible mine calibrate`, plus the preset's notes (or, with nothing
+detected, a commented template with empty `suites`). It prints the path and exits 0 without
+overwriting an existing file; an invalid file prints its errors and exits 1.
 
 #### Placeholders
 

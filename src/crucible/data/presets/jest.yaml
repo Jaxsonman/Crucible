@@ -1,0 +1,22 @@
+# Jest. Positional arguments are regular expressions matched against file paths; our repo-relative
+# paths contain no regex that matches other files in practice, so `jest <file> ...` runs those files.
+name: jest
+markers:
+  - {glob: package.json, contains: '"jest"\s*:'}
+  - {glob: "jest.config.*"}
+test_paths:
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/__tests__/**"
+  - "{suite_dir}/**/__snapshots__/**"
+  - "{suite_dir}/**/__mocks__/**"
+# runnable omitted: the built-in rule (*.test.* / *.spec.* and files under __tests__) matches
+# Jest's default testMatch
+setup: npm install --silent
+test_command: npx jest {tests}
+variants:
+  - when: [package-lock.json]
+    setup: npm ci --silent
+notes: >-
+  Uses npm; for yarn or pnpm edit setup (e.g. pnpm install --frozen-lockfile). Add --ci or
+  --runInBand if the suite is flaky in parallel.

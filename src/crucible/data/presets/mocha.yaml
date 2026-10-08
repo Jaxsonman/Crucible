@@ -1,0 +1,29 @@
+# Mocha. `mocha <file> ...` loads exactly the spec files named (it also reads .mocharc.* for
+# require/ts-node settings). Mocha's default spec is ./test/*.{js,cjs,mjs}.
+name: mocha
+markers:
+  - {glob: package.json, contains: '"mocha"\s*:'}
+  - {glob: ".mocharc.*"}
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/*.test.js"
+  - "{suite_dir}/**/*.test.ts"
+  - "{suite_dir}/**/*.spec.js"
+  - "{suite_dir}/**/*.spec.ts"
+runnable:
+  - "{suite_dir}/test/**/*.js"
+  - "{suite_dir}/test/**/*.cjs"
+  - "{suite_dir}/test/**/*.mjs"
+  - "{suite_dir}/test/**/*.ts"
+  - "{suite_dir}/**/*.test.js"
+  - "{suite_dir}/**/*.test.ts"
+  - "{suite_dir}/**/*.spec.js"
+  - "{suite_dir}/**/*.spec.ts"
+setup: npm install --silent
+test_command: npx mocha {tests}
+variants:
+  - when: [package-lock.json]
+    setup: npm ci --silent
+notes: >-
+  Helper files under test/ also count as runnable; Mocha loads them harmlessly. TypeScript
+  specs need ts-node configured in .mocharc.

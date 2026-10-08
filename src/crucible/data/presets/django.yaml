@@ -1,0 +1,23 @@
+# Django's own runner. `manage.py test` takes dotted module labels (app.tests.test_x), not file
+# paths, so `module:` turns each file into a label relative to the project root.
+# The root is the directory that holds manage.py: the suite dir, spelled as a repo-relative path.
+name: django
+markers:
+  - {glob: manage.py}
+supersedes: [pytest]
+test_paths:
+  - "{suite_dir}/**/tests/**"
+  - "{suite_dir}/**/test_*.py"
+  - "{suite_dir}/**/tests.py"
+# runnable omitted: the built-in rule (test_*.py, *_test.py, tests.py) is what Django imports
+setup: ""
+test_command: python manage.py test {modules}
+module_root: "{suite_dir}"
+variants:
+  - when: [requirements.txt]
+    setup: pip install -q -r requirements.txt
+  - when: [pyproject.toml, setup.py]
+    setup: pip install -q -e .
+notes: >-
+  Needs DJANGO_SETTINGS_MODULE and a database the settings can reach; add dummy values under env
+  or point the settings at SQLite. {modules} = {tests|module:<module_root>}.

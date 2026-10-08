@@ -35,6 +35,28 @@ claude plugin validate .     # validate the manifests and skills
 
 The plugin shim in `bin/crucible` runs the CLI through `uv`; see `docs/plugin.md`.
 
+## Adding a preset
+
+A preset teaches `crucible mine` how to start for one test runner. It is one YAML file plus one
+test case; no Python changes.
+
+1. Create `src/crucible/data/presets/<name>.yaml` (the file name is the preset name). Copy the
+   closest existing preset. Fields are documented in `src/crucible/mine/presets.py` and
+   `docs/design.md` ("Presets and detection"):
+   - `markers`: how to recognise the runner (`glob` for files in the directory itself, optional
+     `contains` regex). Add `aggregator: true` to the marker of a multi-module root.
+   - `evidence`: add it when the marker alone does not prove tests exist (build files).
+   - `test_paths` (include fixtures and resources), `runnable` (the real file naming of that
+     ecosystem; omit it only for the built-in Python/JS rule), `setup`, `test_command`.
+   - Write the command from the runner's documented CLI and justify it in a comment at the top
+     of the file; `notes` says what to watch for. Use `{suite_dir}` so globs and `module:` roots
+     are right for a suite in a sub-directory. `variants` switch on wrapper scripts or lockfiles.
+2. Add a case to `CASES` in `tests/test_mine_presets.py`: a tiny fixture layout, the expected
+   suite name, `cwd` and `test_command`, which paths are runnable, and the command rendered for
+   sample test files. `test_shipped_presets_load_and_validate` already loads every preset, and a
+   malformed one fails with `<file>: <field>: ...`.
+3. Run `uv run pytest -q tests/test_mine_presets.py` and `uv run ruff check .`.
+
 ## Pull requests
 
 1. Fork the repository and create a branch (`feat/...`, `fix/...`, `docs/...`, `chore/...`).

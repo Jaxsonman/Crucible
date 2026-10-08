@@ -21,6 +21,7 @@ DEFAULT_MAX_LINES = 800
 DEFAULT_EXCLUDE = [
     "**/package-lock.json", "**/*.lock", "**/migrations/**", "docs/**", "*.md",
 ]
+SUITE_NAME_MAX = 64
 SUITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env",
                "runnable", "timeout", "setup_timeout"}
@@ -66,9 +67,10 @@ class Suite:
         """Plain-data form (stable key order); optional fields appear only when set."""
         d = self.hashed_dict()
         if self.timeout != DEFAULT_TEST_TIMEOUT_S:
-            d["timeout"] = self.timeout
+            d["timeout"] = int(self.timeout) if self.timeout.is_integer() else self.timeout
         if self.setup_timeout != DEFAULT_SETUP_TIMEOUT_S:
-            d["setup_timeout"] = self.setup_timeout
+            d["setup_timeout"] = (int(self.setup_timeout) if self.setup_timeout.is_integer()
+                                  else self.setup_timeout)
         return d
 
     def hashed_dict(self) -> dict:
@@ -297,128 +299,38 @@ def load_config(path: Path) -> MineConfig:
 
 # --- stack detection ---
 
-_SKIP_DIRS = {"node_modules", "venv", "env", "build", "dist", "site-packages"}
-
-
-def _candidate_dirs(root: Path) -> list[Path]:
-    subs = sorted(
-        d for d in root.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and d.name not in _SKIP_DIRS
-        and not d.name.endswith(".egg-info")
-    )
-    return [root, *subs]
-
-
-def _has_pytest_config(d: Path) -> bool:
-    if (d / "pytest.ini").is_file():
-        return True
-    pyproject = d / "pyproject.toml"
-    if pyproject.is_file():
-        text = pyproject.read_text(encoding="utf-8", errors="replace")
-        return "[tool.pytest" in text
-    return False
-
-
-def _js_runner(d: Path) -> str | None:
-    pkg = d / "package.json"
-    if not pkg.is_file():
-        return None
-    try:
-        data = json.loads(pkg.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-    for runner in ("vitest", "jest"):
-        if runner in deps:
-            return runner
-    return None
-
-
-def _python_setup(d: Path) -> str:
-    if (d / "requirements.txt").is_file():
-        return "pip install -q -r requirements.txt"
-    if (d / "pyproject.toml").is_file() or (d / "setup.py").is_file():
-        return "pip install -q -e ."
-    return ""
-
-
-_PYTHON_MARKERS = ("pytest.ini", "pyproject.toml", "setup.cfg", "setup.py", "manage.py")
-
-
-def _has_python_marker(d: Path) -> bool:
-    return any((d / m).is_file() for m in _PYTHON_MARKERS) or any(d.glob("requirements*.txt"))
-
-
-def _root_pytest(root: Path):
-    return (root, "pytest", "python -m pytest {tests}",
-            ["**/test_*.py", "**/*_test.py", "**/conftest.py"], _python_setup(root), None)
-
-
 def detect_suites(repo_root: Path) -> list[Suite]:
-    """Guess test suites (pytest, Django, Vitest, Jest) in the repo root or one level down."""
-    repo_root = Path(repo_root)
-    found: list[tuple[Path, str, str, list[str], str, str | None]] = []
-    root_marked = _has_python_marker(repo_root)
-    for d in _candidate_dirs(repo_root):
-        prefix = "" if d == repo_root else d.name + "/"
-        explicit_pytest = _has_pytest_config(d)
-        django = (d / "manage.py").is_file()
-        conftest_only = (d / "conftest.py").is_file() and not django and not explicit_pytest
-        if conftest_only and d != repo_root and root_marked and not _has_python_marker(d):
-            # a conftest.py-only dir (typically `tests/`) belongs to the root's python project
-            if not any(f[0] == repo_root and f[1] in ("pytest", "django") for f in found):
-                found.insert(0, _root_pytest(repo_root))
-        elif explicit_pytest or ((d / "conftest.py").is_file() and not django):
-            found.append((d, "pytest", "python -m pytest {tests}",
-                          [f"{prefix}**/test_*.py", f"{prefix}**/*_test.py", f"{prefix}**/conftest.py"],
-                          _python_setup(d), None))
-        elif django:
-            found.append((d, "django", "python manage.py test {modules}",
-                          [f"{prefix}**/tests/**", f"{prefix}**/test_*.py", f"{prefix}**/tests.py"],
-                          _python_setup(d), "."))
-        runner = _js_runner(d)
-        if runner:
-            cmd = "npx vitest run {tests}" if runner == "vitest" else "npx jest {tests}"
-            setup = "npm ci --silent" if (d / "package-lock.json").is_file() else "npm install --silent"
-            found.append((d, runner, cmd,
-                          [f"{prefix}**/*.test.*", f"{prefix}**/*.spec.*", f"{prefix}**/__tests__/**"],
-                          setup, None))
-    suites: list[Suite] = []
-    used: set[str] = set()
-    for d, kind, cmd, test_paths, setup, module_root in found:
-        name = d.name if d != repo_root else kind
-        name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or kind
-        if name in used:
-            name = f"{name}-{kind}"
-        used.add(name)
-        rel = "." if d == repo_root else d.name
-        suites.append(Suite(name, test_paths, cmd, rel, setup, module_root and rel))
-    return suites
+    """Guess the repo's test suites from the framework presets (`mine/detect.py`)."""
+    from crucible.mine import detect
+    return [d.suite for d in detect.detect(repo_root)]
 
 
 _DETECTED_HEADER = """\
-# AUTO-DETECTED by `crucible mine`. Check every line before relying on it:
-# the test_paths globs, the setup and test commands, and env (names + dummy values only,
-# never real secrets). Run `crucible mine` again once it looks right.
+# AUTO-DETECTED by `crucible mine` from its framework presets. Every suite below is a first
+# guess: check each line (the test_paths globs, the setup and test commands, and env: names +
+# dummy values only, never real secrets), then run `crucible mine calibrate` to prove the
+# commands actually run the selected tests. Run `crucible mine` again once it looks right.
 """
 _TEMPLATE_HEADER = """\
-# NOTHING DETECTED. `crucible mine` could not find pytest, Django, Vitest or Jest in this repo,
-# so `suites` is empty. Fill it in (one entry per test stack), then run `crucible mine` again.
+# NOTHING DETECTED. `crucible mine` found no marker of a framework preset ({presets}) in the
+# repo root or up to two levels below it, so `suites` is empty. Fill it in (one entry per test
+# stack, or copy the closest preset from src/crucible/data/presets/), then run
+# `crucible mine calibrate`.
 #
 # suites:
 #   - name: backend
 #     test_paths: ["backend/**/tests/**", "backend/**/test_*.py"]   # globs of test files
 #     cwd: backend                       # where setup and test commands run (relative to repo root)
 #     setup: pip install -q -r requirements.txt
-#     test_command: python manage.py test {tests|module:backend}
-#         # {tests}: changed test files relative to cwd; filters after `|` reshape them:
+#     test_command: python manage.py test {{tests|module:backend}}
+#         # {{tests}}: changed test files relative to cwd; filters after `|` reshape them:
 #         # module:<root> stem dir unique prefix:<s> suffix:<s> join:<sep>. No placeholder at
 #         # all runs the whole suite. See docs/design.md ("Placeholders").
-#     module_root: backend               # optional; {modules} = {tests|module:<module_root>}
+#     module_root: backend               # optional; {{modules}} = {{tests|module:<module_root>}}
 #     runnable: ["**/*Test.java"]        # optional; which changed test files are passed to the runner
 #     timeout: 600                       # optional, seconds for the test step
 #     setup_timeout: 1800                # optional, seconds for the setup step
-#     env: {DJANGO_SECRET_KEY: dummy-not-secret}      # dummy values only
+#     env: {{DJANGO_SECRET_KEY: dummy-not-secret}}      # dummy values only
 """
 _TAIL = """\
 # Files that never count as the change itself (globs; a pattern without `/` matches any depth).
@@ -428,25 +340,34 @@ max_changed_lines: {max_lines}
 """
 
 
-def render_default(suites: list[Suite]) -> str:
-    """The commented mine.yaml text `crucible mine` writes on first use."""
+def render_default(suites: list[Suite], comments: dict[str, list[str]] | None = None) -> str:
+    """The commented mine.yaml text `crucible mine` writes on first use. `comments` maps a
+    suite name to the comment lines written above it (where the guess came from)."""
     exclude = json.dumps(DEFAULT_EXCLUDE)
     tail = _TAIL.format(exclude=exclude, max_lines=DEFAULT_MAX_LINES)
     if not suites:
-        return _TEMPLATE_HEADER + "suites: []\n" + tail
-    body = yaml.safe_dump({"suites": [s.to_dict() for s in suites]}, sort_keys=False,
-                          default_flow_style=None, width=100)
-    return _DETECTED_HEADER + body + tail
+        from crucible.mine import presets
+        names = ", ".join(presets.shipped())
+        return _TEMPLATE_HEADER.format(presets=names) + "suites: []\n" + tail
+    parts = [_DETECTED_HEADER, "suites:\n"]
+    for s in suites:
+        parts += [f"# {ln}\n".replace("# \n", "#\n") for ln in (comments or {}).get(s.name, [])]
+        parts.append(yaml.safe_dump([s.to_dict()], sort_keys=False, default_flow_style=None,
+                                    width=100))
+    return "".join(parts) + tail
 
 
 def write_default(path: Path, repo_root: Path) -> list[Suite]:
     """Detect suites and write a commented mine.yaml at `path`. Never overwrites."""
+    from crucible.mine import detect
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
-    suites = detect_suites(repo_root)
+    found = detect.detect(repo_root)
+    suites = [d.suite for d in found]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_default(suites), encoding="utf-8")
+    path.write_text(render_default(suites, {d.suite.name: d.comment() for d in found}),
+                    encoding="utf-8")
     return suites
 
 

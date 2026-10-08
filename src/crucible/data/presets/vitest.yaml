@@ -1,0 +1,22 @@
+# Vitest. `vitest run <file> ...` runs once (no watch mode) and treats positional arguments as
+# substring filters on the file path, so the repo-relative file names select exactly those files.
+name: vitest
+markers:
+  - {glob: package.json, contains: '"vitest"\s*:'}
+  - {glob: "vitest.config.*"}
+# a repo that lists both is usually mid-migration to Vitest
+supersedes: [jest]
+test_paths:
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/__tests__/**"
+  - "{suite_dir}/**/__snapshots__/**"
+  - "{suite_dir}/**/__mocks__/**"
+# runnable omitted: the built-in rule matches Vitest's default include (*.test.* / *.spec.*)
+setup: npm install --silent
+test_command: npx vitest run {tests}
+variants:
+  - when: [package-lock.json]
+    setup: npm ci --silent
+notes: >-
+  Uses npm; for yarn or pnpm edit setup. `vitest run` never starts watch mode.

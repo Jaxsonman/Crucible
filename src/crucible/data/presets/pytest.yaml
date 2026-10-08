@@ -1,0 +1,28 @@
+# pytest. `python -m pytest <file> <file> ...` runs exactly the files named, any number of them;
+# `python -m` puts the cwd on sys.path, so a src-less layout imports without an install step.
+name: pytest
+markers:
+  # an explicit pytest config means the repo really uses pytest, even next to a manage.py
+  - {glob: pytest.ini, wins_over: [django]}
+  - {glob: pyproject.toml, contains: '^\[tool\.pytest', wins_over: [django]}
+  - {glob: setup.cfg, contains: '^\[tool:pytest\]', wins_over: [django]}
+  - {glob: tox.ini, contains: '^\[pytest\]', wins_over: [django]}
+  # a bare conftest.py is a hint only: Django keeps priority, and a conftest.py-only directory
+  # (typically `tests/`) folds into the nearest enclosing python project
+  - {glob: conftest.py, weak: true}
+project_files: [pytest.ini, pyproject.toml, setup.cfg, setup.py, manage.py, "requirements*.txt"]
+test_paths:
+  - "{suite_dir}/**/test_*.py"
+  - "{suite_dir}/**/*_test.py"
+  - "{suite_dir}/**/conftest.py"
+# runnable omitted: the built-in rule (test_*.py, *_test.py, tests.py, *.test.* / *.spec.*,
+# anything under __tests__) is the pytest and JS naming convention
+setup: ""
+test_command: python -m pytest {tests}
+variants:
+  - when: [requirements.txt]
+    setup: pip install -q -r requirements.txt
+  - when: [pyproject.toml, setup.py]
+    setup: pip install -q -e .
+notes: >-
+  pytest takes file paths directly. Create/activate a virtualenv before running if the repo needs one.
