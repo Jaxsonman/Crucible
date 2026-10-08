@@ -8,14 +8,17 @@
 # (no-tests-ran: the rule says the runner found no tests; it turns a rejected sample into that
 # suite status), `unless` (regex: the row does not apply to a log it matches, e.g. a "no test
 # files" line for one package while other packages ran tests). A row with a `status` also never
-# applies when the log matches a `ran_tests` pattern (test counts are present).
+# applies when the log matches a `ran_tests` pattern (test counts are present). `suppresses`
+# (list of row ids): a root-cause row hides those generic symptom rows when it matches (a Ruby
+# LoadError before "0 examples" explains the empty run; do not also say "no tests ran").
 
 # Patterns showing that tests really ran (pass/fail counts).
 ran_tests:
-  - '^(?:ok|FAIL|---\s+(?:PASS|FAIL))\s'       # go test
+  - '^ok\s+\S+\s+(?:[\d.]+s(?!.*no tests to run)|\(cached\))'   # go test (not "[no tests to run]")
+  - '^--- (?:PASS|FAIL):'                           # go test: a test ran (not "[build failed]")
   - 'Tests run: [1-9]'                               # maven surefire
-  - 'Tests:\s+.*\b[1-9]\d* (?:passed|failed)'       # jest
-  - '\b[1-9]\d* (?:passed|failed)\b'                # pytest, vitest, ...
+  - '^Tests:\s+.*\b[1-9]\d* (?:passed|failed)'      # jest (the Tests: line, not Test Suites:)
+  - '^(?!\s*Test Suites:).*\b[1-9]\d* (?:passed|failed)\b'   # pytest, vitest, ...
   - '\b[1-9]\d* tests? completed'                   # gradle
   - '\b[1-9]\d* examples?, '                        # rspec
 
@@ -88,7 +91,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'No tests found'
-    unless: 'Tests:\s+.*\b\d+ (?:passed|failed)'
+    unless: '^Tests:\s+.*\b[1-9]\d* (?:passed|failed)'
     hint: >-
       jest found no tests for the given files: check `runnable` (extensions, directories),
       `cwd` (jest resolves paths from its root), and jest's `testMatch` / `roots`.
@@ -133,11 +136,20 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'no test files'
-    unless: '^(?:ok|FAIL|---)\s'
+    unless: '^ok\s+\S+\s+(?:[\d.]+s(?!.*no tests to run)|\(cached\))|^--- (?:PASS|FAIL):'
     hint: >-
       go found no test files in the package: check `runnable` (`**/*_test.go`) and that
       `test_command` passes the package directories (`{tests|dir|unique|prefix:./}`) from the
       module root (`cwd`).
+
+  - id: go-no-tests-to-run
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: '\[no tests to run\]'
+    hint: >-
+      go ran no tests (`[no tests to run]`): the `-run` filter or the packages given matched
+      no test function. Check `runnable`, the `{tests}` placeholder filters in `test_command`,
+      and `cwd` (the module root).
 
   - id: go-package-not-found
     category: wrong-path
@@ -269,8 +281,18 @@ rules:
       or too new for the build tooling). Set `JAVA_HOME` under the suite's `env` to a matching
       JDK, or use a container wrapper script in `.crucible/scripts/`.
 
+  - id: lombok-accessors-missing
+    category: toolchain
+    suppresses: [java-class-missing]
+    pattern: '(?s)cannot find symbol.{0,300}?symbol:\s+method (?:(?:get|set|is)[A-Z]\w*\(\)|builder\(\))'
+    hint: >-
+      Lombok-generated accessors missing: the JDK is probably newer than the build supports;
+      set `JAVA_HOME` in `env` to the JDK version the project targets (see the comment in
+      `mine.yaml`).
+
   - id: lombok-new-jdk
     category: toolchain
+    suppresses: [java-class-missing]
     pattern: '(?is)ExceptionInInitializerError.*lombok|lombok.*ExceptionInInitializerError|symbol:\s+method (?:get|set|is)[A-Z]\w*\(.*lombok|lombok.*symbol:\s+method (?:get|set|is)[A-Z]\w*\('
     hint: >-
       Lombok failed to process the sources, which usually means the JDK is newer than this
@@ -279,6 +301,7 @@ rules:
 
   - id: ruby-load-error
     category: toolchain
+    suppresses: [rspec-no-examples, no-tests-generic]
     pattern: 'LoadError: cannot load such file|cannot load such file --'
     hint: >-
       The runner errored before tests ran (LoadError): a gem or file could not be loaded, often

@@ -70,7 +70,7 @@ check_timeout_minutes: 45     # optional positive integer; how long `crucible ru
 (the suites' `setup_timeout` plus `timeout`, rounded up to whole minutes), so a slow build is
 not killed by the default; `crucible mine prove` uses it too unless `--timeout` is given.
 `crucible run <task>` (and `task validate`, `mine prove`, `mine leakcheck`) take a task directory;
-a bare task id that is not an existing path resolves to `<home>/tasks/<id>`.
+a bare task id that is not an existing task directory (a same-named non-task directory in the cwd does not count) resolves to `<home>/tasks/<id>`; an unknown one errors with the available ids and a close-match suggestion.
 
 The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) plus the
 What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
@@ -343,12 +343,16 @@ Verification), so build-tool presets compile just the main sources: Maven `compi
 version the build needs: the pom's compiler plugin `<release>`, `maven.compiler.release`,
 `java.version`, `maven.compiler.source`/`target` (`1.8` is 8, `${prop}` is followed); for Gradle
 `JavaLanguageVersion.of(N)`, `jvmToolchain(N)`, `languageVersion = N`, `JavaVersion.VERSION_N`,
-`sourceCompatibility` in the suite's build files (root, subprojects two levels down, `buildSrc`)
+`sourceCompatibility` in the suite's build files (root and subprojects two levels down;
+`buildSrc`, `build-logic` and plugin builds count only when nothing else names a version)
 and `jdk = "N"` style keys of `gradle/libs.versions.toml` (the highest wins); else the first
 literal `java-version:` of a `.github/workflows` `actions/setup-java` step. The version and its
-source file are written as a comment above the suite. If a matching JDK is installed
-(`JAVA_HOME_<N>_*` variables, macOS `/usr/libexec/java_home -v N`, `/usr/lib/jvm/*N*`; the lookup
-function is injectable: `detect(..., jdk_lookup=)`), the suite gets `env: {JAVA_HOME: <path>}`
+source file are written as a comment above the suite. Local JDKs are enumerated
+(`JAVA_HOME_<N>_*` variables, macOS `java_home -V`, `/Library/Java/JavaVirtualMachines/*`,
+Homebrew `openjdk*`, `/usr/lib/jvm/*`, `~/.sdkman/candidates/java/*`) and each one's major is
+read from its `release` file, never from its directory name; the exact major is picked, else the
+lowest newer one (never the newest: a build pinned to 21 can break on 26). The lookup function
+is injectable: `detect(..., jdk_lookup=)`. If one is found, the suite gets `env: {JAVA_HOME: <path>}`
 (`JAVA_HOME` is not secret-like, so the secret guard allows it); otherwise the comment suggests
 installing one or a container wrapper script (`docs/mining-recipes.md`).
 
@@ -521,8 +525,8 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   verification; re-run --verify` (not "not verified").
 - **Weak-task warnings.** A verified candidate may carry `warnings` (cache and JSON, printed
   under its line; never a rejection): a changed runnable test file contains a skip marker
-  (`@Disabled`, `@Ignore`, `.skip(`, `xit(`, `xdescribe(`, `pytest.mark.skip`, `t.Skip(`, rspec
-  `skip "..."` / `pending`, `[Fact(Skip=`), or every failing base step died with a diagnostics
+  (`@Disabled`, `@Ignore`, `it.skip(` / `describe.skip(` / `test.skip(` in JS/TS files, `xit(`, `xdescribe(`, `pytest.mark.skip`, `t.Skip(`, rspec
+  `skip "..."` / a bare `pending`, `[Fact(Skip=`), or every failing base step died with a diagnostics
   row of category `compile` and printed no test counts (the tests fail only because they use code
   the PR adds). The skill prefers candidates without warnings.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
@@ -561,7 +565,10 @@ body, header line excluded, last 64 KiB) and/or `exit` (both given: both must ma
 `stage` (`setup`/`test`), `status: no-tests-ran` and `unless` (a regex: the row does not apply to
 a log it matches, e.g. go's `[no test files]` while other packages ran tests, Maven's per-module
 "No tests to run"; set on the go, maven, gradle and jest rows). A top-level `ran_tests` list of
-patterns (pass/fail counts) also switches every `status` row off for a log it matches. The step runner appends `exit code: N` to
+patterns (pass/fail counts: go `ok pkg 0.1s` / `--- PASS|FAIL:`, jest's `Tests:` line, not
+`Test Suites:`, so a build failure is not "tests ran") also switches every `status` row off for a
+log it matches. An optional `suppresses` list names generic rows a root-cause row hides (Ruby
+`LoadError` hides rspec's "0 examples"). The step runner appends `exit code: N` to
 every log, which is where the exit code is read from. Rows cover missing runner (127, "command
 not found", missing script), permission, "no tests" messages of pytest, jest, vitest, mocha,
 maven, gradle, go, cargo, rspec, phpunit, dotnet and mix, Python/Java/Node import errors, missing
@@ -629,6 +636,10 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   install as "fails before"); a failed copy exits 98.
 - **Docker.** If `check.sh` or a copied script mentions `docker`, scaffold warns that the task
   needs Docker on the machine that runs it and records `"requires": ["docker"]` in `.mine.json`.
+- **Portable env.** `check.sh` never exports a machine path blindly: an env value that is an
+  absolute path existing on the scaffolding machine (always `JAVA_HOME`) is written as
+  `if [ -d <path> ]; then export JAVA_HOME=<path>; fi`, a comment keeps the required JDK major,
+  and scaffold warns and records `"requires": ["jdk N"]` (N from the JDK's `release` file).
 - **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`,
   `check_timeout_s`, optionally `requires`) records the merge SHA deterministically; `check_timeout_s` is the sum of
   the suites' `setup_timeout` and `timeout`, the default for `prove`'s per-run limit. The workspace never contains `.crucible/`, so a hidden file in the task

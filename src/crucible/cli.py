@@ -1,6 +1,7 @@
 """Crucible command line interface."""
 
 import argparse
+import difflib
 import json
 import os
 import subprocess
@@ -121,17 +122,27 @@ def _task_new(args: argparse.Namespace) -> int:
 
 
 def _task_path(arg: str) -> Path:
-    """The task directory for `arg`: the path itself, or (when it does not exist) a bare task
-    id resolved against `<home>/tasks/`."""
+    """The task directory for `arg`: the path itself, or a bare task id resolved against
+    `<home>/tasks/` (also when a same-named directory in the cwd is not a task). A bare id
+    that is neither raises TaskError listing the available tasks."""
     path = Path(arg)
-    if not path.exists() and "/" not in arg and os.sep not in arg:
-        try:
-            candidate = paths.tasks_dir() / arg
-        except paths.CrucibleHomeError:
-            return path
-        if candidate.is_dir():
-            return candidate
-    return path
+    if "/" in arg or os.sep in arg or (path / "task.md").is_file():
+        return path
+    try:
+        tasks = paths.tasks_dir()
+    except paths.CrucibleHomeError:
+        return path
+    if (tasks / arg).is_dir():
+        return tasks / arg
+    if path.exists():
+        return path  # not a task either: let load_task say what is wrong with it
+    names = sorted(p.name for p in tasks.iterdir() if (p / "task.md").is_file()) \
+        if tasks.is_dir() else []
+    msg = f"no task named {arg} in {tasks} (available: "
+    msg += (", ".join(names[:10]) + (", \u2026" if len(names) > 10 else "")) if names else "none"
+    close = difflib.get_close_matches(arg, names, n=1)
+    msg += ")" + (f"; did you mean {close[0]}?" if close else "")
+    raise TaskError(msg)
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -660,7 +671,7 @@ def _mine_scaffold(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
     print(f"created {task_dir / 'task.md'}")
-    needs = mine_scaffold.requires(task_dir)
+    needs = mine_scaffold.recorded_requires(task_dir)
     if needs:
         print(f"warning: this task requires {', '.join(needs)} on the machine that runs it "
               "(recorded as `requires` in .mine.json)", file=sys.stderr)

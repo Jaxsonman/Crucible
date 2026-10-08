@@ -29,6 +29,12 @@ POM = """<project>
      "<source>1.7</source><target>1.7</target></configuration></plugin>"), 7),
     ("<project/>", None),
     ("<properties><java.version>${undefined}</java.version></properties>", None),
+    # cyclic property references must not recurse forever
+    ("<properties><a>${b}</a><b>${a}</b><java.version>${a}</java.version></properties>", None),
+    ("<properties><java.version>${java.version}</java.version></properties>", None),
+    # a non-numeric first tag is skipped in favour of a later numeric one
+    ("<x><source>true</source></x><plugin><source>11</source></plugin>", 11),
+    ("<x><release>${project.basedir}/r</release></x><release>17</release>", 17),
 ])
 def test_parse_pom(text, expected):
     assert jdk.parse_pom(text) == expected
@@ -99,30 +105,86 @@ def test_required_none_when_nothing_says(tmp_path):
     assert jdk.required_java(tmp_path, tmp_path, "maven") is None
 
 
-def test_local_lookup_from_env_vars():
-    env = {"JAVA_HOME_17_X64": "/opt/jdk17", "JAVA_HOME_21_ARM64": "/opt/jdk21"}
-    assert jdk.find_local_jdk(17, env=env, java_home_tool=None, jvm_dir=None) == "/opt/jdk17"
-    assert jdk.find_local_jdk(21, env=env, java_home_tool=None, jvm_dir=None) == "/opt/jdk21"
-    assert jdk.find_local_jdk(8, env=env, java_home_tool=None, jvm_dir=None) is None
+def make_jdk(path: Path, version: str) -> Path:
+    path.mkdir(parents=True)
+    (path / "release").write_text(f'IMPLEMENTOR="x"\nJAVA_VERSION="{version}"\n')
+    return path
 
 
-def test_local_lookup_linux_jvm_dir(tmp_path):
-    for n in ("java-17-openjdk-amd64", "java-1.8.0-openjdk", "temurin-21-jdk", "java-11-openjdk"):
-        (tmp_path / n).mkdir()
-    find = lambda v: jdk.find_local_jdk(v, env={}, java_home_tool=None, jvm_dir=tmp_path)
-    assert find(17) == str(tmp_path / "java-17-openjdk-amd64")
-    assert find(8) == str(tmp_path / "java-1.8.0-openjdk")
-    assert find(21) == str(tmp_path / "temurin-21-jdk")
-    assert find(1) is None and find(7) is None
+def find(version, tmp_path, env=None, tool=None):
+    return jdk.find_local_jdk(version, env=env or {}, java_home_tool=tool,
+                              roots=[str(tmp_path / "*")])
 
 
-def test_local_lookup_macos_java_home_tool(tmp_path):
+def test_local_lookup_from_env_vars(tmp_path):
+    env = {"JAVA_HOME_17_X64": str(make_jdk(tmp_path / "a", "17.0.1")),
+           "JAVA_HOME_21_ARM64": str(make_jdk(tmp_path / "b", "21.0.2"))}
+    nowhere = [str(tmp_path / "none" / "*")]
+    find_env = lambda v: jdk.find_local_jdk(v, env=env, java_home_tool=None, roots=nowhere)
+    assert find_env(17) == env["JAVA_HOME_17_X64"]
+    assert find_env(21) == env["JAVA_HOME_21_ARM64"]
+    assert find_env(22) is None
+
+
+def test_major_comes_from_the_release_file_not_the_directory_name(tmp_path):
+    make_jdk(tmp_path / "jdk-17.0.8", "17.0.8")
+    make_jdk(tmp_path / "jdk-11.0.17", "11.0.17")
+    assert find(8, tmp_path) == str(tmp_path / "jdk-11.0.17")  # lowest major above 8, not 17.0.8
+    assert find(17, tmp_path) == str(tmp_path / "jdk-17.0.8")
+    assert find(11, tmp_path) == str(tmp_path / "jdk-11.0.17")
+    assert find(18, tmp_path) is None
+
+
+def test_misleading_directory_names_are_ignored(tmp_path):
+    make_jdk(tmp_path / "java-21-openjdk", "17.0.1")  # the name lies
+    assert find(21, tmp_path) is None
+    assert find(17, tmp_path) == str(tmp_path / "java-21-openjdk")
+
+
+def test_exact_major_beats_newer_and_lowest_newer_beats_highest(tmp_path):
+    make_jdk(tmp_path / "a", "26.0.1")
+    make_jdk(tmp_path / "b", "22.0.1")
+    make_jdk(tmp_path / "c", "21.0.5")
+    assert find(21, tmp_path) == str(tmp_path / "c")
+    assert find(17, tmp_path) == str(tmp_path / "c")  # 21 is the lowest major above 17
+    (tmp_path / "c" / "release").unlink()
+    assert find(17, tmp_path) == str(tmp_path / "b")  # not 26
+
+
+def test_old_style_version_is_read_as_8(tmp_path):
+    make_jdk(tmp_path / "x", "1.8.0_392")
+    assert find(8, tmp_path) == str(tmp_path / "x")
+    assert find(7, tmp_path) == str(tmp_path / "x")
+
+
+def test_macos_bundle_layout_is_found(tmp_path):
+    make_jdk(tmp_path / "temurin-21.jdk" / "Contents" / "Home", "21.0.3")
+    assert find(21, tmp_path) == str(tmp_path / "temurin-21.jdk" / "Contents" / "Home")
+
+
+def test_java_home_tool_listing_is_parsed(tmp_path):
+    h22 = make_jdk(tmp_path / "jvms" / "j22" / "Contents" / "Home", "22.0.1")
+    h21 = make_jdk(tmp_path / "jvms" / "j21" / "Contents" / "Home", "21.0.2")
     tool = tmp_path / "java_home"
-    tool.write_text('#!/bin/sh\n[ "$2" = 17 ] && echo /Library/Java/jdk-17 && exit 0\nexit 1\n')
+    tool.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = -V ]; then\n'
+        '  echo "Matching Java Virtual Machines (2):" >&2\n'
+        f'  echo \'    22.0.1 (arm64) "Oracle" - "Java SE 22.0.1" {h22}\' >&2\n'
+        f'  echo \'    21.0.2 (arm64) "Eclipse Adoptium" - "OpenJDK 21.0.2" {h21}\' >&2\n'
+        "  exit 0\nfi\nexit 1\n")
     tool.chmod(0o755)
-    assert jdk.find_local_jdk(17, env={}, java_home_tool=str(tool), jvm_dir=None) \
-        == "/Library/Java/jdk-17"
-    assert jdk.find_local_jdk(11, env={}, java_home_tool=str(tool), jvm_dir=None) is None
+    nowhere = [str(tmp_path / "none" / "*")]
+    assert jdk.find_local_jdk(21, env={}, java_home_tool=str(tool), roots=nowhere) == str(h21)
+    assert jdk.find_local_jdk(17, env={}, java_home_tool=str(tool), roots=nowhere) == str(h21)
+    assert jdk.find_local_jdk(23, env={}, java_home_tool=str(tool), roots=nowhere) is None
+
+
+def test_enumeration_is_injectable_and_dedups_symlinks(tmp_path):
+    real = make_jdk(tmp_path / "real", "17.0.1")
+    (tmp_path / "current").symlink_to(real)
+    found = jdk.local_jdks(env={}, java_home_tool=None, roots=[str(tmp_path / "*")])
+    assert [j.major for j in found] == [17]
 
 
 def write_maven(root: Path, version="17"):
@@ -163,3 +225,23 @@ def test_written_mine_yaml_with_java_home_loads(tmp_path):
 
 def test_java_home_is_not_secret_like():
     assert not config._secret_like("JAVA_HOME")
+
+
+def test_gradle_ignores_buildsrc_and_plugin_builds_for_the_max(tmp_path):
+    (tmp_path / "build.gradle.kts").write_text("kotlin { jvmToolchain(17) }\n")
+    (tmp_path / "buildSrc").mkdir()
+    (tmp_path / "buildSrc" / "build.gradle.kts").write_text("kotlin { jvmToolchain(21) }\n")
+    (tmp_path / "build-logic").mkdir()
+    (tmp_path / "build-logic" / "build.gradle.kts").write_text("kotlin { jvmToolchain(21) }\n")
+    (tmp_path / "gradle-plugin").mkdir()
+    (tmp_path / "gradle-plugin" / "build.gradle").write_text("sourceCompatibility = '22'\n")
+    req = jdk.required_java(tmp_path, tmp_path, "gradle")
+    assert req and req.version == 17 and req.source == "build.gradle.kts"
+
+
+def test_gradle_falls_back_to_buildsrc_when_nothing_else_says(tmp_path):
+    (tmp_path / "build.gradle.kts").write_text("plugins { java }\n")
+    (tmp_path / "buildSrc").mkdir()
+    (tmp_path / "buildSrc" / "build.gradle.kts").write_text("kotlin { jvmToolchain(11) }\n")
+    req = jdk.required_java(tmp_path, tmp_path, "gradle")
+    assert req and req.version == 11

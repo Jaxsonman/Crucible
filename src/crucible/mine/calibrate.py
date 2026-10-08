@@ -23,6 +23,7 @@ from crucible.mine.config import Suite
 
 DEFAULT_CANDIDATES = 3
 FILE_NAME = "calibration.json"
+SCAN_FACTOR = 3
 OK_STATUSES = ("ok", "no-candidates")
 STATUSES = ("ok", "setup-failed", "no-tests-ran", "not-selective", "failing", "timeout",
             "no-candidates", "mixed")
@@ -188,7 +189,8 @@ def _own_part(res: vf.VerifyResult, suite: str, table: diagnostics.Table,
     base, merge = f"base-{suite}-test", f"merge-{suite}-test"
     if base not in res.logs or merge not in res.logs or _exit_code(res, merge) != 0:
         return None
-    logs = {k: v for k, v in res.logs.items() if f"-{suite}-" in k}
+    own = re.compile(rf"(?:base|merge)-{re.escape(suite)}-(?:setup|test)")
+    logs = {k: v for k, v in res.logs.items() if own.fullmatch(k)}
     tail = diagnostics.tail_lines(_read(res.logs[merge]))
     if _exit_code(res, base) == 0:
         body, code = diagnostics.split_log(_read(res.logs[base]))
@@ -260,7 +262,9 @@ def calibrate_suite(
                            f"setup {'timed out' if setup.timed_out else 'failed'} at HEAD")
     samples: list[Sample] = []
     hints: list[diagnostics.Hint] = []
-    for c in owned_candidates(suite, suites, candidates):
+    # Candidates that blame another suite yield no sample, so the scan is bounded: at most
+    # SCAN_FACTOR x N owned candidates are examined.
+    for c in owned_candidates(suite, suites, candidates)[:SCAN_FACTOR * n]:
         if len(samples) >= n:
             break
         res = memo.get(c.merge)

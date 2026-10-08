@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from crucible import checker, paths, workspace
-from crucible.mine import placeholders, verify
+from crucible.mine import jdk, placeholders, verify
 from crucible.mine.candidates import Candidate
 from crucible.mine.config import Suite
 from crucible.task import ID_RE, Task, repo_relative, repo_task_md
@@ -46,8 +46,37 @@ def default_slug(c: Candidate) -> str:
     return slug if ID_RE.match(slug) else f"{prefix}-{re.sub(r'[^a-z0-9]', '', c.id.lower())}"
 
 
+def _machine_path(value: str) -> bool:
+    """An env value that is an absolute path existing on this machine: baked into a task it
+    would only be right here, so `check.sh` guards it instead of exporting it blindly."""
+    return os.path.isabs(value) and os.path.exists(value)
+
+
+def jdk_requirements(suites: list[Suite]) -> list[str]:
+    """`["jdk N"]` when a suite's `env: JAVA_HOME` points at a local JDK (N: its real major)."""
+    majors = {m for s in suites if (home := s.env.get("JAVA_HOME")) and _machine_path(home)
+              and (m := jdk.release_major(home))}
+    return [f"jdk {m}" for m in sorted(majors)]
+
+
+def recorded_requires(task_dir: Path) -> list[str]:
+    """The `requires` list recorded in the task's `.mine.json` (empty when absent)."""
+    try:
+        meta = json.loads((task_dir / MINE_META).read_text(encoding="utf-8"))
+        return [str(x) for x in meta.get("requires", [])]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+
+
 def _suite_prelude(suite: Suite, files: list[str]) -> list[str]:
-    lines = [f"export {k}={shlex.quote(v)}" for k, v in suite.env.items()]
+    lines = []
+    for k, v in suite.env.items():
+        q = shlex.quote(v)
+        if _machine_path(v) or (k == "JAVA_HOME" and os.path.isabs(v)):
+            test = "-d" if k == "JAVA_HOME" else "-e"
+            lines.append(f"if [ {test} {q} ]; then export {k}={q}; fi")
+        else:
+            lines.append(f"export {k}={q}")
     lines.append(f"export CRUCIBLE_TEST_FILES={shlex.quote(chr(10).join(files))}")
     lines.append("export CRUCIBLE_TEST_FILES_CWD="
                  + shlex.quote(chr(10).join(os.path.relpath(f, suite.cwd) for f in files)))
@@ -96,6 +125,10 @@ def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: b
         "fi",
     ]
     lines = list(header)
+    for req in jdk_requirements(suites):
+        major = req.split()[1]
+        lines.append(f"# Requires JDK {major}: the JAVA_HOME below is used only if it exists on this "
+                     f"machine; otherwise provide a JDK {major} (JAVA_HOME or PATH).")
     if scripts:
         lines.append(f'export CRUCIBLE_SCRIPTS="$TASK_DIR/{SCRIPTS_DIRNAME}"')
     if len(suites) == 1:
@@ -210,7 +243,7 @@ def scaffold_task_dir(
         meta = {"id": c.id, "base": c.base, "merge": c.merge, "suite": suites[0].name,
                 "suites": [s.name for s in suites], "source": c.source,
                 "check_timeout_s": check_s}
-        needs = requires(task_dir)
+        needs = requires(task_dir) + jdk_requirements(suites)
         if needs:
             meta["requires"] = needs
         (task_dir / MINE_META).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
@@ -318,8 +351,10 @@ __all__ = [
     "check_script",
     "check_timeout",
     "default_slug",
+    "jdk_requirements",
     "merge_sha",
     "prove_task",
+    "recorded_requires",
     "requires",
     "scaffold_task_dir",
 ]

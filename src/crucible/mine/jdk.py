@@ -2,10 +2,13 @@
 
 Detection reads the build files (pom properties and compiler plugin, Gradle toolchain /
 `jvmToolchain` / `sourceCompatibility`, the version catalog) and, as a fallback, the CI
-`actions/setup-java` step. The local lookup (macOS `java_home`, `/usr/lib/jvm`,
-`JAVA_HOME_<N>_*` variables) is injectable so tests never depend on the machine.
+`actions/setup-java` step. The local lookup enumerates the JDKs on this machine (macOS `java_home -V`,
+`JAVA_HOME_<N>_*` variables, the usual install directories), reads each one's real major from
+its `release` file, and picks the exact major or else the lowest newer one. It is injectable so
+tests never depend on the machine.
 """
 
+import glob
 import os
 import re
 import subprocess
@@ -34,15 +37,19 @@ def _major(text: str) -> int | None:
     return n if n >= 5 else None
 
 
-def _prop(text: str, name: str) -> int | None:
-    m = re.search(rf"<{re.escape(name)}>\s*([^<]+?)\s*</{re.escape(name)}>", text)
-    if not m:
+def _prop(text: str, name: str, seen: frozenset[str] = frozenset()) -> int | None:
+    """The numeric Java version of the first `<name>` tag with one (a `${prop}` value is
+    followed; reference cycles, `true`, paths and other non-numeric values are skipped)."""
+    if name in seen:
         return None
-    value = m.group(1)
-    ref = re.fullmatch(r"\$\{([\w.\-]+)\}", value)
-    if ref and ref.group(1) != name:
-        return _prop(text, ref.group(1))
-    return _major(value)
+    seen = seen | {name}
+    for m in re.finditer(rf"<{re.escape(name)}>\s*([^<]+?)\s*</{re.escape(name)}>", text):
+        value = m.group(1)
+        ref = re.fullmatch(r"\$\{([\w.\-]+)\}", value)
+        v = _prop(text, ref.group(1), seen) if ref else _major(value)
+        if v:
+            return v
+    return None
 
 
 def parse_pom(text: str) -> int | None:
@@ -117,6 +124,17 @@ def _gradle_files(d: Path) -> list[Path]:
     return out
 
 
+_AUX_DIRS = re.compile(r"^(?:buildSrc|build-logic|gradle-plugins?|.+-plugins?)$")
+
+
+def _auxiliary_build(path: Path, suite_dir: Path) -> bool:
+    try:
+        parts = path.relative_to(suite_dir).parts[:-1]
+    except ValueError:
+        return False
+    return any(_AUX_DIRS.match(p) for p in parts)
+
+
 def _ci_files(root: Path) -> list[Path]:
     wf = root / ".github" / "workflows"
     return sorted(wf.glob("*.y*ml")) if wf.is_dir() else []
@@ -142,9 +160,13 @@ def required_java(suite_dir: Path, repo_root: Path, tool: str) -> Requirement | 
         cat = suite_dir / "gradle" / "libs.versions.toml"
         if (v := parse_catalog(_read(cat))):
             found.append((v, rel(cat)))
-        for f in _gradle_files(suite_dir):
-            if (v := parse_gradle(_read(f))):
-                found.append((v, rel(f)))
+        files = _gradle_files(suite_dir)
+        main = [f for f in files if not _auxiliary_build(f, suite_dir)]
+        # buildSrc / build-logic / plugin builds say what the build tooling runs on, not what
+        # the project targets: they count only when the main project names nothing.
+        main_found = [(v, rel(f)) for f in main if (v := parse_gradle(_read(f)))]
+        found += main_found or [(v, rel(f)) for f in files if f not in main
+                                if (v := parse_gradle(_read(f)))]
     if found:
         best = max(found, key=lambda t: t[0])
         return Requirement(*best)
@@ -158,33 +180,105 @@ def required_java(suite_dir: Path, repo_root: Path, tool: str) -> Requirement | 
 # --- local JDKs ---
 
 MAC_JAVA_HOME = "/usr/libexec/java_home"
-LINUX_JVM_DIR = Path("/usr/lib/jvm")
+# Glob patterns of directories that are (or hold, under `Contents/Home` or Homebrew's
+# `libexec/openjdk.jdk/Contents/Home`) a JDK home.
+JDK_ROOTS = (
+    "/Library/Java/JavaVirtualMachines/*",
+    "/opt/homebrew/opt/openjdk*",
+    "/usr/local/opt/openjdk*",
+    "/usr/lib/jvm/*",
+    "~/.sdkman/candidates/java/*",
+)
+_HOME_SUBDIRS = ("", "Contents/Home", "libexec/openjdk.jdk/Contents/Home")
 
 
-def find_local_jdk(version: int, *, env: dict | None = None, java_home_tool: str | None = MAC_JAVA_HOME,
-                   jvm_dir: Path | None = LINUX_JVM_DIR) -> str | None:
-    """A JAVA_HOME for Java `version` on this machine, or None. Looked up in order:
-    `JAVA_HOME_<N>_<ARCH>` variables, macOS `java_home -v N`, `/usr/lib/jvm/*N*`."""
+@dataclass(frozen=True)
+class LocalJdk:
+    home: str
+    major: int
+
+
+def release_major(home: str | Path) -> int | None:
+    """The Java major in `<home>/release` (`JAVA_VERSION="22.0.1"` -> 22, `"1.8.0_392"` -> 8),
+    or None when there is no readable release file."""
+    text = _read(Path(home) / "release")
+    m = re.search(r'(?m)^JAVA_VERSION\s*=\s*"?([^"\s]+)', text)
+    if not m:
+        return None
+    parts = re.match(r"(?:1\.)?(\d{1,3})", m.group(1))
+    return int(parts.group(1)) if parts else None
+
+
+def _resolve_home(path: str | Path) -> str | None:
+    for sub in _HOME_SUBDIRS:
+        home = Path(path) / sub if sub else Path(path)
+        if (home / "release").is_file():
+            return str(home)
+    return None
+
+
+def _java_home_listing(tool: str | None) -> list[str]:
+    """JDK homes named by `java_home -V` (macOS; it prints the list on stderr)."""
+    if not tool or not Path(tool).is_file():
+        return []
+    try:
+        r = subprocess.run([tool, "-V"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    homes = []
+    for line in (r.stderr + "\n" + r.stdout).splitlines():
+        m = re.match(r'^\s+\d[\w.+\-]*\s.*?"\s+(/.+?)\s*$', line)
+        if m:
+            homes.append(m.group(1))
+    return homes
+
+
+def local_jdks(*, env: dict | None = None, java_home_tool: str | None = MAC_JAVA_HOME,
+               roots: tuple[str, ...] | list[str] | None = None) -> list[LocalJdk]:
+    """The JDKs on this machine with their real majors (from each `release` file; a directory
+    without one is not a JDK we can place, whatever its name says). Sources, in order:
+    `JAVA_HOME_<N>_*` variables, `java_home -V`, then the `roots` globs. Duplicates (symlinks)
+    are listed once."""
+    env = os.environ if env is None else env
+    candidates: list[str] = [env[n] for n in sorted(env)
+                             if re.fullmatch(r"JAVA_HOME_\d+(?:_[A-Z0-9]+)?", n) and env[n]]
+    candidates += _java_home_listing(java_home_tool)
+    for pattern in JDK_ROOTS if roots is None else roots:
+        candidates += sorted(glob.glob(os.path.expanduser(pattern)))
+    out, seen = [], set()
+    for c in candidates:
+        home = _resolve_home(c)
+        if not home:
+            continue
+        key = os.path.realpath(home)
+        major = release_major(home)
+        if key in seen or major is None:
+            continue
+        seen.add(key)
+        out.append(LocalJdk(home, major))
+    return out
+
+
+def pick_jdk(version: int, jdks: list[LocalJdk]) -> str | None:
+    """The JDK of exactly `version`, else the one with the lowest major above it, else None."""
+    exact = [j for j in jdks if j.major == version]
+    if exact:
+        return exact[0].home
+    newer = sorted((j for j in jdks if j.major > version), key=lambda j: j.major)
+    return newer[0].home if newer else None
+
+
+def find_local_jdk(version: int, *, env: dict | None = None,
+                   java_home_tool: str | None = MAC_JAVA_HOME,
+                   roots: tuple[str, ...] | list[str] | None = None,
+                   jdks: list[LocalJdk] | None = None) -> str | None:
+    """A JAVA_HOME for Java `version` on this machine, or None: the exact major if installed,
+    else the lowest newer major (never the newest: `java_home -v N` returns that, and a build
+    pinned to 21 breaks on 26). Pass `jdks` to skip enumeration."""
     if version < 5:
         return None
-    env = os.environ if env is None else env
-    for name in sorted(env):
-        if re.fullmatch(rf"JAVA_HOME_{version}(?:_[A-Z0-9]+)?", name) and env[name]:
-            return env[name]
-    if java_home_tool and Path(java_home_tool).is_file():
-        try:
-            r = subprocess.run([java_home_tool, "-v", str(version)], capture_output=True,
-                               text=True, timeout=10, check=False)
-        except (OSError, subprocess.SubprocessError):
-            r = None
-        if r and r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip().splitlines()[0]
-    if jvm_dir and Path(jvm_dir).is_dir():
-        token = re.compile(rf"(?<!\d)(?:1\.)?{version}(?!\d)")
-        for d in sorted(Path(jvm_dir).iterdir()):
-            if d.is_dir() and token.search(d.name):
-                return str(d)
-    return None
+    found = local_jdks(env=env, java_home_tool=java_home_tool, roots=roots) if jdks is None else jdks
+    return pick_jdk(version, found)
 
 
 def describe(req: Requirement, home: str | None) -> list[str]:

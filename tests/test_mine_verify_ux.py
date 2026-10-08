@@ -77,7 +77,7 @@ def test_scaffold_never_verified_message_unchanged(git_repo, crucible_home, caps
 
 @pytest.mark.parametrize("text,marker", [
     ("@Disabled\nvoid t() {}\n", "@Disabled"), ("@Ignore\n", "@Ignore"),
-    ("it.skip('x', () => {})\n", ".skip("), ("xit('x', () => {})\n", "xit("),
+    ("xit('x', () => {})\n", "xit("),
     ("xdescribe('x', () => {})\n", "xdescribe("), ("@pytest.mark.skip\n", "pytest.mark.skip"),
     ("t.Skip(\"no\")\n", "t.Skip("), ("skip \"later\" do\nend\n", 'skip "'),
     ("pending\n", "pending"), ("[Fact(Skip=\"x\")]\n", "[Fact(Skip="),

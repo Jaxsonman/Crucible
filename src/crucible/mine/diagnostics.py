@@ -27,6 +27,7 @@ class Rule:
     stages: tuple[str, ...] = STAGES
     status: str | None = None
     unless: re.Pattern | None = None  # the row does not apply to a log this matches
+    suppresses: tuple[str, ...] = ()  # ids of rows hidden when this (root-cause) row matches
 
     def matches(self, text: str, exit_code: int | None, stage: str) -> bool:
         if stage not in self.stages:
@@ -77,7 +78,8 @@ def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
         for key in ("category", "hint"):
             if not isinstance(row.get(key), str) or not row[key].strip():
                 raise ValueError(f"{label}: `{key}` must be a non-empty string")
-        unknown = set(row) - {"id", "category", "hint", "pattern", "exit", "stage", "status", "unless"}
+        unknown = set(row) - {"id", "category", "hint", "pattern", "exit", "stage", "status", "unless",
+                                "suppresses"}
         if unknown:
             raise ValueError(f"{label}: unknown field(s) {sorted(unknown)}")
         pattern = None
@@ -105,8 +107,15 @@ def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
         status = row.get("status")
         if status is not None and status not in STATUSES:
             raise ValueError(f"{label}: `status` must be one of {list(STATUSES)}")
+        sup = row.get("suppresses", [])
+        if not isinstance(sup, list) or not all(isinstance(x, str) for x in sup):
+            raise ValueError(f"{label}: `suppresses` must be a list of row ids")
         rules.append(Rule(rid, row["category"], " ".join(row["hint"].split()), pattern,
-                          tuple(exit_codes), tuple(stages), status, unless))
+                          tuple(exit_codes), tuple(stages), status, unless, tuple(sup)))
+    for r in rules:
+        missing = [x for x in r.suppresses if x not in seen]
+        if missing:
+            raise ValueError(f"{where}: rule {r.id!r}: `suppresses` names unknown row(s) {missing}")
     status_hints = data.get("status_hints") or {}
     if not isinstance(status_hints, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in status_hints.items()):
@@ -150,12 +159,15 @@ def diagnose(text: str, exit_code: int | None, stage: str, table: Table | None =
     """Hints for one step's log (`text` is the body from `split_log`), de-duplicated by text."""
     table = table or load_table()
     window = text[-LOG_WINDOW:]
-    hints, seen = [], set()
     ran = any(p.search(window) for p in table.ran_tests)
-    for rule in table.rules:
-        if ran and rule.status:  # test counts are present: the runner did run tests
-            continue
-        if rule.matches(window, exit_code, stage) and rule.hint not in seen:
+    matched = [r for r in table.rules
+               if not (ran and r.status)  # test counts are present: the runner did run tests
+               and r.matches(window, exit_code, stage)]
+    # A root-cause row (`suppresses`) hides the generic symptom rows it names.
+    hidden = {x for r in matched for x in r.suppresses}
+    hints, seen = [], set()
+    for rule in matched:
+        if rule.id not in hidden and rule.hint not in seen:
             seen.add(rule.hint)
             hints.append(Hint(rule.id, rule.category, rule.hint, rule.status))
     return hints

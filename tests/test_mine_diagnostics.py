@@ -21,6 +21,7 @@ SAMPLES = {
     "maven-no-tests": ("[ERROR] No tests were executed!  (Set -DfailIfNoTests=false)\n", 1, "test"),
     "gradle-no-tests": ("No tests found for given includes: [a.B](--tests filter)\n", 1, "test"),
     "go-no-test-files": ("?   \texample.com/pkg\t[no test files]\n", 0, "test"),
+    "go-no-tests-to-run": ("ok  \texample.com/pkg\t0.003s [no tests to run]\n", 0, "test"),
     "go-package-not-found": ("go: cannot find package \"x/y\"\n", 1, "test"),
     "cargo-no-test-target": ("error: no test target named `foo`\n", 101, "test"),
     "rspec-no-examples": ("0 examples, 0 failures\n", 0, "test"),
@@ -41,6 +42,8 @@ SAMPLES = {
     "lombok-new-jdk": (
         "java.lang.ExceptionInInitializerError\nCaused by: lombok.javac.apt.LombokProcessor\n",
         1, "test"),
+    "lombok-accessors-missing": (
+        "cannot find symbol\n  symbol:   method getUrl()\n  location: class a.B\n", 1, "test"),
     "ruby-load-error": ("LoadError: cannot load such file -- rails/all\n", 1, "test"),
     "node-engine-mismatch": (
         'error foo@1.0.0: The engine "node" is incompatible with this module.\n', 1, "setup"),

@@ -231,17 +231,19 @@ def _write_cache(c: Candidate, suites: list[Suite], r: VerifyResult) -> None:
 # --- weak-task warnings ---
 
 # Markers of tests that are skipped or pending: a task whose tests do not really run is weak.
-SKIP_MARKERS = (
-    ("@Disabled", re.compile(r"@Disabled\b")),
-    ("@Ignore", re.compile(r"@Ignore\b")),
-    (".skip(", re.compile(r"\.skip\(")),
-    ("xit(", re.compile(r"\bxit\(")),
-    ("xdescribe(", re.compile(r"\bxdescribe\(")),
-    ("pytest.mark.skip", re.compile(r"pytest\.mark\.skip")),
-    ("t.Skip(", re.compile(r"\bt\.Skip\(")),
-    ('skip "', re.compile(r"""^\s*skip\s+["']""", re.MULTILINE)),
-    ("pending", re.compile(r"^\s*pending\b", re.MULTILINE)),
-    ("[Fact(Skip=", re.compile(r"\[Fact\(\s*Skip\s*=")),
+_JS_FILE = re.compile(r"\.(?:[cm]?[jt]sx?)$")
+# (label, regex, only for files matching this pattern or None for any file)
+SKIP_MARKERS: tuple[tuple[str, re.Pattern, re.Pattern | None], ...] = (
+    ("@Disabled", re.compile(r"@Disabled\b"), None),
+    ("@Ignore", re.compile(r"@Ignore\b"), None),
+    (".skip(", re.compile(r"\b(?:it|describe|test)\.skip\("), _JS_FILE),
+    ("xit(", re.compile(r"\bxit\("), None),
+    ("xdescribe(", re.compile(r"\bxdescribe\("), None),
+    ("pytest.mark.skip", re.compile(r"pytest\.mark\.skip"), None),
+    ("t.Skip(", re.compile(r"\bt\.Skip\("), None),
+    ('skip "', re.compile(r"""^\s*skip\s+["']""", re.MULTILINE), None),
+    ("pending", re.compile(r"""^\s*pending\s*(?:\(|['"]|$)""", re.MULTILINE), None),
+    ("[Fact(Skip=", re.compile(r"\[Fact\(\s*Skip\s*="), None),
 )
 
 
@@ -254,7 +256,8 @@ def skip_marker_warnings(repo: Path, c: Candidate, files: list[str]) -> list[str
                 "utf-8", "replace")
         except MineGitError:  # an unreadable blob is no reason to warn
             text = ""
-        found = [name for name, rx in SKIP_MARKERS if rx.search(text)]
+        found = [name for name, rx, only in SKIP_MARKERS
+                 if (only is None or only.search(path)) and rx.search(text)]
         if found:
             out.append(f"{path} contains skip marker(s) {', '.join(found)}: "
                        "some tests may not really run")
