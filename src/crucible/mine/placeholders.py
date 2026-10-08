@@ -181,6 +181,14 @@ class _Item:
     pre: str = ""
     post: str = ""
     path: bool = True  # still a path relative to cwd (no module/stem transform applied)
+    root: bool = False  # `dir` of a file at the cwd (value `.`)
+
+    def text(self) -> str:
+        """pre + value + post; the cwd itself behind a prefix ending in `/` is just the prefix
+        (`./` + `.` would be `./.`)."""
+        if self.root and self.value == "." and self.pre.endswith("/"):
+            return self.pre + self.post
+        return self.pre + self.value + self.post
 
 
 def _outside(rel: str) -> bool:
@@ -220,6 +228,7 @@ def _expand(ph: Placeholder, files: list[str], cwd: str, module_root: str | None
         elif flt.name == "dir":
             for _, it in items:
                 it.value = posixpath.dirname(it.value) or "."
+                it.root = it.value == "."
         elif flt.name == "unique":
             seen, kept = set(), []
             for pair in items:
@@ -236,12 +245,13 @@ def _expand(ph: Placeholder, files: list[str], cwd: str, module_root: str | None
         elif flt.name == "join":
             join = flt.arg
     if join is not None and join != " ":
-        return shlex.quote(join.join(it.pre + it.value + it.post for _, it in items))
+        return shlex.quote(join.join(it.text() for _, it in items))
     # default: every item is its own shell word (value quoted; prefix/suffix are the
     # configuration's own text and stay unquoted)
     # A path item that starts with `-` (and has no prefix in front of it) would be parsed as an
     # option by the runner: render it as `./-name`.
     return " ".join(
+        it.text() if it.root and it.value == "." and it.pre.endswith("/") else
         it.pre + shlex.quote("./" + it.value if it.path and not it.pre and it.value.startswith("-")
                              else it.value) + it.post for _, it in items)
 

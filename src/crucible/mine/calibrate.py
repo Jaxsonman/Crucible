@@ -8,6 +8,7 @@ Results are written to `<home>/mine/calibration.json`. Never calls `claude`.
 
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -37,7 +38,9 @@ def calibration_file() -> Path:
 
 def config_hash(suites: list[Suite]) -> str:
     """Hash of every suite's settings plus the scripts digest: what a calibration is valid for."""
-    base = json.dumps([s.settings_hash() for s in suites])
+    # timeouts are not part of a suite's verify-cache hash (a timeout result is never cached),
+    # but a calibration must not outlive them: raising a limit has to clear a stale `timeout`
+    base = json.dumps([[s.settings_hash(), s.timeout, s.setup_timeout] for s in suites])
     return hashlib.sha256((base + vf.scripts_digest()).encode()).hexdigest()
 
 
@@ -153,8 +156,55 @@ def _read(path: str) -> str:
         return ""
 
 
-def _sample_from(res: vf.VerifyResult, table: diagnostics.Table,
-                 ) -> tuple[Sample, list[diagnostics.Hint]]:
+def _failing_suite(res: vf.VerifyResult) -> str | None:
+    """The suite a multi-suite rejection points at: the `(<suite>)` reason suffix, else (a
+    timeout) the suite of the last step that ran; None for a single-suite result or a rejection
+    of every suite alike (`passes at base`)."""
+    if "+" not in res.suite:
+        return None
+    m = re.search(r" \((.+)\)$", res.reason)
+    if m:
+        return m.group(1)
+    if res.reason == "timeout":
+        key, _ = _last_log(res)
+        parts = key.split("-", 1)
+        if len(parts) == 2:
+            return parts[1].rsplit("-", 1)[0]
+    return None
+
+
+def _exit_code(res: vf.VerifyResult, key: str) -> int | None:
+    path = res.logs.get(key)
+    return diagnostics.split_log(_read(path))[1] if path else None
+
+
+def _own_part(res: vf.VerifyResult, suite: str, table: diagnostics.Table,
+              ) -> tuple[Sample, list[diagnostics.Hint]] | None:
+    """The sample for `suite` out of a result whose rejection belongs to another suite: only if
+    its own base and merge test steps both ran (it passed at merge, failed or not at base);
+    None when they did not, so the candidate says nothing about this suite."""
+    if not res.reason.startswith("fails at merge"):
+        return None  # setup / timeout / module_root of another suite: this suite's tests never ran
+    base, merge = f"base-{suite}-test", f"merge-{suite}-test"
+    if base not in res.logs or merge not in res.logs or _exit_code(res, merge) != 0:
+        return None
+    logs = {k: v for k, v in res.logs.items() if f"-{suite}-" in k}
+    tail = diagnostics.tail_lines(_read(res.logs[merge]))
+    if _exit_code(res, base) == 0:
+        body, code = diagnostics.split_log(_read(res.logs[base]))
+        hints = diagnostics.diagnose(body, code, "test", table)
+        klass = "no-tests-ran" if any(h.status == "no-tests-ran" for h in hints) else "not-selective"
+        return Sample(res.id, "rejected", "passes at base", res.cached, logs, tail, klass), hints
+    return Sample(res.id, "verified", cached=res.cached, logs=logs, tail=tail), []
+
+
+def _sample_from(res: vf.VerifyResult, table: diagnostics.Table, suite: str = "",
+                 ) -> tuple[Sample, list[diagnostics.Hint]] | None:
+    """The sample `res` gives for `suite`, or None when the rejection belongs to another suite
+    whose failure leaves nothing to say about this one."""
+    blamed = None if res.verified else _failing_suite(res)
+    if blamed and suite and blamed != suite:
+        return _own_part(res, suite, table)
     key, path = _last_log(res)
     text = _read(path) if path else ""
     body, code = diagnostics.split_log(text)
@@ -210,7 +260,9 @@ def calibrate_suite(
                            f"setup {'timed out' if setup.timed_out else 'failed'} at HEAD")
     samples: list[Sample] = []
     hints: list[diagnostics.Hint] = []
-    for c in owned_candidates(suite, suites, candidates)[:n]:
+    for c in owned_candidates(suite, suites, candidates):
+        if len(samples) >= n:
+            break
         res = memo.get(c.merge)
         if res is None:
             try:
@@ -220,9 +272,11 @@ def calibrate_suite(
                 samples.append(Sample(c.id, "error", str(e), klass="failing"))
                 continue
             memo[c.merge] = res
-        sample, found = _sample_from(res, table)
-        samples.append(sample)
-        hints += found
+        got = _sample_from(res, table, suite.name)
+        if got is None:  # another suite's failure: not a sample for this one, try the next
+            continue
+        samples.append(got[0])
+        hints += got[1]
     status, detail = _status(samples)
     if status != "ok":
         hints += _status_hints(status, table, hints)
@@ -293,8 +347,11 @@ def note(suites: list[Suite]) -> str | None:
         data = None
     entries = data.get("suites", {}) if isinstance(data, dict) and data.get("config_hash") == h \
         else None
+    if entries is None and isinstance(data, dict) and data.get("suites"):
+        return ("warning: config changed since last calibration; run `crucible mine calibrate` "
+                "first")
     if entries is None or any(s.name not in entries for s in suites):
-        return "warning: mine.yaml is not calibrated; run `crucible mine calibrate` first"
+        return "warning: mine.yaml was never calibrated; run `crucible mine calibrate` first"
     bad = [f"{s.name} ({entries[s.name].get('status')})" for s in suites
            if entries[s.name].get("status") not in OK_STATUSES]
     if bad:

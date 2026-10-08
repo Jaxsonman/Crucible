@@ -62,6 +62,15 @@ def test_stem_dir_unique():
     assert build("t {tests|dir}", ["a_test.go"]) == "t ."
 
 
+def test_root_dir_with_slash_prefix_is_the_prefix_alone():
+    # `./` + `.` would read `./.`; the root directory is just `./` (`go test ./` = root package)
+    assert build("go test {tests|dir|unique|prefix:./}", ["a_test.go", "pkg/b_test.go"]) == \
+        "go test ./ ./pkg"
+    assert build("t {tests|dir|prefix:src/}", ["a_test.go"]) == "t src/"
+    assert build("t {tests|dir|prefix:x}", ["a_test.go"]) == "t x."  # no slash: unchanged
+    assert build("t {tests|dir|prefix:./|join:,}", ["a_test.go", "p/b_test.go"]) == "t ./,./p"
+
+
 def test_maven_style_single_word_join():
     assert build("mvn test -Dtest={tests|stem|join:,}",
                  ["src/test/java/AFooTest.java", "src/test/java/b/BarTest.java"]) == \

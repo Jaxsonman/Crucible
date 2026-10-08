@@ -47,9 +47,17 @@ list directly, write a wrapper under `.crucible/scripts/`; `crucible` exports it
 # .crucible/scripts/run-tests.sh   (mine.yaml: test_command: bash "$CRUCIBLE_SCRIPTS/run-tests.sh")
 set -euo pipefail
 files=()
-while IFS= read -r f; do files+=("$f"); done <<< "$CRUCIBLE_TEST_FILES_CWD"
+while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done <<< "$CRUCIBLE_TEST_FILES_CWD"
+[ "${#files[@]}" -gt 0 ] || { echo "no test files" >&2; exit 2; }   # never pass an empty argument
 exec ./tools/run_tests --only "${files[@]}"
 ```
+
+`setup` runs before the PR's test files are copied in, so it must not need them (compile main
+code only: Maven `compile`, Gradle `classes`). If the toolchain is not installed on this machine
+(a JDK of another version, Go, an old Ruby), run it in a container from a wrapper script and
+note that the task then needs Docker wherever it runs. Tested recipes (Go via Docker, Gradle
+with JDK toolchains, Maven with `JAVA_HOME`, Ruby with `vendor/bundle`) are in
+`docs/mining-recipes.md`.
 
 Rules: use only dummy values in `env`, never real secrets; prefer the repo's own test setup (for
 a database or queue, start the compose service in `setup`); keep every command non-interactive;
@@ -71,6 +79,9 @@ quoting the suite name, status, hint and the last 20 log lines. Continue to step
 suite is `ok` or `no-candidates`; with `no-candidates` only, calibration proved nothing yet, so
 say so and offer to continue anyway.
 
+Per-candidate progress lines go to stderr as each finishes. If the list looks short, the walk may
+have been cut by `--limit` (the CLI hints when so); raise it.
+
 ## 3. List candidates
 
 Run `crucible mine --json <list flags>`. Output is `{"candidates": [...], "excluded": [...]}`;
@@ -91,8 +102,12 @@ than about 5 ids use the Bash tool's `run_in_background: true` and wait for the 
 instead of polling. Add `--timeout S` only if the user says tests are slow, `--force` only to
 ignore cached results. Then run `crucible mine --json <list flags>` again; each candidate's
 `verified` field is `yes`, `no: <reason>`, or null. Report verified vs rejected with reasons
-(for example `passes at base`, `fails at merge`, `setup failed at base`, `no runnable tests`). A rejection is a normal
-outcome, not an error. If nothing verified, stop and say what to fix (usually `mine.yaml`).
+(for example `passes at base`, `fails at merge`, `setup failed at base`, `no runnable tests`);
+each rejection prints its log path and, when a diagnostics row matches, a hint. A rejection is a
+normal outcome, not an error. A verified candidate may carry `warnings` (skipped tests in the
+changed test files, or a base failure that is only a compile/type error): **prefer candidates
+without warnings** and tell the user which ones have them. If scaffold later says `config changed
+since verification`, rerun the verify. If nothing verified, stop and say what to fix (usually `mine.yaml`).
 
 ## 5. Confirm the cost
 
@@ -105,7 +120,8 @@ Do nothing further until the user says yes; offer to do a subset.
 For each verified id:
 
 1. `crucible mine scaffold <id> <list flags>` (add `--task-id <slug>` or `--kind <kind>` only
-   when needed). It writes `.crucible/tasks/<slug>/` with `task.md`, `check.sh`, `hidden_tests/`
+   when needed; it warns when the task needs Docker on the machine that runs it, recorded as
+   `requires` in `.mine.json`: tell the user). It writes `.crucible/tasks/<slug>/` with `task.md`, `check.sh`, `hidden_tests/`
    and `.mine.json`; note the printed path. It exits 1 with the reason if the candidate is not
    verified or already mined; report that and move on.
 2. `crucible mine show <id> --json <list flags>`: gives `title`, `body`, `labels`, `branch`,

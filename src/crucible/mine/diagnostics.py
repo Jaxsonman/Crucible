@@ -26,11 +26,14 @@ class Rule:
     exit: tuple[int, ...] = ()
     stages: tuple[str, ...] = STAGES
     status: str | None = None
+    unless: re.Pattern | None = None  # the row does not apply to a log this matches
 
     def matches(self, text: str, exit_code: int | None, stage: str) -> bool:
         if stage not in self.stages:
             return False
         if self.exit and exit_code not in self.exit:
+            return False
+        if self.unless is not None and self.unless.search(text):
             return False
         return self.pattern is None or self.pattern.search(text) is not None
 
@@ -50,6 +53,9 @@ class Hint:
 class Table:
     rules: list[Rule] = field(default_factory=list)
     status_hints: dict[str, str] = field(default_factory=dict)
+    # Patterns showing tests really ran (pass/fail counts): a `status` row (no tests ran) never
+    # applies to a log that matches one.
+    ran_tests: tuple[re.Pattern, ...] = ()
 
 
 def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
@@ -71,7 +77,7 @@ def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
         for key in ("category", "hint"):
             if not isinstance(row.get(key), str) or not row[key].strip():
                 raise ValueError(f"{label}: `{key}` must be a non-empty string")
-        unknown = set(row) - {"id", "category", "hint", "pattern", "exit", "stage", "status"}
+        unknown = set(row) - {"id", "category", "hint", "pattern", "exit", "stage", "status", "unless"}
         if unknown:
             raise ValueError(f"{label}: unknown field(s) {sorted(unknown)}")
         pattern = None
@@ -80,6 +86,12 @@ def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
                 pattern = re.compile(str(row["pattern"]), re.MULTILINE)
             except re.error as e:
                 raise ValueError(f"{label}: invalid `pattern`: {e}") from e
+        unless = None
+        if "unless" in row:
+            try:
+                unless = re.compile(str(row["unless"]), re.MULTILINE)
+            except re.error as e:
+                raise ValueError(f"{label}: invalid `unless`: {e}") from e
         exit_codes = row.get("exit", [])
         if not isinstance(exit_codes, list) or not all(
                 isinstance(c, int) and not isinstance(c, bool) for c in exit_codes):
@@ -94,12 +106,19 @@ def parse_table(data: object, where: str = "diagnostics.yaml") -> Table:
         if status is not None and status not in STATUSES:
             raise ValueError(f"{label}: `status` must be one of {list(STATUSES)}")
         rules.append(Rule(rid, row["category"], " ".join(row["hint"].split()), pattern,
-                          tuple(exit_codes), tuple(stages), status))
+                          tuple(exit_codes), tuple(stages), status, unless))
     status_hints = data.get("status_hints") or {}
     if not isinstance(status_hints, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in status_hints.items()):
         raise ValueError(f"{where}: `status_hints` must map status names to text")
-    return Table(rules, {k: " ".join(v.split()) for k, v in status_hints.items()})
+    ran = data.get("ran_tests") or []
+    if not isinstance(ran, list) or not all(isinstance(x, str) for x in ran):
+        raise ValueError(f"{where}: `ran_tests` must be a list of regexes")
+    try:
+        ran_patterns = tuple(re.compile(x, re.MULTILINE) for x in ran)
+    except re.error as e:
+        raise ValueError(f"{where}: invalid `ran_tests` regex: {e}") from e
+    return Table(rules, {k: " ".join(v.split()) for k, v in status_hints.items()}, ran_patterns)
 
 
 def load_table() -> Table:
@@ -132,8 +151,18 @@ def diagnose(text: str, exit_code: int | None, stage: str, table: Table | None =
     table = table or load_table()
     window = text[-LOG_WINDOW:]
     hints, seen = [], set()
+    ran = any(p.search(window) for p in table.ran_tests)
     for rule in table.rules:
+        if ran and rule.status:  # test counts are present: the runner did run tests
+            continue
         if rule.matches(window, exit_code, stage) and rule.hint not in seen:
             seen.add(rule.hint)
             hints.append(Hint(rule.id, rule.category, rule.hint, rule.status))
     return hints
+
+
+def ran_tests(text: str, table: Table | None = None) -> bool:
+    """True if the log shows test pass/fail counts (the runner really ran tests)."""
+    table = table or load_table()
+    window = text[-LOG_WINDOW:]
+    return any(p.search(window) for p in table.ran_tests)

@@ -27,7 +27,7 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
-from crucible.mine import config, presets
+from crucible.mine import config, jdk, presets
 from crucible.mine.presets import Preset
 
 MAX_DEPTH = 3
@@ -91,6 +91,7 @@ class Detection:
     preset: str
     marker: str
     notes: str
+    extra: tuple[str, ...] = ()  # more comment text (e.g. the Java version the build needs)
 
     def comment(self) -> list[str]:
         where = "the repo root" if self.suite.cwd == "." else f"`{_clean(self.suite.cwd)}/`"
@@ -101,6 +102,7 @@ class Detection:
         ]
         if self.notes:
             lines += textwrap.wrap(f"Note: {self.notes}", width=94)
+        lines += self.extra
         return [ln for part in lines for ln in textwrap.wrap(part, width=94) or [""]]
 
 
@@ -207,8 +209,11 @@ def _unique_name(base: str, preset: str, used: set[str]) -> str:
     raise AssertionError("unreachable: no unique suite name")
 
 
-def detect(repo_root: Path, catalog: dict[str, Preset] | None = None) -> list[Detection]:
-    """Detect the repo's test suites from the presets (the shipped ones by default)."""
+def detect(repo_root: Path, catalog: dict[str, Preset] | None = None,
+           jdk_lookup: jdk.JdkLookup | None = None) -> list[Detection]:
+    """Detect the repo's test suites from the presets (the shipped ones by default). For Maven
+    and Gradle suites the Java version the build needs is read and, when `jdk_lookup(version)`
+    (default: this machine's JDKs) finds a JDK, set as `env: JAVA_HOME`."""
     root = Path(repo_root)
     catalog = presets.shipped() if catalog is None else catalog
     matches = []
@@ -228,7 +233,19 @@ def detect(repo_root: Path, catalog: dict[str, Preset] | None = None) -> list[De
         rel = _rel(root, m.directory)
         name = _unique_name(m.directory.name if rel != "." else m.preset.name, m.preset.name, used)
         fields = presets.build_fields(m.preset, rel, m.directory, root)
+        extra: tuple[str, ...] = ()
+        if m.preset.name in ("maven", "gradle"):
+            req = jdk.required_java(m.directory, root, m.preset.name)
+            if req:
+                home = (jdk_lookup or jdk.find_local_jdk)(req.version)
+                if home and "JAVA_HOME" not in fields["env"]:
+                    fields["env"] = {**fields["env"], "JAVA_HOME": home}
+                extra = tuple(ln for part in jdk.describe(req, home)
+                              for ln in textwrap.wrap(part, width=94))
         suite = config.Suite(name=name, cwd=rel, **fields)
-        found.append(Detection(suite, m.preset.name, m.marker, m.preset.notes))
+        notes = " ".join([m.preset.notes] + [
+            note for globs, note in m.preset.notes_when
+            if any(presets.glob_files(m.directory, g) for g in globs)])
+        found.append(Detection(suite, m.preset.name, m.marker, notes, extra))
     return found
 

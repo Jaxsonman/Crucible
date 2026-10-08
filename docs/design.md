@@ -69,6 +69,8 @@ check_timeout_minutes: 45     # optional positive integer; how long `crucible ru
 `check_timeout_minutes`, else 300 s. Mined tasks get `check_timeout_minutes` from `scaffold`
 (the suites' `setup_timeout` plus `timeout`, rounded up to whole minutes), so a slow build is
 not killed by the default; `crucible mine prove` uses it too unless `--timeout` is given.
+`crucible run <task>` (and `task validate`, `mine prove`, `mine leakcheck`) take a task directory;
+a bare task id that is not an existing path resolves to `<home>/tasks/<id>`.
 
 The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) plus the
 What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
@@ -153,7 +155,8 @@ PR mining turns merged PRs into tasks.
 
 - Code lives in the `src/crucible/mine/` package: `config.py` (mine.yaml, path globs), `presets.py`
   and `detect.py` (framework presets, stack detection), `candidates.py` (model, filters, local-git source), `gh.py`, `verify.py`,
-  `calibrate.py` and `diagnostics.py` (setup check, status and hints), `scaffold.py`, `leak.py`.
+  `calibrate.py` and `diagnostics.py` (setup check, status and hints), `jdk.py` (Java version
+  a Maven/Gradle build needs, local JDK lookup), `scaffold.py`, `leak.py`.
 - A candidate's **base** is the first parent of its merge commit (works for merge, squash and
   single-commit rebase merges). Its **merge** is the merge commit SHA. Both are full SHAs.
 - A file is a **test file** if it matches a suite's `test_paths` globs; everything else is
@@ -222,7 +225,9 @@ them (a bad file is an error naming `<file>: <field>`; a test loads every shippe
 
 A preset has `name` (= file name), `markers`, `test_paths`, `test_command`, `notes` (why the
 command is right) and optionally `runnable`, `setup`, `module_root`, `env`, `timeout`,
-`setup_timeout`, `evidence`, `supersedes`, `fallback`, `project_files` and `variants`:
+`setup_timeout`, `evidence`, `supersedes`, `fallback`, `project_files`, `variants` and
+`notes_when` (`[{when: [globs], note}]`: extra notes written only when a file matching a glob
+exists in the suite directory, e.g. rspec's Rails database note for `config/application.rb`):
 
 - `markers`: `{glob, contains?, evidence?, weak?, aggregator?, wins_over?}`. `glob` names files in
   the directory itself (`pom.xml`, `*.sln`, `test/test_helper.rb`; `{a,b}` alternation works);
@@ -329,6 +334,24 @@ guess to be checked with `crucible mine calibrate`, plus the preset's notes (or,
 detected, a commented template with empty `suites`). It prints the path and exits 0 without
 overwriting an existing file; an invalid file prints its errors and exits 1.
 
+**Setup compiles main code only.** `setup` runs before the PR's test files are copied in (see
+Verification), so build-tool presets compile just the main sources: Maven `compile`
+(`./mvnw ... compile`), Gradle `classes` (`./gradlew classes`), never `test-compile` /
+`testClasses` (the PR's tests reference classes the base does not have).
+
+**JDK detection** (`mine/jdk.py`). For `maven` and `gradle` suites detection reads the Java
+version the build needs: the pom's compiler plugin `<release>`, `maven.compiler.release`,
+`java.version`, `maven.compiler.source`/`target` (`1.8` is 8, `${prop}` is followed); for Gradle
+`JavaLanguageVersion.of(N)`, `jvmToolchain(N)`, `languageVersion = N`, `JavaVersion.VERSION_N`,
+`sourceCompatibility` in the suite's build files (root, subprojects two levels down, `buildSrc`)
+and `jdk = "N"` style keys of `gradle/libs.versions.toml` (the highest wins); else the first
+literal `java-version:` of a `.github/workflows` `actions/setup-java` step. The version and its
+source file are written as a comment above the suite. If a matching JDK is installed
+(`JAVA_HOME_<N>_*` variables, macOS `/usr/libexec/java_home -v N`, `/usr/lib/jvm/*N*`; the lookup
+function is injectable: `detect(..., jdk_lookup=)`), the suite gets `env: {JAVA_HOME: <path>}`
+(`JAVA_HOME` is not secret-like, so the secret guard allows it); otherwise the comment suggests
+installing one or a container wrapper script (`docs/mining-recipes.md`).
+
 #### Placeholders
 
 ```
@@ -370,7 +393,9 @@ errors naming the field: a name equal to `tests`/`modules` ignoring case (`{Test
 source name (`{ tests }`, `{tests }`, `{ tests}`), and an unclosed `{tests`. Inside an argument `\|`, `\}` and `\\` are literals and `\n`/`\t`
 a newline/tab. Examples: pytest `{tests}`; Django `{tests|module:backend}`; Maven
 `-Dtest={tests|stem|join:,}`; Gradle `--tests` per class as above; Go
-`{tests|dir|unique|prefix:./}`.
+`{tests|dir|unique|prefix:./}`. `dir` of a file at the `cwd` is `.`; behind a `prefix` ending in
+`/` that item is just the prefix (`./`, not `./.`), so a root-level Go test file yields
+`go test ./pkg ./`, which runs the package in the current directory.
 
 Every setup and test step (verify, and `check.sh`) also gets `CRUCIBLE_TEST_FILES` (the
 suite's runnable files, repo-relative, newline-separated) and `CRUCIBLE_TEST_FILES_CWD` (the
@@ -427,6 +452,9 @@ local source; `--local` forces it.
 `test_diff` and `non_test_diff` (the diffs base->merge of its test and non-test files) and
 `excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional subcommand (`calibrate`, `show`, `scaffold`,
 `prove`, `leakcheck`) and shares `--branch --limit --max-lines --local --json` with it.
+`--limit` caps the PRs (gh) or commits (local) scanned, newest first (default 300); when the walk
+hit it and few candidates remain among many exclusions, the listing prints a stderr hint to
+raise it.
 
 ### Verification (`mine/verify.py`)
 
@@ -445,21 +473,26 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   (conftest, fixtures, helpers) are overlaid but not passed. No runnable file means rejected
   `no runnable tests`, also for a command without placeholders (which then runs the whole suite).
 - **Several suites.** A candidate whose test files fall in more than one suite is a normal
-  candidate (`suites: [a, b]`; the listing shows `a+b`). Per side the tree is exported and all
-  test files overlaid once; then for each suite in order: setup (failure rejects as
-  `setup failed at <side> (<suite>)`), then its test command with only that suite's runnable
-  files (a suite with none is skipped; none at all: `no runnable tests`). Base is verified if
+  candidate (`suites: [a, b]`; the listing shows `a+b`). Per side the tree is exported and every
+  suite's setup runs (failure rejects as `setup failed at <side> (<suite>)`); then, on the base
+  side, all test files are overlaid once; then each suite in order runs its test command with
+  only that suite's runnable files (a suite with none is skipped; none at all: `no runnable tests`). Base is verified if
   at least one suite fails (all pass: `passes at base`); merge needs every suite to pass
   (`fails at merge (<suite>)`). `{modules}`/`module_root` apply per suite
   (`test outside module_root (<suite>)`). Single-suite results keep the plain reasons without
   the suffix.
 - **Steps.** Export base (`workspace.export_tree`, which drops the top-level `.crucible/`) into a
-  fresh dir under `paths.work_dir()/mine/`, overlay the PR's test files at their merge versions
-  (added and modified are written with their git mode, so `100755` stays executable and `120000`
-  becomes a symlink; deleted are removed; a write whose parent directory is a symlink, or that
-  resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run `setup` (if any) in the suite `cwd`,
-  then the test command, which must exit non-zero. Then export merge to another fresh dir, setup,
-  same command, which must exit zero. Setup and tests run via `bash -c` in their own process
+  fresh dir under `paths.work_dir()/mine/`, run `setup` (if any) in the suite `cwd` **before
+  anything else**, then overlay the PR's test files at their merge versions (added and modified
+  are written with their git mode, so `100755` stays executable and `120000` becomes a symlink;
+  deleted are removed; a write whose parent directory is a symlink, or that resolves outside the
+  workspace, is refused and rejects with `unsafe path (symlink)`), then run the test command,
+  which must exit non-zero. Then export merge to another fresh dir, setup, same command, which
+  must exit zero. Setup comes first because build-tool setups that compile (Maven, Gradle) would
+  otherwise fail on the PR's tests, which reference classes the base lacks; the dependency
+  manifests setup needs are not test files, so they are present. Setup still gets
+  `CRUCIBLE_TEST_FILES` (the files it may not find on disk yet). `check.sh` and `prove` use the
+  same order. Setup and tests run via `bash -c` in their own process
   group, with `os.environ`, the suite `env` and Crucible's own variables (`CRUCIBLE_TEST_FILES`,
   `CRUCIBLE_TEST_FILES_CWD`, and `CRUCIBLE_SCRIPTS` when the home has a scripts dir). A setup
   step is killed after the suite's `setup_timeout` (default 1800 s), a test step after its
@@ -481,6 +514,17 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   `timeout` and `setup_timeout` are deliberately left out: a run that hit a limit is never
   cached, and a result obtained within a limit stays valid under a longer one. `--force` reruns. `timeout` and `setup failed at ...` are transient and never cached (the logs
   are still written), so a rerun with a longer `--timeout` or fixed setup really runs.
+- **Progress and rejections.** While verifying, one line per candidate goes to stderr as it
+  finishes (`[2/5] 123: verified in 41s`). A rejection also prints the log path and, when a
+  diagnostics row matches that log, its hint (JSON: `hints`). `scaffold` of a candidate whose
+  cache entry exists but was produced with other settings says `config changed since
+  verification; re-run --verify` (not "not verified").
+- **Weak-task warnings.** A verified candidate may carry `warnings` (cache and JSON, printed
+  under its line; never a rejection): a changed runnable test file contains a skip marker
+  (`@Disabled`, `@Ignore`, `.skip(`, `xit(`, `xdescribe(`, `pytest.mark.skip`, `t.Skip(`, rspec
+  `skip "..."` / `pending`, `[Fact(Skip=`), or every failing base step died with a diagnostics
+  row of category `compile` and printed no test counts (the tests fail only because they use code
+  the PR adds). The skill prefers candidates without warnings.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
   (the same string, or null) read from the cache.
 
@@ -495,7 +539,12 @@ the config really runs the repo's tests:
    A suite without `setup` skips this. Failure: `setup-failed` (`timeout` if it hit the limit),
    and no candidates are run.
 2. **Samples.** The N (default 3) newest candidates owned by the suite that carry a runnable file
-   for it are verified with `verify_candidate`: results already in the verify cache count toward
+   for it are verified with `verify_candidate`. A multi-suite candidate's failure is attributed to
+   the failing suite only (the `(<suite>)` reason suffix; a timeout by its last step). For another
+   suite the sample counts only if that suite's own base and merge test steps both ran (it
+   passed at merge): then it is verified, or `passes at base`, from its own logs; otherwise the
+   candidate is skipped for that suite and the next one is sampled (a suite left with none is
+   `no-candidates`). Verifications: results already in the verify cache count toward
    the sample without running (`--force` reruns), others run and are cached under verify's own
    rules, so `timeout` and `setup failed ...` are never cached. `--timeout S` overrides the test
    step as in verify.
@@ -509,11 +558,20 @@ the config really runs the repo's tests:
 **Diagnostics** are data: `src/crucible/data/diagnostics.yaml` (shipped in the wheel). A rule has
 `id`, `category`, `hint` (names the mine.yaml field to change), `pattern` (regex over the log
 body, header line excluded, last 64 KiB) and/or `exit` (both given: both must match), optional
-`stage` (`setup`/`test`) and `status: no-tests-ran`. The step runner appends `exit code: N` to
+`stage` (`setup`/`test`), `status: no-tests-ran` and `unless` (a regex: the row does not apply to
+a log it matches, e.g. go's `[no test files]` while other packages ran tests, Maven's per-module
+"No tests to run"; set on the go, maven, gradle and jest rows). A top-level `ran_tests` list of
+patterns (pass/fail counts) also switches every `status` row off for a log it matches. The step runner appends `exit code: N` to
 every log, which is where the exit code is read from. Rows cover missing runner (127, "command
 not found", missing script), permission, "no tests" messages of pytest, jest, vitest, mocha,
 maven, gradle, go, cargo, rspec, phpunit, dotnet and mix, Python/Java/Node import errors, missing
-environment variables, refused service connections and timeouts. `status_hints` gives a generic
+environment variables, refused service connections and timeouts, wrapper scripts missing
+(`<path>: No such file or directory`, `exec: ...: not found`), JVM toolchain trouble (Gradle "Cannot
+find a Java installation", "release version N not supported", "Unsupported class file major
+version", Lombok on a newer JDK: hint to set `JAVA_HOME` in `env` or use a container wrapper), Ruby
+`LoadError`, Node engine mismatches, and `compile`-category rows (javac/Maven, TypeScript, Go
+build, Rust/C#) used for weak-task warnings. The exit-127 hint suggests a container wrapper in
+`.crucible/scripts/` when the toolchain is not installed on the host. `status_hints` gives a generic
 hint per status. A test requires a sample log for every row, so contributors adding a row add its
 sample to `tests/test_mine_diagnostics.py`.
 
@@ -524,10 +582,12 @@ the last 20 lines of the setup log, or of the last step of that sample.
 
 **State.** `<home>/mine/calibration.json` holds `{"config_hash", "suites": {name: <suite
 report> + "calibrated_at"}}`. The hash covers every suite's `settings_hash()` (so editing a
-suite, or a wrapper script, which `scripts_digest()` is mixed into, makes the file stale) but not
-the timeouts. A `--suite` run merges into a file of the same hash; a different hash replaces it.
+suite, or a wrapper script, which `scripts_digest()` is mixed into, makes the file stale) and,
+unlike verify's cache key, the suites' `timeout` and `setup_timeout`: raising a limit makes a
+stale `timeout` status disappear (the verify cache is unaffected). A `--suite` run merges into a file of the same hash; a different hash replaces it.
 `crucible mine` (listing, also `--json`) and `--verify` print one warning line on stderr when the
-current config is uncalibrated or its last calibration was not ok; they never fail because of it.
+current config was never calibrated, changed since the last calibration, or its last calibration
+was not ok; they never fail because of it.
 
 ### Scaffold and prove (`mine/scaffold.py`)
 
@@ -551,22 +611,26 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   merge versions at repo-relative paths (git modes kept: exec bit, symlinks; `check.sh`'s `tar`
   copy preserves both), plus `hidden_tests/DELETED` (one path per line) for test
   files the PR removed.
-- **Several suites.** `check.sh` installs once, then runs each suite's setup and test command
-  in its own subshell (own `env` and `cwd`), printing `== suite <name> ==` before each. A setup
-  failure exits 97 immediately; test failures are collected so every suite runs, and the
-  script exits with the first failing code. `prove` is unchanged.
+- **Several suites.** `check.sh` runs every suite's setup first (own subshell, `env` and `cwd`;
+  a failure exits 97 immediately), installs the hidden tests once, then runs each suite's test
+  command in its own subshell, printing `== suite <name> ==` before each. Test failures are
+  collected so every suite runs, and the script exits with the first failing code. `prove` is
+  unchanged.
 - **`check.sh`** (mode 755), generated from the suite, run by `checker.run_check` with the
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
-  copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
-  paths, exports the suite `env`, `CRUCIBLE_TEST_FILES` and `CRUCIBLE_TEST_FILES_CWD` (and
-  `CRUCIBLE_SCRIPTS` when `<task>/scripts/` was copied), `cd`s to the suite `cwd`, runs `setup`
-  and then exec's the test command, each via `bash -c '<quoted command>'`, with the
+  exports the suite `env`, `CRUCIBLE_TEST_FILES` and `CRUCIBLE_TEST_FILES_CWD` (and
+  `CRUCIBLE_SCRIPTS` when `<task>/scripts/` was copied), `cd`s to the suite `cwd` and runs
+  `setup` (as in verify, **before** the hidden tests exist in the workspace), then copies
+  `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED` paths,
+  and exec's the test command, each setup/test via `bash -c '<quoted command>'`, with the
   placeholders filled by `verify.build_command` from `verify.runnable_files`, exactly what
   `--verify` ran. A failing
   setup prints `crucible-check: setup failed` and exits 97 (so `prove` never counts a broken
   install as "fails before"); a failed copy exits 98.
+- **Docker.** If `check.sh` or a copied script mentions `docker`, scaffold warns that the task
+  needs Docker on the machine that runs it and records `"requires": ["docker"]` in `.mine.json`.
 - **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`,
-  `check_timeout_s`) records the merge SHA deterministically; `check_timeout_s` is the sum of
+  `check_timeout_s`, optionally `requires`) records the merge SHA deterministically; `check_timeout_s` is the sum of
   the suites' `setup_timeout` and `timeout`, the default for `prove`'s per-run limit. The workspace never contains `.crucible/`, so a hidden file in the task
   dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only `task.md`.
 

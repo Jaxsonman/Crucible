@@ -34,6 +34,7 @@ def commit(repo: Path, msg: str, files: dict[str, str]) -> None:
 
 
 def write_config(home: Path, command: str, *, setup: str = "", timeout: float | None = None,
+                 setup_timeout: float | None = None,
                  extra_suites: str = "") -> None:
     lines = ["suites:", "  - name: app", '    test_paths: ["tests/**"]',
              f"    test_command: {json.dumps(command)}"]
@@ -41,6 +42,8 @@ def write_config(home: Path, command: str, *, setup: str = "", timeout: float | 
         lines.append(f"    setup: {json.dumps(setup)}")
     if timeout is not None:
         lines.append(f"    timeout: {timeout}")
+    if setup_timeout is not None:
+        lines.append(f"    setup_timeout: {setup_timeout}")
     (home / "mine.yaml").write_text("\n".join(lines) + "\n" + extra_suites, encoding="utf-8")
 
 
@@ -259,7 +262,7 @@ def test_listing_warns_when_uncalibrated_then_clears(repo, crucible_home, capsys
     write_config(crucible_home, GOOD)
     assert main(["mine", "--local"]) == 0
     err = capsys.readouterr().err
-    assert "not calibrated" in err and "crucible mine calibrate" in err
+    assert "never calibrated" in err and "crucible mine calibrate" in err
     assert calibrate() == 0
     capsys.readouterr()
     assert main(["mine", "--local"]) == 0
@@ -280,7 +283,8 @@ def test_editing_config_makes_it_uncalibrated(repo, crucible_home, capsys):
     write_config(crucible_home, GOOD + " ")
     capsys.readouterr()
     main(["mine", "--local"])
-    assert "not calibrated" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "config changed since last calibration" in err and "never calibrated" not in err
 
 
 def test_json_listing_stays_pure_json(repo, crucible_home, capsys):
@@ -288,7 +292,7 @@ def test_json_listing_stays_pure_json(repo, crucible_home, capsys):
     main(["mine", "--local", "--json"])
     cap = capsys.readouterr()
     json.loads(cap.out)
-    assert "not calibrated" in cap.err
+    assert "never calibrated" in cap.err
 
 
 def test_verify_hints_to_calibrate_first_but_runs(repo, crucible_home, capsys):
@@ -296,7 +300,7 @@ def test_verify_hints_to_calibrate_first_but_runs(repo, crucible_home, capsys):
     cid = git(repo, "rev-parse", "--short=8", "HEAD")
     assert main(["mine", "--local", "--verify", cid]) == 0
     cap = capsys.readouterr()
-    assert "not calibrated" in cap.err and f"{cid}: verified" in cap.out
+    assert "never calibrated" in cap.err and f"{cid}: verified" in cap.out
 
 
 def test_partial_calibration_merges_into_the_file(repo, crucible_home):
@@ -319,3 +323,28 @@ def test_verify_logs_end_with_the_exit_code(repo, crucible_home, capsys):
     _, data = run_json(capsys, "--candidates", "1")
     log = list(suite_of(data)["samples"][0]["logs"].values())[-1]
     assert Path(log).read_text().rstrip().endswith("exit code: 7")
+
+
+def test_raising_a_timeout_clears_the_stale_timeout_status(repo, crucible_home, capsys):
+    from crucible.mine.config import load_config
+    write_config(crucible_home, ": {tests}; sleep 5", timeout=0.5)
+    assert calibrate("--candidates", "1") == 1
+    suites = load_config(crucible_home / "mine.yaml").suites
+    assert "last calibration was not ok: app (timeout)" in cal.note(suites)
+    before = cal.config_hash(suites)
+    write_config(crucible_home, ": {tests}; sleep 5", timeout=900)
+    suites = load_config(crucible_home / "mine.yaml").suites
+    assert cal.config_hash(suites) != before
+    assert "config changed since last calibration" in cal.note(suites)
+    write_config(crucible_home, ": {tests}; sleep 5", setup_timeout=7)
+    suites = load_config(crucible_home / "mine.yaml").suites
+    assert cal.config_hash(suites) not in (before,)
+
+
+def test_timeouts_change_the_calibration_hash_but_not_the_verify_cache_key(crucible_home):
+    from crucible.mine import config as mc
+    a = mc.Suite("a", ["t/**"], "x")
+    b = mc.Suite("a", ["t/**"], "x", timeout=5, setup_timeout=9)
+    assert a.settings_hash() == b.settings_hash()
+    assert cal.config_hash([a]) != cal.config_hash([b])
+    assert cal.config_hash([mc.Suite("a", ["t/**"], "x", timeout=5)]) != cal.config_hash([b])

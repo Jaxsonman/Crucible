@@ -85,6 +85,9 @@ pass to the runner), `timeout` / `setup_timeout`, and wrapper scripts in `.cruci
    the `mine.yaml` field to change. The skill loops on it (at most 5 rounds) before mining.
 
 A new test runner is one YAML file: see "Adding a preset" in [CONTRIBUTING.md](CONTRIBUTING.md).
+Tested recipes for toolchains that are awkward on a host (Go via Docker, Gradle with JDK
+toolchains, Maven with `JAVA_HOME`, Ruby with `vendor/bundle`) are in
+[docs/mining-recipes.md](docs/mining-recipes.md).
 
 The same steps work by hand (add `--local` to skip `gh`):
 

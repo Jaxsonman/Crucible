@@ -404,13 +404,14 @@ def render_default(suites: list[Suite], comments: dict[str, list[str]] | None = 
     return "".join(parts) + tail
 
 
-def write_default(path: Path, repo_root: Path) -> list[Suite]:
-    """Detect suites and write a commented mine.yaml at `path`. Never overwrites."""
+def write_default(path: Path, repo_root: Path, jdk_lookup=None) -> list[Suite]:
+    """Detect suites and write a commented mine.yaml at `path`. Never overwrites.
+    `jdk_lookup(version)` finds a local JDK for Maven/Gradle suites (tests inject one)."""
     from crucible.mine import detect
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
-    found = detect.detect(repo_root)
+    found = detect.detect(repo_root, jdk_lookup=jdk_lookup)
     suites = [d.suite for d in found]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_default(suites, {d.suite.name: d.comment() for d in found}),

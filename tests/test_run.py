@@ -222,6 +222,9 @@ def test_ctrl_c_records_interrupted_and_stops(crucible_home, tmp_path):
         [sys.executable, "-m", "crucible.cli", "run", task_dir(crucible_home),
          "--configs", "opus:high,sonnet:medium", "--repeat", "2"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # a runner started as a background job passes SIGINT=ignored down; Python would then
+        # install no KeyboardInterrupt handler in the child and the signal below would do nothing
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),  # noqa: PLW1509
     )
     deadline = time.monotonic() + 30
     while not pid_file.exists() and time.monotonic() < deadline:
@@ -290,3 +293,15 @@ def test_unexpected_exception_is_recorded_and_batch_continues(crucible_home, mon
     assert by["sonnet"]["status"] == "completed"
     (batch,) = batches(crucible_home)
     assert (batch / "opus-high-1" / "output.json").is_file()
+
+
+def test_bare_task_id_resolves_against_the_tasks_dir(crucible_home, capsys):
+    assert main(["run", "example-fizzbuzz", "--configs", "opus:high", "--dry-run"]) == 0
+    assert "task example-fizzbuzz" in capsys.readouterr().out
+
+
+def test_existing_path_wins_over_a_bare_id(crucible_home, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(crucible_home / "tasks")
+    assert main(["run", "example-fizzbuzz", "--configs", "opus:high", "--dry-run"]) == 0
+    assert main(["run", "no-such-task", "--configs", "opus:high", "--dry-run"]) == 1
+    assert "no-such-task" in capsys.readouterr().err

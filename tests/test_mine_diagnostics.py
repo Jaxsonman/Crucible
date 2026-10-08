@@ -34,6 +34,21 @@ SAMPLES = {
     "missing-env-message": (
         "django.core.exceptions.ImproperlyConfigured: Set the SECRET_KEY\n", 1, "test"),
     "db-connection-refused": ("psycopg2.OperationalError: could not connect to server\n", 1, "test"),
+    "jvm-no-java-toolchain": (
+        "Cannot find a Java installation on your machine matching: {languageVersion=21}\n", 1,
+        "setup"),
+    "jvm-version-mismatch": ("error: release version 21 not supported\n", 1, "test"),
+    "lombok-new-jdk": (
+        "java.lang.ExceptionInInitializerError\nCaused by: lombok.javac.apt.LombokProcessor\n",
+        1, "test"),
+    "ruby-load-error": ("LoadError: cannot load such file -- rails/all\n", 1, "test"),
+    "node-engine-mismatch": (
+        'error foo@1.0.0: The engine "node" is incompatible with this module.\n', 1, "setup"),
+    "compile-error-jvm": ("[ERROR] COMPILATION ERROR :\n", 1, "test"),
+    "compile-error-ts": ("src/a.test.ts(3,1): error TS2305: Module has no exported member\n", 1,
+                         "test"),
+    "compile-error-go": ("FAIL\texample.com/pkg [build failed]\n", 1, "test"),
+    "compile-error-other": ("error[E0432]: unresolved import `x`\n", 101, "test"),
     "timeout-setup": ("timed out after 1800.0s and was killed\n", None, "setup"),
     "timeout-test": ("timed out after 600.0s and was killed\n", None, "test"),
 }
@@ -116,3 +131,67 @@ def test_shipped_yaml_parses_with_plain_yaml():
     data = yaml.safe_load(
         resources.files("crucible").joinpath("data", "diagnostics.yaml").read_text())
     assert len(data["rules"]) == len(SAMPLES)
+
+
+def ids_of(text, code=1, stage="test"):
+    return [h.id for h in dg.diagnose(text, code, stage)]
+
+
+def test_wrapper_file_missing_variants():
+    for text in ("./go-test.sh: line 3: ./tools/x: No such file or directory\n",
+                 "/work/run.sh: exec: go: not found\n",
+                 'exec: "docker": executable file not found in $PATH\n'):
+        assert "runner-file-missing" in ids_of(text, 127)
+
+
+def test_exit_127_hint_mentions_container_wrapper():
+    hint = next(r.hint for r in dg.load_table().rules if r.id == "runner-exit-127")
+    assert "container" in hint and ".crucible/scripts" in hint
+
+
+def test_lombok_getter_pattern():
+    log = "[ERROR] symbol:   method getName()\n[INFO] annotationProcessor lombok 1.18\n"
+    assert "lombok-new-jdk" in ids_of(log)
+    assert "lombok-new-jdk" not in ids_of("[ERROR] symbol:   method getName()\n")
+    for hint_id in ("jvm-no-java-toolchain", "jvm-version-mismatch", "lombok-new-jdk"):
+        hint = next(r.hint for r in dg.load_table().rules if r.id == hint_id)
+        assert "JAVA_HOME" in hint and "container" in hint
+
+
+def test_no_tests_row_ignored_when_other_packages_ran_tests():
+    go = "ok  \texample.com/a\t0.2s\n?   \texample.com/b\t[no test files]\n"
+    assert "go-no-test-files" not in ids_of(go, 0)
+    assert "go-no-test-files" in ids_of("?   \texample.com/b\t[no test files]\n", 0)
+    fail = "--- FAIL: TestX\nFAIL\n?   \texample.com/b\t[no test files]\n"
+    assert "go-no-test-files" not in ids_of(fail)
+
+
+def test_maven_per_module_no_tests_with_other_modules_running():
+    log = ("[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0\n"
+           "[INFO] No tests to run.\n")
+    assert "maven-no-tests" not in ids_of(log, 0)
+    assert "maven-no-tests" in ids_of("[INFO] No tests to run.\n", 0)
+    assert "maven-no-tests" in ids_of("[INFO] Tests run: 0, Failures: 0\nNo tests to run.\n", 0)
+
+
+def test_jest_and_gradle_no_tests_unless_counts():
+    assert "jest-no-tests" not in ids_of("No tests found\nTests:       3 passed, 3 total\n", 0)
+    assert "jest-no-tests" in ids_of("No tests found, exiting with code 1\n")
+    assert "gradle-no-tests" not in ids_of(
+        "No tests found for given includes: [x]\n12 tests completed, 1 failed\n")
+
+
+def test_status_rows_do_not_apply_when_counts_are_present():
+    # the global `ran_tests` guard: a pytest-style count beats a "no tests ran" style line
+    assert "no-tests-generic" not in ids_of("collected 0 items\n3 passed in 0.1s\n", 0)
+    assert "rspec-no-examples" in ids_of("0 examples, 0 failures\n", 0)
+
+
+def test_unless_is_validated():
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="invalid `unless`"):
+        dg.parse_table({"rules": [{"id": "x", "category": "c", "hint": "h", "pattern": "a",
+                                   "unless": "("}]})
+    t = dg.parse_table({"rules": [{"id": "x", "category": "c", "hint": "h", "pattern": "a",
+                                   "unless": "b"}]})
+    assert dg.diagnose("a", 0, "test", t) and not dg.diagnose("a b", 0, "test", t)

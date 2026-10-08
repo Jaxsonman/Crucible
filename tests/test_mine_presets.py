@@ -173,7 +173,7 @@ CASES = {
         {"go.mod": "module x\n", "pkg/a_test.go": "", "a_test.go": ""},
         "go", ".", "go test -count=1 {tests|dir|unique|prefix:./}",
         (["pkg/a_test.go"], ["pkg/a.go", "pkg/testdata/x.json"]),
-        ["pkg/a_test.go", "pkg/b_test.go", "a_test.go"], "go test -count=1 ./pkg ./."),
+        ["pkg/a_test.go", "pkg/b_test.go", "a_test.go"], "go test -count=1 ./pkg ./"),
     "cargo": (
         {"Cargo.toml": "[package]\n", "tests/it.rs": ""},
         "cargo", ".", "cargo test --workspace {tests|stem|prefix:--test }",
@@ -471,3 +471,42 @@ def test_gradle_command_survives_render_and_runs_with_the_init_script(tmp_path):
     assert "test --console=plain --tests *.FooTest --tests *.BarTest" in r.stdout
     assert "filter.failOnNoMatchingTests = false" in r.stdout
     assert not os.path.exists((tmp_path / "init.path").read_text().strip())
+
+
+def test_jvm_setups_compile_main_code_only():
+    # setup runs before the PR's tests are overlaid, and must not compile test sources
+    shipped = presets.shipped()
+    mvn, gr = shipped["maven"], shipped["gradle"]
+    assert "compile" in mvn.setup and "test-compile" not in mvn.setup
+    assert "classes" in gr.setup and "testClasses" not in gr.setup
+    for p in (mvn, gr):
+        for v in p.variants:
+            s = v.overrides.get("setup")
+            assert s and "test-compile" not in s and "testClasses" not in s
+
+
+def test_rspec_rails_note_only_with_a_rails_marker(tmp_path):
+    from crucible.mine import detect
+    plain = tmp_path / "plain"
+    (plain / "spec").mkdir(parents=True)
+    (plain / ".rspec").write_text("")
+    (plain / "spec" / "a_spec.rb").write_text("")
+    [d] = detect.detect(plain)
+    assert "Rails" not in "\n".join(d.comment())
+    rails = tmp_path / "rails"
+    (rails / "spec").mkdir(parents=True)
+    (rails / "config").mkdir()
+    (rails / "config" / "application.rb").write_text("")
+    (rails / ".rspec").write_text("")
+    (rails / "spec" / "a_spec.rb").write_text("")
+    [d] = detect.detect(rails)
+    assert "Rails" in "\n".join(d.comment()) and "database" in "\n".join(d.comment())
+
+
+def test_notes_when_is_validated():
+    base = {"name": "x", "markers": [{"glob": "x.cfg"}], "test_paths": ["t/**"],
+            "test_command": "x", "notes": "n"}
+    p = presets.parse_preset({**base, "notes_when": [{"when": ["a.rb"], "note": "extra"}]}, "x.yaml")
+    assert p.notes_when == ((("a.rb",), "extra"),)
+    with pytest.raises(presets.PresetError, match="notes_when"):
+        presets.parse_preset({**base, "notes_when": [{"when": "a.rb"}]}, "x.yaml")

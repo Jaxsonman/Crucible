@@ -32,12 +32,12 @@ runnable:
   - "*ITCase.kt"
 timeout: 1200
 setup_timeout: 3600
-setup: gradle testClasses --console=plain
+setup: gradle classes --console=plain
 test_command: >-
   i=$(mktemp) && trap 'rm -f "$i"' EXIT && printf '%s\n' 'allprojects { tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }' > "$i" && gradle -I "$i" test --console=plain {tests|stem|prefix:--tests \*.}
 variants:
   - when: [gradlew]
-    setup: ./gradlew testClasses --console=plain
+    setup: ./gradlew classes --console=plain
     test_command: >-
       i=$(mktemp) && trap 'rm -f "$i"' EXIT && printf '%s\n' 'allprojects { tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }' > "$i" && ./gradlew -I "$i" test --console=plain {tests|stem|prefix:--tests \*.}
 notes: >-

@@ -6,7 +6,18 @@
 # case-sensitive unless it starts with (?i)) and/or `exit` (list of exit codes). When both are
 # given, both must match. Optional: `stage` (setup | test | list of them), `status`
 # (no-tests-ran: the rule says the runner found no tests; it turns a rejected sample into that
-# suite status).
+# suite status), `unless` (regex: the row does not apply to a log it matches, e.g. a "no test
+# files" line for one package while other packages ran tests). A row with a `status` also never
+# applies when the log matches a `ran_tests` pattern (test counts are present).
+
+# Patterns showing that tests really ran (pass/fail counts).
+ran_tests:
+  - '^(?:ok|FAIL|---\s+(?:PASS|FAIL))\s'       # go test
+  - 'Tests run: [1-9]'                               # maven surefire
+  - 'Tests:\s+.*\b[1-9]\d* (?:passed|failed)'       # jest
+  - '\b[1-9]\d* (?:passed|failed)\b'                # pytest, vitest, ...
+  - '\b[1-9]\d* tests? completed'                   # gradle
+  - '\b[1-9]\d* examples?, '                        # rspec
 
 rules:
   - id: runner-exit-127
@@ -14,7 +25,9 @@ rules:
     exit: [127]
     hint: >-
       Exit 127: the runner (or a tool it calls) is not installed, or `cwd` is wrong. Install it
-      in the suite's `setup`, fix `cwd`, or correct the executable in `test_command`.
+      in the suite's `setup`, fix `cwd`, or correct the executable in `test_command`. If the
+      toolchain is not installed on this host, run it in a container through a wrapper script in
+      `.crucible/scripts/` (`test_command: bash "$CRUCIBLE_SCRIPTS/run-tests.sh" {tests}`).
 
   - id: command-not-found
     category: missing-tool
@@ -25,11 +38,11 @@ rules:
 
   - id: runner-file-missing
     category: missing-tool
-    pattern: '(?m)^(?:ba|z)?sh: (?:line \d+: )?\S+: No such file or directory'
+    pattern: '^(?:\S+: )*(?:line \d+: )?\S+: No such file or directory|^(?:\S+: )?exec: .+: not found|exec: "[^"]+": executable file not found'
     hint: >-
-      The script or binary in `setup` / `test_command` does not exist at that path. Check `cwd`
-      (paths are relative to it) and the file name; a wrapper belongs in `.crucible/scripts/` and
-      is run as `bash "$CRUCIBLE_SCRIPTS/<name>"`.
+      A script or binary run by `setup` / `test_command` (or by a wrapper script it calls) does
+      not exist at that path. Check `cwd` (paths are relative to it) and the file name; a
+      wrapper belongs in `.crucible/scripts/` and is run as `bash "$CRUCIBLE_SCRIPTS/<name>"`.
 
   - id: permission-denied
     category: permission
@@ -75,6 +88,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'No tests found'
+    unless: 'Tests:\s+.*\b\d+ (?:passed|failed)'
     hint: >-
       jest found no tests for the given files: check `runnable` (extensions, directories),
       `cwd` (jest resolves paths from its root), and jest's `testMatch` / `roots`.
@@ -99,6 +113,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'No tests were executed|No tests to run|No tests were run'
+    unless: 'Tests run: [1-9]'
     hint: >-
       Maven ran no tests: `-Dtest=` takes class names (`{tests|stem|join:,}`); check `runnable`
       (`**/*Test.java`, `*Tests.java`, `*IT.java`), `cwd` (module directory) and
@@ -108,6 +123,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'No tests found for given includes'
+    unless: '\b[1-9]\d* tests? completed|Tests run: [1-9]'
     hint: >-
       Gradle matched no tests for `--tests`: pass fully qualified class names
       (`{tests|module:src/test/java|prefix:--tests }`), check `module_root` and the Gradle
@@ -117,6 +133,7 @@ rules:
     category: no-tests-ran
     status: no-tests-ran
     pattern: 'no test files'
+    unless: '^(?:ok|FAIL|---)\s'
     hint: >-
       go found no test files in the package: check `runnable` (`**/*_test.go`) and that
       `test_command` passes the package directories (`{tests|dir|unique|prefix:./}`) from the
@@ -234,6 +251,78 @@ rules:
       The test step hit its time limit: raise the suite's `timeout` (seconds, default 600) or
       `--timeout S`, or narrow the command to the selected files so it does not run the whole
       suite or wait on a missing service.
+
+  - id: jvm-no-java-toolchain
+    category: toolchain
+    pattern: 'Cannot find a Java installation|No matching toolchains? found|Unable to download toolchain'
+    hint: >-
+      Gradle needs a JDK this machine does not have (see `languageVersion=N` in the log). Set
+      `JAVA_HOME` to a matching JDK under the suite's `env`, or run the build in a container
+      through a wrapper script in `.crucible/scripts/` (`test_command: bash
+      "$CRUCIBLE_SCRIPTS/run-tests.sh" {tests}`).
+
+  - id: jvm-version-mismatch
+    category: toolchain
+    pattern: 'release version \d+ not supported|invalid (?:target|source) release|Unsupported class file major version|UnsupportedClassVersionError|class file version \d+'
+    hint: >-
+      The JDK on this host does not match what the build needs (too old for the target release,
+      or too new for the build tooling). Set `JAVA_HOME` under the suite's `env` to a matching
+      JDK, or use a container wrapper script in `.crucible/scripts/`.
+
+  - id: lombok-new-jdk
+    category: toolchain
+    pattern: '(?is)ExceptionInInitializerError.*lombok|lombok.*ExceptionInInitializerError|symbol:\s+method (?:get|set|is)[A-Z]\w*\(.*lombok|lombok.*symbol:\s+method (?:get|set|is)[A-Z]\w*\('
+    hint: >-
+      Lombok failed to process the sources, which usually means the JDK is newer than this
+      Lombok version supports. Set `JAVA_HOME` under the suite's `env` to the JDK the project
+      builds with (see its CI), or use a container wrapper script in `.crucible/scripts/`.
+
+  - id: ruby-load-error
+    category: toolchain
+    pattern: 'LoadError: cannot load such file|cannot load such file --'
+    hint: >-
+      The runner errored before tests ran (LoadError): a gem or file could not be loaded, often
+      because the Ruby version does not match the project's (`.ruby-version`) or the gems are
+      not installed. Install them in `setup` (`bundle config set --local path vendor/bundle && bundle install`), use an
+      older Ruby on `PATH` via `env`, or run in a container wrapper script in
+      `.crucible/scripts/`.
+
+  - id: node-engine-mismatch
+    category: toolchain
+    pattern: 'Unsupported engine|The engine "node" is incompatible'
+    hint: >-
+      The Node version on this host does not satisfy the package's `engines`. Put a matching
+      Node first on `PATH` via the suite's `env`, or run in a container wrapper script in
+      `.crucible/scripts/`.
+
+  - id: compile-error-jvm
+    category: compile
+    pattern: 'COMPILATION ERROR|error: (?:cannot find symbol|package \S+ does not exist|incompatible types)|Compilation failed|^e: file://'
+    hint: >-
+      The code does not compile. At base this is expected when the tests use code the PR adds
+      (a weak task: prefer candidates that fail by assertion); at merge, fix `setup` / `env`
+      (JDK, dependencies) so the build works.
+
+  - id: compile-error-ts
+    category: compile
+    pattern: 'error TS\d+:|TSError: '
+    hint: >-
+      TypeScript type errors. At base this is expected when the tests use types or exports the
+      PR adds (a weak task); at merge, check the `setup` build step and `cwd`.
+
+  - id: compile-error-go
+    category: compile
+    pattern: '\[build failed\]|^\S+\.go:\d+:\d+: (?:undefined|cannot use)'
+    hint: >-
+      Go build failure. At base this is expected when the tests use symbols the PR adds (a weak
+      task); at merge, check `cwd` (the module root), `setup` and build tags in `test_command`.
+
+  - id: compile-error-other
+    category: compile
+    pattern: 'error\[E\d+\]|error CS\d+:'
+    hint: >-
+      Compilation failed (Rust/C#). At base this is expected when the tests use items the PR
+      adds (a weak task); at merge, check `setup`, `cwd` and the toolchain.
 
 # Hints keyed by the suite status that calibrate computed (no log needed).
 status_hints:

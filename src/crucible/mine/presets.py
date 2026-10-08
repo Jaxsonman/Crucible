@@ -28,6 +28,8 @@ Fields (all validated here; an error names the file and the field, e.g.
                    `cd <that directory> && ` (empty when it is the suite directory);
                    `{suite_cd}` is the `cd` back from there to the suite directory
     notes          why the command is right and what to watch for
+    notes_when     [{when: [globs], note}]  extra notes, written only when a file matching a
+                   glob exists in the suite directory (e.g. a Rails-only warning)
 
 A `setup` list is joined with ` && ` at detection time, so the written `mine.yaml` holds one plain
 command. A step is a string (always included) or `{run, when?, contains?, unless?}`: included
@@ -55,7 +57,7 @@ from crucible.mine import config, placeholders
 SUITE_DIR = "{suite_dir}"
 _TOP = {"name", "markers", "project_files", "evidence", "supersedes", "fallback", "test_paths",
         "runnable", "setup", "test_command", "module_root", "env", "timeout", "setup_timeout",
-        "variants", "notes"}
+        "variants", "notes", "notes_when"}
 _MARKER = {"glob", "contains", "evidence", "weak", "aggregator", "wins_over"}
 _VARIANT = {"when", "ancestors", "setup", "test_command", "module_root"}
 _STEP = {"run", "when", "contains", "unless", "first"}
@@ -121,6 +123,7 @@ class Preset:
     timeout: float = config.DEFAULT_TEST_TIMEOUT_S
     setup_timeout: float = config.DEFAULT_SETUP_TIMEOUT_S
     variants: tuple[Variant, ...] = ()
+    notes_when: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 
 # --- file matching helpers (shared with detection) ---
@@ -343,6 +346,7 @@ def parse_preset(raw, filename: str) -> Preset | None:
     env = _parse_env(raw.get("env"), f, errors)
     variants = _parse_variants(raw.get("variants"), f, module_root is not None, errors)
     fallback = _bool(raw, "fallback", f, errors)
+    notes_when = _parse_notes_when(raw.get("notes_when"), f, errors)
     if errors:
         raise PresetError(errors)
     return Preset(
@@ -351,7 +355,27 @@ def parse_preset(raw, filename: str) -> Preset | None:
         supersedes=tuple(lists["supersedes"]),
         runnable=tuple(runnable) if runnable else None, setup=setup, module_root=module_root,
         env=env, fallback=fallback, timeout=timeout,
-        setup_timeout=setup_timeout, variants=variants)
+        setup_timeout=setup_timeout, variants=variants, notes_when=notes_when)
+
+
+def _parse_notes_when(raw, f: str, errors: list[str]) -> tuple:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        errors.append(f"{f}: notes_when: must be a list of {{when: [globs], note: text}}")
+        return ()
+    out = []
+    for i, row in enumerate(raw):
+        where = f"{f}: notes_when[{i}]"
+        if not isinstance(row, dict) or set(row) != {"when", "note"}:
+            errors.append(f"{where}: must be a mapping with exactly `when` and `note`")
+            continue
+        when = _str_list(row["when"], f"{where}.when", errors)
+        if not isinstance(row["note"], str) or not row["note"].strip():
+            errors.append(f"{where}.note: must be a non-empty string")
+        elif when:
+            out.append((tuple(when), row["note"].strip()))
+    return tuple(out)
 
 
 def _positive(raw: dict, key: str, default: float, f: str, errors: list[str]) -> float:

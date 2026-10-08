@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from crucible import (
@@ -88,7 +90,7 @@ def _init(args: argparse.Namespace) -> int:
 
 def _task_validate(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
     except TaskError as e:
         print(e, file=sys.stderr)
         return 1
@@ -118,9 +120,23 @@ def _task_new(args: argparse.Namespace) -> int:
     return 0
 
 
+def _task_path(arg: str) -> Path:
+    """The task directory for `arg`: the path itself, or (when it does not exist) a bare task
+    id resolved against `<home>/tasks/`."""
+    path = Path(arg)
+    if not path.exists() and "/" not in arg and os.sep not in arg:
+        try:
+            candidate = paths.tasks_dir() / arg
+        except paths.CrucibleHomeError:
+            return path
+        if candidate.is_dir():
+            return candidate
+    return path
+
+
 def _run(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         cfgs = (
             configs.parse_configs(args.configs) if args.configs else configs.load_named(args.matrix)
         )
@@ -445,6 +461,7 @@ def _mine(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
     labels = [mine_verify.verified_label(c, cfg.suites) for c in kept]
+    _limit_hint(args, kept, excluded)
     if args.json:
         print(json.dumps({
             "candidates": [{**c.to_dict(), "verified": v} for c, v in zip(kept, labels)],
@@ -458,6 +475,16 @@ def _mine(args: argparse.Namespace) -> int:
         _print_candidates([e.candidate for e in excluded], [e.reason for e in excluded])
     print(f"\n{len(kept)} candidate(s), {len(excluded)} excluded")
     return 0
+
+
+def _limit_hint(args, kept, excluded) -> None:
+    """Few candidates among many exclusions after a walk that hit `--limit`: older history was
+    not scanned."""
+    scanned = len(kept) + len(excluded)
+    if scanned >= args.limit and len(kept) < 5 and len(excluded) > 2 * len(kept):
+        print(f"hint: {len(kept)} candidate(s) among {scanned} scanned ({len(excluded)} "
+              f"excluded); raise --limit (now {args.limit}) to scan further back",
+              file=sys.stderr)
 
 
 def _print_calibration(report) -> None:
@@ -522,13 +549,15 @@ def _mine_verify(args, top: Path, cfg, kept, excluded) -> int:
     by_id = {c.id: c for c in kept}
     why = {e.candidate.id: e.reason for e in excluded}
     results, skipped = [], False
-    for cid in dict.fromkeys(args.verify):
+    wanted = list(dict.fromkeys(args.verify))
+    for i, cid in enumerate(wanted, 1):
         c = by_id.get(cid)
         if c is None:
             reason = f"excluded: {why[cid]}" if cid in why else "not in the candidate list"
             print(f"{cid}: skipped ({reason})", file=sys.stderr)
             skipped = True
             continue
+        started = time.monotonic()
         try:
             r = mine_verify.verify_candidate(
                 top, c, mine_verify.involved_suites(c, cfg.suites), timeout=args.timeout, keep=args.keep, force=args.force)
@@ -540,9 +569,21 @@ def _mine_verify(args, top: Path, cfg, kept, excluded) -> int:
             skipped = True
             continue
         results.append(r)
+        took = "" if r.cached else f" in {time.monotonic() - started:.0f}s"
+        label = "verified" if r.verified else f"rejected: {r.reason}"
+        print(f"[{i}/{len(wanted)}] {cid}: {label}{' (cached)' if r.cached else took}",
+              file=sys.stderr, flush=True)
+        log, hints = mine_verify.rejection_diagnosis(r)
+        r.hints = [h.to_dict() for h in hints]
         if not args.json:
             detail = "verified" if r.verified else f"rejected: {r.reason}"
             print(f"{cid}: {detail}" + (" (cached)" if r.cached else ""))
+            if log:
+                print(f"  log: {log}")
+            for h in hints:
+                print(f"  hint [{h.id}]: {h.hint}")
+            for w in r.warnings:
+                print(f"  warning: {w}")
             for d in r.kept:
                 print(f"  kept {d}")
     if args.json:
@@ -602,8 +643,12 @@ def _mine_scaffold(args: argparse.Namespace) -> int:
         suites = mine_verify.involved_suites(c, cfg.suites)
         r = mine_verify.cached_result(c, suites)
         if r is None:
-            print(f"cannot scaffold {args.id}: not verified; run `crucible mine --verify {c.id}`",
-                  file=sys.stderr)
+            if mine_verify.has_stale_cache(c):
+                print(f"cannot scaffold {args.id}: config changed since verification; "
+                      f"re-run --verify {c.id} (`crucible mine --verify {c.id}`)", file=sys.stderr)
+            else:
+                print(f"cannot scaffold {args.id}: not verified; run "
+                      f"`crucible mine --verify {c.id}`", file=sys.stderr)
             return 1
         if not r.verified:
             print(f"cannot scaffold {args.id}: rejected by verification ({r.reason})",
@@ -615,6 +660,10 @@ def _mine_scaffold(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
     print(f"created {task_dir / 'task.md'}")
+    needs = mine_scaffold.requires(task_dir)
+    if needs:
+        print(f"warning: this task requires {', '.join(needs)} on the machine that runs it "
+              "(recorded as `requires` in .mine.json)", file=sys.stderr)
     print("fill in the What / Why / Acceptance criteria sections, then run "
           f"`crucible mine prove {task_dir}`")
     return 0
@@ -637,7 +686,7 @@ def _print_flags(flags) -> None:
 
 def _mine_leakcheck(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         flags = _leak_flags(task)
     except (TaskError, mine_scaffold.ScaffoldError, mine_candidates.MineGitError,
             paths.CrucibleHomeError, workspace.WorkspaceError) as e:
@@ -655,7 +704,7 @@ def _mine_leakcheck(args: argparse.Namespace) -> int:
 
 def _mine_prove(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         result = mine_scaffold.prove_task(task, args.timeout)
         flags = _leak_flags(task) if result.ok else []
     except (TaskError, mine_scaffold.ScaffoldError, mine_candidates.MineGitError,
@@ -757,7 +806,8 @@ def build_parser() -> argparse.ArgumentParser:
                                help="local: history to walk (default HEAD); gh: only PRs "
                                     "merged into this base branch (default all)")
                 q.add_argument("--limit", type=int, default=dflt(mine_candidates.DEFAULT_LIMIT),
-                               help="PRs / commits to walk (default 300)")
+                               help="max PRs (gh) or commits (local) scanned, newest first "
+                                    "(default 300); raise it when few candidates are found")
                 q.add_argument("--max-lines", type=_positive_int, default=dflt(None),
                                help="override max_changed_lines from mine.yaml")
                 q.add_argument("--local", action="store_true", default=dflt(False),

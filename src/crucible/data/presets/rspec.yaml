@@ -19,5 +19,10 @@ variants:
     setup: bundle install --quiet
     test_command: bundle exec rspec {tests}
 notes: >-
-  Rails apps usually need a database: set it up in setup (e.g. bin/rails db:prepare) with
-  dummy credentials in env.
+  Runs the locked gems under bundle exec when there is a Gemfile; install them in setup
+  (e.g. bundle config set --local path vendor/bundle).
+notes_when:
+  - when: [config/application.rb]
+    note: >-
+      Rails needs a database: set it up in setup (e.g. bin/rails db:prepare) with dummy
+      credentials in env.

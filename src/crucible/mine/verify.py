@@ -1,12 +1,13 @@
 """Fail-before / pass-after verification of mining candidates.
 
-Runs the repo's own tests in two throwaway exports (base with the PR's test files overlaid,
-then merge). Never calls `claude`; never touches the user's checkout, index or refs.
+Runs the repo's own tests in two throwaway exports (base: setup, then the PR's test files
+overlaid; then merge). Never calls `claude`; never touches the user's checkout, index or refs.
 """
 
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,8 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from crucible import executor, paths, workspace
-from crucible.mine import placeholders
-from crucible.mine.candidates import Candidate, _git, owning_suite
+from crucible.mine import diagnostics, placeholders
+from crucible.mine.candidates import Candidate, MineGitError, _git, owning_suite
 from crucible.mine.config import DEFAULT_TEST_TIMEOUT_S, Suite, default_is_runnable
 
 DEFAULT_TIMEOUT_S = DEFAULT_TEST_TIMEOUT_S
@@ -155,6 +156,8 @@ class VerifyResult:
     logs: dict = field(default_factory=dict)
     kept: list[str] = field(default_factory=list)  # workspace dirs kept by --keep
     command: str = ""
+    warnings: list[str] = field(default_factory=list)  # weak-task flags; never a rejection
+    hints: list[dict] = field(default_factory=list)  # diagnostics for a rejection (not cached)
 
     @property
     def verified(self) -> bool:
@@ -168,7 +171,8 @@ class VerifyResult:
                 "reason": self.reason, "cached": self.cached, "suite": self.suite,
                 "suites": self.suite.split("+") if self.suite else [],
                 "timings": self.timings, "logs": self.logs, "kept": self.kept,
-                "command": self.command}
+                "command": self.command, "warnings": self.warnings,
+                "hints": self.hints}
 
 
 # --- cache ---
@@ -193,9 +197,15 @@ def cached_result(c: Candidate, suites: "Suite | list[Suite]") -> VerifyResult |
             id=c.id, merge=c.merge, outcome=data["outcome"], reason=data.get("reason", ""),
             cached=True, suite=data.get("suite", ""), timings=data.get("timings", {}),
             logs=data.get("logs", {}), command=data.get("command", ""),
+            warnings=list(data.get("warnings", [])),
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def has_stale_cache(c: Candidate) -> bool:
+    """A cache entry exists for `c` but was produced with other settings than the current."""
+    return _cache_file(c.merge).is_file()
 
 
 def verified_label(c: Candidate, suites: list[Suite]) -> str | None:
@@ -214,8 +224,75 @@ def _write_cache(c: Candidate, suites: list[Suite], r: VerifyResult) -> None:
         "suites": [s.name for s in suites],
         "suite_hash": suites_hash(suites), "outcome": r.outcome, "reason": r.reason,
         "command": r.command, "timings": r.timings, "logs": r.logs,
-        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "warnings": r.warnings, "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }, indent=2) + "\n", encoding="utf-8")
+
+
+# --- weak-task warnings ---
+
+# Markers of tests that are skipped or pending: a task whose tests do not really run is weak.
+SKIP_MARKERS = (
+    ("@Disabled", re.compile(r"@Disabled\b")),
+    ("@Ignore", re.compile(r"@Ignore\b")),
+    (".skip(", re.compile(r"\.skip\(")),
+    ("xit(", re.compile(r"\bxit\(")),
+    ("xdescribe(", re.compile(r"\bxdescribe\(")),
+    ("pytest.mark.skip", re.compile(r"pytest\.mark\.skip")),
+    ("t.Skip(", re.compile(r"\bt\.Skip\(")),
+    ('skip "', re.compile(r"""^\s*skip\s+["']""", re.MULTILINE)),
+    ("pending", re.compile(r"^\s*pending\b", re.MULTILINE)),
+    ("[Fact(Skip=", re.compile(r"\[Fact\(\s*Skip\s*=")),
+)
+
+
+def skip_marker_warnings(repo: Path, c: Candidate, files: list[str]) -> list[str]:
+    """One warning per runnable changed test file (merge version) that holds a skip marker."""
+    out = []
+    for path in files:
+        try:
+            text = _git(repo, "cat-file", "blob", f"{c.merge}:{path}").decode(
+                "utf-8", "replace")
+        except MineGitError:  # an unreadable blob is no reason to warn
+            text = ""
+        found = [name for name, rx in SKIP_MARKERS if rx.search(text)]
+        if found:
+            out.append(f"{path} contains skip marker(s) {', '.join(found)}: "
+                       "some tests may not really run")
+    return out
+
+
+def compile_only_warning(res: "VerifyResult", failed_base: list[str]) -> list[str]:
+    """Warn when every failing base step died with a compile/type error and showed no test
+    counts: the tests fail because they use code the PR adds, not by assertion."""
+    if not failed_base:
+        return []
+    table = diagnostics.load_table()
+    for key in failed_base:
+        try:
+            text = Path(res.logs[key]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        body, code = diagnostics.split_log(text)
+        if diagnostics.ran_tests(body, table) or not any(
+                h.category == "compile" for h in diagnostics.diagnose(body, code, "test", table)):
+            return []
+    return [("base fails only with a compile/type error (the tests use code the PR adds), "
+             "not by a failing assertion: a weak task")]
+
+
+def rejection_diagnosis(res: "VerifyResult") -> tuple[str, list[diagnostics.Hint]]:
+    """(log path, diagnostics hints) of the step a rejection stopped at; ("", []) when none."""
+    if res.verified or not res.logs:
+        return "", []
+    key = list(res.logs)[-1]
+    path = res.logs[key]
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return path, []
+    body, code = diagnostics.split_log(text)
+    stage = "setup" if key.rsplit("-", 1)[-1] == "setup" else "test"
+    return path, diagnostics.diagnose(body, code, stage)
 
 
 # --- command building ---
@@ -348,9 +425,9 @@ def verify_candidate(
     keep: bool = False, force: bool = False,
 ) -> VerifyResult:
     """Verify one candidate, or return its cached result. `suites` are the suites owning its
-    test files (a single Suite is accepted). Per side the tree is exported and the tests are
-    overlaid once, then each suite in order runs setup and its test command with only its own
-    runnable files. Base is verified if at least one suite fails; merge needs every suite to
+    test files (a single Suite is accepted). Per side the tree is exported, every suite's
+    setup runs, then (base only) the PR's tests are overlaid once, then each suite in order runs
+    its test command with only its own runnable files. Base is verified if at least one suite fails; merge needs every suite to
     pass. `timeout` (seconds) overrides every suite's test-step `timeout`; the setup step always
     uses the suite's `setup_timeout`. Raises MineGitError / WorkspaceError for git problems and
     ScriptsLinkError for a scripts symlink out of the home."""
@@ -407,11 +484,22 @@ def verify_candidate(
         return code
 
     dirs: list[Path] = []
+    failed_base: list[str] = []
     try:
         for side, ref in (("base", c.base), ("merge", c.merge)):
             ws = _make_dir(side, c)
             dirs.append(ws)
             workspace.export_tree(repo, ref, ws)
+            # Setup first, on the plain tree: build-tool setups that compile (Maven
+            # test-compile, Gradle testClasses) would fail on the PR's tests, which reference
+            # classes the base does not have yet. The tests are overlaid only afterwards.
+            for suite, _ in plan:
+                if suite.setup:
+                    code = step(side, suite, "setup", suite.setup, ws / suite.cwd)
+                    if code is None:
+                        return finish("timeout")
+                    if code != 0:
+                        return finish(tag(f"setup failed at {side}", suite))
             if side == "base":
                 try:
                     _overlay(repo, c, ws)
@@ -419,22 +507,19 @@ def verify_candidate(
                     return finish(UNSAFE_PATH)
             failed: list[str] = []
             for suite, _ in plan:
-                cwd = ws / suite.cwd
-                if suite.setup:
-                    code = step(side, suite, "setup", suite.setup, cwd)
-                    if code is None:
-                        return finish("timeout")
-                    if code != 0:
-                        return finish(tag(f"setup failed at {side}", suite))
-                code = step(side, suite, "test", commands[suite.name], cwd)
+                code = step(side, suite, "test", commands[suite.name], ws / suite.cwd)
                 if code is None:
                     return finish("timeout")
                 if code != 0:
                     failed.append(suite.name)
+                    if side == "base":
+                        failed_base.append(f"base-{suite.name}-test" if multi else "base-test")
                     if side == "merge":
                         return finish(tag("fails at merge", suite))
             if side == "base" and not failed:
                 return finish("passes at base")
+        res.warnings = (skip_marker_warnings(repo, c, [f for _, fs in plan for f in fs])
+                        + compile_only_warning(res, failed_base))
         return finish()
     finally:
         if keep:
