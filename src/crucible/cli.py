@@ -710,8 +710,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="with --verify: ignore cached results and run again")
             p.add_argument("--keep", action="store_true",
                            help="with --verify: keep the workspace dirs and print their paths")
-            p.add_argument("--timeout", type=float, default=mine_verify.DEFAULT_TIMEOUT_S,
-                           help="with --verify: seconds allowed per step (default 600)")
+            p.add_argument("--timeout", type=float, default=None,
+                           help="with --verify: seconds allowed for each test step, overriding "
+                                "the suites' `timeout` (default: per suite, 600)")
             p.set_defaults(func=_mine)
             mine_sub = p.add_subparsers(dest="mine_command", metavar="{show,scaffold,prove,leakcheck}")
             sh = mine_sub.add_parser("show", help="One candidate with its test and non-test diffs")
@@ -728,8 +729,9 @@ def build_parser() -> argparse.ArgumentParser:
             pr = mine_sub.add_parser(
                 "prove", help="Prove a finished mined task's check: fails at ref, passes at merge")
             pr.add_argument("task_dir")
-            pr.add_argument("--timeout", type=float, default=mine_verify.DEFAULT_TIMEOUT_S,
-                            help="seconds allowed per check run (default 600)")
+            pr.add_argument("--timeout", type=float, default=None,
+                            help="seconds allowed per check run (default: recorded at scaffold "
+                                 "time as the suites' setup + test timeouts, else 600)")
             pr.add_argument("--allow-leaks", action="store_true",
                             help="do not fail when the task text leaks the solution")
             pr.set_defaults(func=_mine_prove)

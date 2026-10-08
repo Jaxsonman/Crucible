@@ -5,6 +5,7 @@
 """
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -13,12 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from crucible import checker, paths, workspace
-from crucible.mine import verify
+from crucible.mine import placeholders, verify
 from crucible.mine.candidates import Candidate
 from crucible.mine.config import Suite
 from crucible.task import ID_RE, Task, repo_relative, repo_task_md
 
 MINE_META = ".mine.json"
+SCRIPTS_DIRNAME = verify.SCRIPTS_DIRNAME
 SETUP_FAILED = "crucible-check: setup failed"
 SETUP_EXIT = 97
 DEFAULT_TIMEOUT_MINUTES = 30
@@ -43,19 +45,31 @@ def default_slug(c: Candidate) -> str:
     return slug if ID_RE.match(slug) else f"{prefix}-{re.sub(r'[^a-z0-9]', '', c.id.lower())}"
 
 
-def _suite_prelude(suite: Suite) -> list[str]:
+def _suite_prelude(suite: Suite, files: list[str]) -> list[str]:
     lines = [f"export {k}={shlex.quote(v)}" for k, v in suite.env.items()]
+    lines.append(f"export CRUCIBLE_TEST_FILES={shlex.quote(chr(10).join(files))}")
+    lines.append("export CRUCIBLE_TEST_FILES_CWD="
+                 + shlex.quote(chr(10).join(os.path.relpath(f, suite.cwd) for f in files)))
     lines.append(f"cd -- {shlex.quote(suite.cwd)} || exit 98" if suite.cwd != "." else "cd . || exit 98")
     return lines
 
 
-def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
+def _command(suite: Suite, files: list[str]) -> str:
+    try:
+        return verify.build_command(suite, files)
+    except placeholders.OutsideRoot as e:
+        raise ScaffoldError(f"test outside module_root ({suite.name}): {e}") from e
+
+
+def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: bool = False) -> str:
     """The task's `check.sh`: self-contained, run with the workspace as cwd. It installs the
     hidden tests once, then for each suite runs exactly the setup and test command `verify`
     ran (`bash -c`, same placeholder filling, only that suite's runnable files). One suite
     exec's its test command. Several suites each run in a subshell (own env and cwd); a setup
     failure exits 97 at once, test failures are collected so every suite runs, and the script
-    exits with the first failing code."""
+    exits with the first failing code. Every step gets `CRUCIBLE_TEST_FILES` and
+    `CRUCIBLE_TEST_FILES_CWD` (the suite's runnable files, as in `verify`); with `scripts` the
+    task's own `scripts/` dir is exported as `CRUCIBLE_SCRIPTS`."""
     suites = verify.as_suites(suites)
     plan = verify.suite_plan_for(suites, runnable)
     names = ", ".join(repr(s.name) for s in suites)
@@ -75,22 +89,24 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
         '  done < "$HIDDEN/DELETED"',
         "fi",
     ]
+    if scripts:
+        lines.append(f'export CRUCIBLE_SCRIPTS="$TASK_DIR/{SCRIPTS_DIRNAME}"')
     if len(suites) == 1:
         suite = suites[0]
-        lines += _suite_prelude(suite)
+        lines += _suite_prelude(suite, runnable)
         if suite.setup:
             lines.append(f'bash -c {shlex.quote(suite.setup)} || {{ echo "{SETUP_FAILED}" >&2; '
                          f"exit {SETUP_EXIT}; }}")
-        lines.append(f"exec bash -c {shlex.quote(verify.build_command(suite, runnable))}")
+        lines.append(f"exec bash -c {shlex.quote(_command(suite, runnable))}")
         return "\n".join(lines) + "\n"
     lines.append("rc=0")
     for suite, files in plan:
-        pre = "; ".join(_suite_prelude(suite))
+        pre = "; ".join(_suite_prelude(suite, files))
         lines.append(f"echo {shlex.quote(f'== suite {suite.name} ==')}")
         if suite.setup:
             lines.append(f"( {pre}; bash -c {shlex.quote(suite.setup)} ) || {{ "
                          f'echo {shlex.quote(f"{SETUP_FAILED} ({suite.name})")} >&2; exit {SETUP_EXIT}; }}')
-        cmd = verify.build_command(suite, files)
+        cmd = _command(suite, files)
         lines.append(f"( {pre}; bash -c {shlex.quote(cmd)} ); code=$?")
         lines.append('[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code')
     lines.append('exit "$rc"')
@@ -111,6 +127,15 @@ def _write_hidden_tests(repo: Path, c: Candidate, dest: Path) -> None:
         (dest / "DELETED").write_text("\n".join(deleted) + "\n", encoding="utf-8")
 
 
+def _copy_scripts(dest: Path) -> bool:
+    """Copy the home's wrapper scripts to `dest` (file modes kept). False if there are none."""
+    src = verify.scripts_dir()
+    if not verify.scripts_digest():
+        return False
+    shutil.copytree(src, dest, symlinks=True)
+    return True
+
+
 def scaffold_task_dir(
     repo: Path, c: Candidate, suites: Suite | list[Suite], tasks_dir: Path, *, slug: str | None = None,
     kind: str | None = None,
@@ -121,7 +146,8 @@ def scaffold_task_dir(
     slug = slug or default_slug(c)
     if not ID_RE.match(slug):
         raise ScaffoldError(f"invalid task id {slug!r}: must match {ID_RE.pattern}")
-    if not verify.runnable_files(c):
+    runnable = verify.runnable_files(c, suites)
+    if not runnable:
         raise ScaffoldError("candidate has no runnable test files")
     tasks_dir = tasks_dir.resolve()
     task_dir = tasks_dir / slug
@@ -138,11 +164,14 @@ def scaffold_task_dir(
             encoding="utf-8")
         _write_hidden_tests(repo, c, task_dir / "hidden_tests")
         check = task_dir / "check.sh"
-        check.write_text(check_script(suites, verify.runnable_files(c)), encoding="utf-8")
+        has_scripts = _copy_scripts(task_dir / SCRIPTS_DIRNAME)
+        check.write_text(check_script(suites, runnable, scripts=has_scripts), encoding="utf-8")
         check.chmod(0o755)
         (task_dir / MINE_META).write_text(json.dumps({
             "id": c.id, "base": c.base, "merge": c.merge, "suite": suites[0].name,
-            "suites": [s.name for s in suites], "source": c.source}, indent=2) + "\n", encoding="utf-8")
+            "suites": [s.name for s in suites], "source": c.source,
+            "check_timeout_s": sum(s.setup_timeout + s.timeout for s in suites)},
+            indent=2) + "\n", encoding="utf-8")
     except BaseException:
         shutil.rmtree(task_dir, ignore_errors=True)
         raise
@@ -200,9 +229,25 @@ def _check_at(task: Task, ref: str, label: str, timeout: float) -> checker.Check
         shutil.rmtree(ws, ignore_errors=True)
 
 
-def prove_task(task: Task, timeout: float = verify.DEFAULT_TIMEOUT_S) -> ProveResult:
-    """Run the task's own check at `ref` (must fail) and at the merge (must pass). Raises
-    ScaffoldError / WorkspaceError for problems finding the task's inputs."""
+def check_timeout(task: Task) -> float:
+    """Seconds `prove` allows one check run (setup plus tests): the total the suites' timeouts
+    gave when the task was scaffolded (`.mine.json`), else the default."""
+    try:
+        meta = json.loads((task.task_dir / MINE_META).read_text(encoding="utf-8"))
+        value = meta.get("check_timeout_s")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return verify.DEFAULT_TIMEOUT_S
+
+
+def prove_task(task: Task, timeout: float | None = None) -> ProveResult:
+    """Run the task's own check at `ref` (must fail) and at the merge (must pass), each within
+    `timeout` seconds (default `check_timeout`). Raises ScaffoldError / WorkspaceError for
+    problems finding the task's inputs."""
+    if timeout is None:
+        timeout = check_timeout(task)
     if not task.check_path:
         raise ScaffoldError("task has no `check:`; nothing to prove")
     if not task.ref:
@@ -226,6 +271,7 @@ __all__ = [
     "ProveResult",
     "ScaffoldError",
     "check_script",
+    "check_timeout",
     "default_slug",
     "merge_sha",
     "prove_task",

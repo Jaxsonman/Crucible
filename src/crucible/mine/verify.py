@@ -7,21 +7,21 @@ then merge). Never calls `claude`; never touches the user's checkout, index or r
 import hashlib
 import json
 import os
-import re
-import shlex
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from crucible import executor, paths, workspace
+from crucible.mine import placeholders
 from crucible.mine.candidates import Candidate, _git, owning_suite
-from crucible.mine.config import Suite
+from crucible.mine.config import DEFAULT_TEST_TIMEOUT_S, Suite, default_is_runnable
 
-DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_TIMEOUT_S = DEFAULT_TEST_TIMEOUT_S
+SCRIPTS_DIRNAME = "scripts"
 
 # Outcomes that depend on the machine or the time limit, not on the candidate: never cached
 # (the logs are still written), so a rerun with a longer timeout or a fixed setup really runs.
@@ -33,20 +33,18 @@ def is_transient(reason: str) -> bool:
     return reason in TRANSIENT_REASONS or any(
         reason.startswith(r + " (") for r in TRANSIENT_REASONS)
 
-# A changed test file is *runnable* (passed to the test command) when its name matches one of
-# these or it lives under a `__tests__` directory. Everything else under `test_paths`
-# (conftest.py, fixtures, helpers) is overlaid but never passed.
-_RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
+is_runnable_test = default_is_runnable  # the rule for a suite without `runnable` globs
 
 
-def is_runnable_test(path: str) -> bool:
-    p = PurePosixPath(path)
-    return bool(_RUNNABLE_NAME.match(p.name)) or "__tests__" in p.parts[:-1]
-
-
-def runnable_files(c: Candidate) -> list[str]:
-    """The candidate's non-deleted runnable test files: what the test command is given."""
-    return [f.path for f in c.test_files if f.status != "deleted" and is_runnable_test(f.path)]
+def runnable_files(c: Candidate, suites: "Suite | list[Suite] | None" = None) -> list[str]:
+    """The candidate's non-deleted runnable test files: what the test command is given. With
+    `suites`, each file follows the rule of the suite owning it (its `runnable` globs, else the
+    built-in rule); without, the built-in rule."""
+    live = [f.path for f in c.test_files if f.status != "deleted"]
+    if suites is None:
+        return [p for p in live if default_is_runnable(p)]
+    return [f for _, files in suite_plan_for(as_suites(suites), live, only_runnable=True)
+            for f in files]
 
 
 def as_suites(suites: "Suite | list[Suite]") -> list[Suite]:
@@ -60,24 +58,54 @@ def involved_suites(c: Candidate, suites: "Suite | list[Suite]") -> list[Suite]:
     return mine or all_s
 
 
+def scripts_dir() -> Path:
+    """Wrapper scripts for test commands live in `<home>/scripts/` (`.crucible/scripts/`)."""
+    return paths.home() / SCRIPTS_DIRNAME
+
+
+def scripts_digest() -> str:
+    """Digest of the scripts dir (relative names, exec bits, contents); "" when there are none."""
+    root = scripts_dir()
+    if not root.is_dir():
+        return ""
+    h, any_file = hashlib.sha256(), False
+    for f in sorted(p for p in root.rglob("*") if not p.is_dir() or p.is_symlink()):
+        any_file = True
+        h.update(f.relative_to(root).as_posix().encode() + b"\0")
+        if f.is_symlink():
+            h.update(b"L" + os.readlink(f).encode())
+        else:
+            h.update((b"x" if os.access(f, os.X_OK) else b"-") + f.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest() if any_file else ""
+
+
 def suites_hash(suites: list[Suite]) -> str:
     """Hash of every involved suite's settings. One suite: that suite's own `settings_hash()`
-    (so single-suite cache entries stay valid)."""
+    (so single-suite cache entries stay valid). When the home has wrapper scripts their digest
+    is mixed in, so editing a script invalidates the cache."""
     if len(suites) == 1:
-        return suites[0].settings_hash()
-    return hashlib.sha256(json.dumps([s.settings_hash() for s in suites]).encode()).hexdigest()
+        base = suites[0].settings_hash()
+    else:
+        base = hashlib.sha256(json.dumps([s.settings_hash() for s in suites]).encode()).hexdigest()
+    digest = scripts_digest()
+    return hashlib.sha256((base + digest).encode()).hexdigest() if digest else base
 
 
 def suite_plan(c: Candidate, suites: list[Suite]) -> list[tuple[Suite, list[str]]]:
     """(suite, its runnable files) for every suite in order that has some."""
-    return suite_plan_for(suites, runnable_files(c))
+    live = [f.path for f in c.test_files if f.status != "deleted"]
+    return suite_plan_for(suites, live, only_runnable=True)
 
 
-def suite_plan_for(suites: list[Suite], files: list[str]) -> list[tuple[Suite, list[str]]]:
-    """Split `files` by owner: each belongs to the first suite whose `test_paths` match it."""
+def suite_plan_for(suites: list[Suite], files: list[str], *, only_runnable: bool = False,
+                   ) -> list[tuple[Suite, list[str]]]:
+    """Split `files` by owner: each belongs to the first suite whose `test_paths` match it.
+    With `only_runnable`, a suite keeps just the files its own runnable rule accepts."""
     plan = []
     for s in suites:
-        own = [f for f in files if owning_suite(f, suites) == s.name]
+        own = [f for f in files if owning_suite(f, suites) == s.name
+               and (not only_runnable or s.is_runnable(f))]
         if own:
             plan.append((s, own))
     return plan
@@ -161,18 +189,23 @@ def _write_cache(c: Candidate, suites: list[Suite], r: VerifyResult) -> None:
 # --- command building ---
 
 def build_command(suite: Suite, test_files: list[str]) -> str:
-    """Fill `{tests}` (paths relative to the suite cwd) and `{modules}` (dotted, relative to
-    `module_root`, `.py` stripped); every substituted path is shell-quoted."""
-    tests = [os.path.relpath(f, suite.cwd) for f in test_files]
-    mods = []
-    if suite.module_root is not None:
-        for f in test_files:
-            rel = PurePosixPath(os.path.relpath(f, suite.module_root))
-            mods.append(".".join(rel.with_suffix("").parts) if rel.suffix == ".py"
-                        else ".".join(rel.parts))
-    fills = {"tests": " ".join(shlex.quote(t) for t in tests),
-             "modules": " ".join(shlex.quote(m) for m in mods)}
-    return re.sub(r"\{(tests|modules)\}", lambda m: fills[m.group(1)], suite.test_command)
+    """Fill the suite's `test_command` placeholders (see `placeholders`) from the repo-relative
+    `test_files`. Raises `placeholders.OutsideRoot` for a `module` filter / `{modules}` meeting
+    a file outside its root."""
+    return placeholders.render(placeholders.parse(suite.test_command), test_files, suite.cwd,
+                               suite.module_root)
+
+
+def step_env(suite: Suite, test_files: list[str]) -> dict[str, str]:
+    """Environment of every setup/test step: the process env, the suite `env`, then Crucible's
+    own variables (they win): the suite's runnable files for wrapper scripts, and the scripts
+    dir when the home has one."""
+    env = {**os.environ, **suite.env,
+           "CRUCIBLE_TEST_FILES": "\n".join(test_files),
+           "CRUCIBLE_TEST_FILES_CWD": "\n".join(os.path.relpath(f, suite.cwd) for f in test_files)}
+    if scripts_digest():
+        env["CRUCIBLE_SCRIPTS"] = str(scripts_dir().resolve())
+    return env
 
 
 # --- running ---
@@ -278,14 +311,16 @@ def _make_dir(label: str, c: Candidate) -> Path:
 
 
 def verify_candidate(
-    repo: Path, c: Candidate, suites: "Suite | list[Suite]", *, timeout: float = DEFAULT_TIMEOUT_S,
+    repo: Path, c: Candidate, suites: "Suite | list[Suite]", *, timeout: float | None = None,
     keep: bool = False, force: bool = False,
 ) -> VerifyResult:
     """Verify one candidate, or return its cached result. `suites` are the suites owning its
     test files (a single Suite is accepted). Per side the tree is exported and the tests are
     overlaid once, then each suite in order runs setup and its test command with only its own
     runnable files. Base is verified if at least one suite fails; merge needs every suite to
-    pass. Raises MineGitError / WorkspaceError only for git problems."""
+    pass. `timeout` (seconds) overrides every suite's test-step `timeout`; the setup step always
+    uses the suite's `setup_timeout`. Raises MineGitError / WorkspaceError only for git
+    problems."""
     involved = involved_suites(c, suites)
     multi = len(involved) > 1
     if not force:
@@ -316,15 +351,24 @@ def verify_candidate(
         if suite.module_root is not None and any(
                 os.path.relpath(f, suite.module_root).startswith("..") for f in files):
             return finish(tag("test outside module_root", suite))
-    commands = {s.name: build_command(s, files) for s, files in plan}
+    commands = {}
+    for suite, files in plan:
+        try:
+            commands[suite.name] = build_command(suite, files)
+        except placeholders.OutsideRoot:
+            return finish(tag("test outside module_root", suite))
     res.command = (next(iter(commands.values())) if not multi
                    else "\n".join(f"[{n}] {cmd}" for n, cmd in commands.items()))
+
+    plan_files = {s.name: files for s, files in plan}
 
     def step(side: str, suite: Suite, name: str, command: str, cwd: Path) -> int | None:
         key = f"{side}-{suite.name}-{name}" if multi else f"{side}-{name}"
         log = log_dir / f"{c.merge}.{key}.log"
         res.logs[key] = str(log)
-        code, secs = _run_step(command, cwd, {**os.environ, **suite.env}, timeout, log)
+        limit = suite.setup_timeout if name == "setup" else (
+            suite.timeout if timeout is None else timeout)
+        code, secs = _run_step(command, cwd, step_env(suite, plan_files[suite.name]), limit, log)
         res.timings[key] = round(secs, 3)
         return code
 

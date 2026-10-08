@@ -228,9 +228,10 @@ def test_short_or_dummy_secrets_allowed(tmp_path):
     assert load(tmp_path, text).suites[0].env["MODE"] == "realvalue123"
 
 
-def test_command_needs_a_placeholder(tmp_path):
+def test_command_without_placeholder_runs_the_whole_suite(tmp_path):
+    # changed on purpose: a placeholder used to be required, now it is optional
     text = GOOD.replace("test {modules}", "test")
-    assert any("must contain" in e for e in errors_of(tmp_path, text))
+    assert load(tmp_path, text).suites[0].test_command == "python manage.py test"
 
 
 def test_duplicate_suite_names_and_not_a_mapping(tmp_path):

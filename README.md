@@ -58,17 +58,23 @@ suites:
     test_paths: ["backend/**/tests/**", "backend/**/test_*.py"]
     cwd: backend
     setup: pip install -q -r requirements.txt
-    test_command: python manage.py test {modules}   # {tests} and/or {modules}
-    module_root: backend
+    test_command: python manage.py test {tests|module:backend}   # any language: see below
 exclude_paths: ["**/*.lock", "docs/**", "*.md"]
 max_changed_lines: 800
 ```
+
+`test_command` takes `{tests}` (the PR's changed test files) with optional filters
+(`{tests|stem|join:,}`, `{tests|module:src/test/java|prefix:--tests }`, `{tests|dir|unique}`) or no
+placeholder to run the whole suite. A suite may also set `runnable` (globs of the test files to
+pass to the runner), `timeout` / `setup_timeout`, and wrapper scripts in `.crucible/scripts/`
+(available as `$CRUCIBLE_SCRIPTS`; the changed files arrive in `$CRUCIBLE_TEST_FILES`). Details in
+`docs/design.md`.
 
 The same steps work by hand (add `--local` to skip `gh`):
 
 ```bash
 crucible mine [--json] [--show-excluded]          # list candidates (first run writes mine.yaml)
-crucible mine --verify 12 15 --timeout 600        # tests fail at base, pass at merge
+crucible mine --verify 12 15 [--timeout 600]      # tests fail at base, pass at merge
 crucible mine show 12 --json                      # PR text plus test and non-test diffs
 crucible mine scaffold 12 [--task-id s] [--kind bugfix]   # write .crucible/tasks/<slug>/
 crucible mine leakcheck .crucible/tasks/<slug>    # flag text that gives away the fix

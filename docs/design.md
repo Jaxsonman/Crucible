@@ -171,21 +171,29 @@ suites:                         # one per test stack; a repo may have several
     cwd: backend                # where setup and test commands run, relative to repo root
     setup: pip install -q -r requirements.txt   # optional
     test_command: python manage.py test {modules}
-    module_root: backend        # optional; enables {modules} (dotted paths, .py stripped)
+    module_root: backend        # optional; {modules} = {tests|module:backend} (legacy form)
     env: {DJANGO_SECRET_KEY: dummy-not-secret}   # names + dummy values only
   - name: frontend
     test_paths: ["frontend/src/**/*.test.*", "frontend/src/**/__tests__/**"]
     cwd: frontend
     setup: npm ci --silent
     test_command: npx vitest run {tests}   # {tests}: space-separated, relative to cwd
+    runnable: ["**/*.test.*"]   # optional: which changed test files are passed to the runner
+    timeout: 600                # optional: seconds for the test step (default 600)
+    setup_timeout: 1800         # optional: seconds for the setup step (default 1800)
 exclude_paths: ["**/package-lock.json", "**/*.lock", "**/migrations/**", "docs/**", "*.md"]
 max_changed_lines: 800
 ```
 
 Loaded and validated by `mine/config.py` (`load_config`, raising `MineConfigError` with one
 message per problem, each naming its field, e.g. `suites[0].test_command: required`).
-`test_command` must contain `{tests}` and/or `{modules}`; any other placeholder is an error, and
-`{modules}` needs `module_root`. `cwd` and `module_root` must stay inside the repo. `env`
+`test_command` is parsed with the placeholder grammar below at load time: a malformed
+placeholder, an unknown name or filter is an error naming `suites[i].test_command`, and
+`{modules}` needs `module_root`. A command with no placeholder is allowed and runs the whole
+suite. `runnable` (optional, a non-empty list of globs, matched like `test_paths`) says which
+of a suite's changed test files are passed to the runner; omitted, the built-in rule applies
+(see Verification). `timeout` (test step, default 600) and `setup_timeout` (setup step,
+default 1800) are positive numbers of seconds. `cwd` and `module_root` must stay inside the repo. `env`
 values longer than 7 characters whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
 `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
 start with `dummy`; and any value that is a URL with embedded credentials
@@ -202,6 +210,58 @@ Vitest and Jest (`package.json` dependencies), and returns suites with sensible 
 first `crucible mine` writes a commented `mine.yaml` saying it was auto-detected and must be
 checked (or, with nothing detected, a commented template with empty `suites`), prints the path
 and exits 0 without overwriting an existing file; an invalid file prints its errors and exits 1.
+
+#### Placeholders
+
+```
+placeholder := "{" source ( "|" filter )* "}"
+source      := "tests" | "modules"
+filter      := name | name ":" argument        # argument runs to the next unescaped "|" or "}"
+```
+
+`{tests}` is the suite's runnable changed test files, repo-relative paths made relative to the
+suite `cwd`, in diff order. Filters apply left to right to every item:
+
+| filter | effect |
+| --- | --- |
+| `module:<root>` | path relative to `<root>` (repo-relative), final extension stripped, `/` turned into `.`; a file outside `<root>` rejects the candidate (`test outside module_root`) |
+| `stem` | file name without its final extension |
+| `dir` | parent directory (`.` for none) |
+| `unique` | drop duplicates, keeping the first |
+| `prefix:<s>` / `suffix:<s>` | text put before / after each item (stacked outward) |
+| `join:<sep>` | join the items with `<sep>` into one word; must be the last filter |
+
+`{modules}` is an alias for `{tests|module:<module_root>}` that keeps its original behaviour
+(only a `.py` extension is stripped) and accepts more filters (`{modules|unique}`). Quoting:
+without `join` (or with `join: `, a single space) every item is its own shell word, its value
+quoted with `shlex.quote`; `prefix`/`suffix` text is the configuration's own and stays
+unquoted, so `{tests|module:src/test/java|prefix:--tests }` gives `--tests com.A --tests com.B`.
+With any other separator the joined string, prefixes and suffixes included, is quoted as one
+word (`-Dtest={tests|stem|join:,}` gives `-Dtest=A,B`). `prefix`/`suffix` wrap the finished
+item, so `module`, `stem` and `dir` cannot follow them. File names with spaces, quotes,
+`$(...)`, backticks, `;` or newlines reach the program verbatim.
+
+Only braces shaped like a placeholder are parsed: `{` not directly preceded by `$`, then an
+identifier, then `|` or `}`. `${VAR}`, `${VAR:-x}`, `{}`, `{a,b}`, `{1..3}` and
+`awk '{print $1}'` pass through untouched. An identifier other than `tests`/`modules` in that
+position (`{foo}`, `{Tests}`) is an error, as is an unclosed `{tests`; for a literal such brace
+group use a wrapper script. Inside an argument `\|`, `\}` and `\\` are literals and `\n`/`\t`
+a newline/tab. Examples: pytest `{tests}`; Django `{tests|module:backend}`; Maven
+`-Dtest={tests|stem|join:,}`; Gradle `--tests` per class as above; Go
+`{tests|dir|unique|prefix:./}`.
+
+Every setup and test step (verify, and `check.sh`) also gets `CRUCIBLE_TEST_FILES` (the
+suite's runnable files, repo-relative, newline-separated) and `CRUCIBLE_TEST_FILES_CWD` (the
+same relative to the suite `cwd`) for wrapper scripts.
+
+#### Wrapper scripts
+
+Files in `<home>/scripts/` (`.crucible/scripts/`) are made available at `$CRUCIBLE_SCRIPTS`:
+`verify` exports the host directory; `scaffold` copies the whole tree to `<task>/scripts/`
+(modes and symlinks kept) and `check.sh` exports `CRUCIBLE_SCRIPTS="$TASK_DIR/scripts"`, so
+`test_command: bash "$CRUCIBLE_SCRIPTS/run-tests.sh"` behaves the same in verify, `prove` and
+`crucible run`. Without a scripts dir nothing is copied or exported. The workspace never
+contains `.crucible/`.
 
 ### Candidates (`mine/candidates.py`)
 
@@ -251,10 +311,12 @@ is an error (exit 2); ids not in the candidate list, or excluded, print why on s
 skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
 
 - **Runnable test files.** Of the candidate's changed test files, only non-deleted ones that are
-  *runnable* are passed to the test command: file name `test_*.py`, `*_test.py`, `tests.py`,
-  `*.test.<ext>` or `*.spec.<ext>`, or any file under a `__tests__` directory
-  (`verify.is_runnable_test`). Other files under `test_paths` (conftest, fixtures, helpers) are
-  overlaid but not passed. No runnable file means rejected `no runnable tests`.
+  *runnable* are passed to the test command. A suite with `runnable` globs uses them (each file
+  follows the rule of the suite owning it). Otherwise the built-in rule applies: file name
+  `test_*.py`, `*_test.py`, `tests.py`, `*.test.<ext>` or `*.spec.<ext>`, or any file under a
+  `__tests__` directory (`config.default_is_runnable`). Other files under `test_paths`
+  (conftest, fixtures, helpers) are overlaid but not passed. No runnable file means rejected
+  `no runnable tests`, also for a command without placeholders (which then runs the whole suite).
 - **Several suites.** A candidate whose test files fall in more than one suite is a normal
   candidate (`suites: [a, b]`; the listing shows `a+b`). Per side the tree is exported and all
   test files overlaid once; then for each suite in order: setup (failure rejects as
@@ -271,19 +333,26 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run `setup` (if any) in the suite `cwd`,
   then the test command, which must exit non-zero. Then export merge to another fresh dir, setup,
   same command, which must exit zero. Setup and tests run via `bash -c` in their own process
-  group, with `os.environ` plus the suite `env`, each step killed after `--timeout` seconds
-  (default 600). Dirs are removed afterwards unless `--keep`, which prints their paths.
-- **Placeholders.** `{tests}`: runnable files relative to the suite `cwd`. `{modules}`: the same
-  files relative to `module_root`, `.py` stripped, `/` turned into `.`. Each path is
-  shell-quoted with `shlex.quote`. A suite with `module_root` rejects a candidate whose runnable
-  test file lies outside it (`test outside module_root`, deterministic, nothing is run).
+  group, with `os.environ`, the suite `env` and Crucible's own variables (`CRUCIBLE_TEST_FILES`,
+  `CRUCIBLE_TEST_FILES_CWD`, and `CRUCIBLE_SCRIPTS` when the home has a scripts dir). A setup
+  step is killed after the suite's `setup_timeout` (default 1800 s), a test step after its
+  `timeout` (default 600 s) or, when given, `--timeout S`, which overrides the test step of
+  every suite. Dirs are removed afterwards unless `--keep`, which prints their paths.
+- **Placeholders.** See "Placeholders" above; one builder (`verify.build_command`) fills them
+  for verify, `check.sh` and therefore `prove`. A suite with `module_root`, or a command using a
+  `module:` filter, rejects a candidate whose runnable test file lies outside the root
+  (`test outside module_root`, deterministic, nothing is run).
 - **Outcomes.** `verified`, or `rejected` with `passes at base`, `fails at merge`,
   `setup failed at base|merge` (setup failing is never counted as "fails before"), `timeout`,
   `test outside module_root` or `no runnable tests`.
 - **Cache.** `<home>/mine/verify/<merge sha>.json` (outcome, reason, suite, `suite_hash`,
   command, timings, log paths) with the step logs beside it (`<merge>.<base|merge>-<setup|test>.log`; with several suites `<merge>.<side>-<suite>-<setup|test>.log`).
   An entry is reused only while the involved suites' settings are unchanged (one suite: its
-  `settings_hash()`, so older entries stay valid; several: a hash over every suite's hash); `--force` reruns. `timeout` and `setup failed at ...` are transient and never cached (the logs
+  `settings_hash()`, so older entries stay valid; several: a hash over every suite's hash). The
+  hash covers name, `test_paths`, `cwd`, `setup`, `test_command`, `module_root`, `env` and
+  `runnable`, plus a digest of the scripts dir (names, exec bits, contents) when there is one.
+  `timeout` and `setup_timeout` are deliberately left out: a run that hit a limit is never
+  cached, and a result obtained within a limit stays valid under a longer one. `--force` reruns. `timeout` and `setup failed at ...` are transient and never cached (the logs
   are still written), so a rerun with a longer `--timeout` or fixed setup really runs.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
   (the same string, or null) read from the cache.
@@ -316,16 +385,20 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
 - **`check.sh`** (mode 755), generated from the suite, run by `checker.run_check` with the
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
   copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
-  paths, exports the suite `env`, `cd`s to the suite `cwd`, runs `setup` and then exec's the test
-  command, each via `bash -c '<quoted command>'`, with the `{tests}`/`{modules}` filled by
-  `verify.build_command` from `verify.runnable_files`, exactly what `--verify` ran. A failing
+  paths, exports the suite `env`, `CRUCIBLE_TEST_FILES` and `CRUCIBLE_TEST_FILES_CWD` (and
+  `CRUCIBLE_SCRIPTS` when `<task>/scripts/` was copied), `cd`s to the suite `cwd`, runs `setup`
+  and then exec's the test command, each via `bash -c '<quoted command>'`, with the
+  placeholders filled by `verify.build_command` from `verify.runnable_files`, exactly what
+  `--verify` ran. A failing
   setup prints `crucible-check: setup failed` and exits 97 (so `prove` never counts a broken
   install as "fails before"); a failed copy exits 98.
-- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`) records the merge
-  SHA deterministically. The workspace never contains `.crucible/`, so a hidden file in the task
+- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`,
+  `check_timeout_s`) records the merge SHA deterministically; `check_timeout_s` is the sum of
+  the suites' `setup_timeout` and `timeout`, the default for `prove`'s per-run limit. The workspace never contains `.crucible/`, so a hidden file in the task
   dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only `task.md`.
 
-`crucible mine prove <task-dir> [--timeout S]` loads the finished task (so placeholders must be
+`crucible mine prove <task-dir> [--timeout S]` (default: `check_timeout_s` from `.mine.json`,
+else 600; one limit covers setup and tests of a run) loads the finished task (so placeholders must be
 filled), exports `ref` with `workspace.export_tree` into a fresh dir under `paths.work_dir()/mine/`
 and runs the task's own `check.sh` through `checker.run_check`: it must fail. It then does the
 same on the merge commit, where it must pass. The merge SHA comes from `.mine.json`, else a
@@ -357,7 +430,13 @@ reason}` (exit code unchanged). Tuned to avoid false positives:
   test diff is interface, not a leak (hidden tests call it, so the task must name it). Plain
   words (no underscore or inner capital) must occur in the code portion of an added line, with
   string literals, comments and docstrings blanked out; code-shaped tokens match the whole
-  line. URL-path-like backticked text (`/api/x/`, `POST /api/x`) is one token, flagged only if
+  line. Which text counts as a comment depends on the file extension of the added line's file
+  (`leak.SYNTAX_BY_EXT`): `#` for py/rb/sh/yaml/toml/pl/r; `//` and `/* */` for java, kt,
+  scala, go, rs, js, ts, cs, swift, dart, c/cpp and similar (`#` is not a comment there, nor is
+  `--`, so `i--` stays code); `--` for sql (plus `/* */`), hs, lua, elm (in hs/elm `-->` is an
+  operator); `<!-- -->` for html/xml/vue/jsp/svelte; php takes `//`, `#` and `/* */`; css only
+  `/* */`; an unknown extension keeps the permissive union of `#`, `//` and `/* */`. String
+  and identifier handling is the same for every language. URL-path-like backticked text (`/api/x/`, `POST /api/x`) is one token, flagged only if
   the exact path is on an added non-test line, absent from the base tree and not in the test diff.
 - **file-instruction**: a sentence naming a changed non-test file (path or basename) together
   with an edit verb (add, change, modify, update, edit, rewrite, replace, remove, create,

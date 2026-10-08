@@ -20,7 +20,7 @@ only jobs are the prose of each task and its kind. Never start a benchmark run a
   auto-detected from the repo, or an empty template) and exits 0. Read the file, show the
   detected suites (name, test paths, cwd, setup, test command), and **ask the user to confirm or
   edit it** before going on. With no suites detected, help fill one in: `test_paths`, `cwd`,
-  `setup`, and a `test_command` containing `{tests}` and/or `{modules}`. Use only dummy values in
+  `setup`, and a `test_command` (`{tests}` with optional `|filters`, or no placeholder to run the whole suite; see docs/design.md, "Placeholders"). Use only dummy values in
   `env`. If `crucible mine` prints config errors (exit 1), fix the file and rerun.
 
 ## 1. List candidates

@@ -8,8 +8,12 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from crucible.mine import placeholders
+
 CONFIG_NAME = "mine.yaml"
-PLACEHOLDERS = ("tests", "modules")
+PLACEHOLDERS = placeholders.SOURCES
+DEFAULT_TEST_TIMEOUT_S = 600.0
+DEFAULT_SETUP_TIMEOUT_S = 1800.0
 SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE", "CREDENTIAL")
 SECRET_TOKENS = ("PAT",)  # whole `_`-separated words only, so `PATH` is not a secret
 _URL_CREDENTIALS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:([^/\s@]*)@")
@@ -18,7 +22,16 @@ DEFAULT_EXCLUDE = [
     "**/package-lock.json", "**/*.lock", "**/migrations/**", "docs/**", "*.md",
 ]
 SUITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env"}
+_SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env",
+               "runnable", "timeout", "setup_timeout"}
+# A changed test file is *runnable* (passed to the test command) when its name matches this or
+# it lives under a `__tests__` directory: the rule used when a suite has no `runnable` globs.
+_RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
+
+
+def default_is_runnable(path: str) -> bool:
+    p = PurePosixPath(path)
+    return bool(_RUNNABLE_NAME.match(p.name)) or "__tests__" in p.parts[:-1]
 _TOP_KEYS = {"suites", "exclude_paths", "max_changed_lines"}
 
 
@@ -39,9 +52,29 @@ class Suite:
     setup: str = ""
     module_root: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    runnable: list[str] | None = None  # None: the built-in rule (`default_is_runnable`)
+    timeout: float = DEFAULT_TEST_TIMEOUT_S
+    setup_timeout: float = DEFAULT_SETUP_TIMEOUT_S
+
+    def is_runnable(self, path: str) -> bool:
+        """Is this changed test file passed to the test command?"""
+        if self.runnable is None:
+            return default_is_runnable(path)
+        return path_matches(path, self.runnable)
 
     def to_dict(self) -> dict:
-        """Plain-data form (stable key order), e.g. for hashing a suite's settings."""
+        """Plain-data form (stable key order); optional fields appear only when set."""
+        d = self.hashed_dict()
+        if self.timeout != DEFAULT_TEST_TIMEOUT_S:
+            d["timeout"] = self.timeout
+        if self.setup_timeout != DEFAULT_SETUP_TIMEOUT_S:
+            d["setup_timeout"] = self.setup_timeout
+        return d
+
+    def hashed_dict(self) -> dict:
+        """The settings that decide a verification result. Timeouts are left out on purpose:
+        a run that hit one is never cached, and a result produced within a limit stays valid
+        under a longer one. Fields at their default are omitted so older caches stay valid."""
         d = {"name": self.name, "test_paths": self.test_paths, "cwd": self.cwd}
         if self.setup:
             d["setup"] = self.setup
@@ -50,10 +83,12 @@ class Suite:
             d["module_root"] = self.module_root
         if self.env:
             d["env"] = self.env
+        if self.runnable is not None:
+            d["runnable"] = self.runnable
         return d
 
     def settings_hash(self) -> str:
-        blob = json.dumps(self.to_dict(), sort_keys=True).encode()
+        blob = json.dumps(self.hashed_dict(), sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()
 
 
@@ -131,6 +166,14 @@ def _check_relative(value: str, field_name: str, errors: list[str]) -> None:
         errors.append(f"{field_name}: must be a path inside the repo, got {value!r}")
 
 
+def _seconds(raw: dict, key: str, default: float, where: str, errors: list[str]) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        errors.append(f"{where}.{key}: must be a positive number of seconds, got {value!r}")
+        return default
+    return float(value)
+
+
 def _secret_like(name: str) -> bool:
     upper = name.upper()
     return any(w in upper for w in SECRET_WORDS) or any(
@@ -172,16 +215,21 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         errors.append(f"{where}.test_command: required")
         command = ""
     else:
-        used = re.findall(r"\{([^{}]*)\}", command)
-        for ph in sorted(set(used) - set(PLACEHOLDERS)):
-            errors.append(
-                f"{where}.test_command: unknown placeholder {{{ph}}} "
-                f"(allowed: {', '.join('{' + p + '}' for p in PLACEHOLDERS)})"
-            )
-        if not used:
-            errors.append(f"{where}.test_command: must contain {{tests}} or {{modules}}")
-        if "modules" in used and module_root is None:
-            errors.append(f"{where}.test_command: {{modules}} needs {where}.module_root")
+        try:
+            parsed = placeholders.parse(command)
+        except placeholders.PlaceholderError as e:
+            errors.append(f"{where}.test_command: {e}")
+        else:
+            if any(p.source == "modules" for p in parsed.placeholders) and module_root is None:
+                errors.append(f"{where}.test_command: {{modules}} needs {where}.module_root")
+    runnable = raw.get("runnable")
+    if runnable is not None:
+        runnable = _str_list(runnable, f"{where}.runnable", errors, required=False)
+        if not runnable and not any(e.startswith(f"{where}.runnable") for e in errors):
+            errors.append(f"{where}.runnable: must not be empty (omit it for the built-in rule)")
+        runnable = runnable or None
+    timeout = _seconds(raw, "timeout", DEFAULT_TEST_TIMEOUT_S, where, errors)
+    setup_timeout = _seconds(raw, "setup_timeout", DEFAULT_SETUP_TIMEOUT_S, where, errors)
     env = raw.get("env") or {}
     if not isinstance(env, dict):
         errors.append(f"{where}.env: must be a mapping of NAME: value")
@@ -206,7 +254,8 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         clean_env[str(k)] = v
     if len(errors) > start:
         return None
-    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env)
+    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env, runnable,
+                 timeout, setup_timeout)
 
 
 def load_config(path: Path) -> MineConfig:
@@ -361,8 +410,14 @@ _TEMPLATE_HEADER = """\
 #     test_paths: ["backend/**/tests/**", "backend/**/test_*.py"]   # globs of test files
 #     cwd: backend                       # where setup and test commands run (relative to repo root)
 #     setup: pip install -q -r requirements.txt
-#     test_command: python manage.py test {modules}   # {tests}: file paths relative to cwd
-#     module_root: backend               # optional; enables {modules} (dotted paths, .py stripped)
+#     test_command: python manage.py test {tests|module:backend}
+#         # {tests}: changed test files relative to cwd; filters after `|` reshape them:
+#         # module:<root> stem dir unique prefix:<s> suffix:<s> join:<sep>. No placeholder at
+#         # all runs the whole suite. See docs/design.md ("Placeholders").
+#     module_root: backend               # optional; {modules} = {tests|module:<module_root>}
+#     runnable: ["**/*Test.java"]        # optional; which changed test files are passed to the runner
+#     timeout: 600                       # optional, seconds for the test step
+#     setup_timeout: 1800                # optional, seconds for the setup step
 #     env: {DJANGO_SECRET_KEY: dummy-not-secret}      # dummy values only
 """
 _TAIL = """\
