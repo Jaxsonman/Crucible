@@ -7,8 +7,10 @@ Grammar (see docs/design.md, "Placeholders")::
     filter      := name | name ":" argument
 
 A `{` is a placeholder only when it is not directly preceded by `$` (so `${VAR}` is shell) and
-is followed by an identifier and then `|` or `}`. Every other brace (`{}`, `{a,b}`,
-`awk '{print $1}'`) is left alone. A backslash escapes `|`, `}` and `\\` inside an argument
+is followed by `tests` or `modules` and then `|` or `}`. Every other brace (`{}`, `{a,b}`,
+`awk '{print $1}'`, `{foo}`) is left alone, except near-misses that are almost certainly typos:
+`{Tests}`, `{test}`, `{module}`, `{foo|stem}` (filter syntax) and `{ tests }` (whitespace) are
+errors. A backslash escapes `|`, `}` and `\\` inside an argument
 (`\\n` and `\\t` are a newline and a tab; any other `\\x` is kept as written).
 """
 
@@ -22,7 +24,8 @@ SOURCES = ("tests", "modules")
 NO_ARG = ("stem", "dir", "unique")
 NEEDS_ARG = ("module", "prefix", "suffix")  # a non-empty argument
 FILTERS = ("module", "stem", "dir", "unique", "prefix", "suffix", "join")
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_OPEN = re.compile(r"(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*)")
+_TYPOS = frozenset(SOURCES) | {"test", "module"}
 _ESCAPES = {"|": "|", "}": "}", "\\": "\\", "n": "\n", "t": "\t"}
 
 
@@ -125,16 +128,27 @@ def parse(command: str) -> Command:
     i, n = 0, len(command)
     while i < n:
         ch = command[i]
-        m = _NAME.match(command, i + 1) if ch == "{" and not (i and command[i - 1] == "$") else None
+        m = _OPEN.match(command, i + 1) if ch == "{" and not (i and command[i - 1] == "$") else None
         if m is None:
             lit.append(ch)
             i += 1
             continue
-        name, after = m.group(), command[m.end():m.end() + 1]
-        if name in SOURCES and after not in ("|", "}"):
+        lead, name, trail = m.groups()
+        after = command[m.end():m.end() + 1]
+        closed = after in ("|", "}")
+        if name in SOURCES and closed and (lead or trail):
+            raise PlaceholderError(
+                f"whitespace inside placeholder {command[i:m.end() + 1]!r}: write "
+                f"{{{name}}} with no spaces around the name")
+        if name in SOURCES and not closed and not lead:
             raise PlaceholderError(
                 f"unclosed placeholder {{{name}... (expected '|' or '}}' after {name!r})")
-        if after not in ("|", "}"):  # `{print $1}`, `{a,b}`: shell or program syntax
+        typo = closed and (name.lower() in _TYPOS or after == "|")
+        if name not in SOURCES and not typo:  # `{print $1}`, `{foo}`, `{a,b}`: shell or program
+            lit.append(ch)
+            i += 1
+            continue
+        if name in SOURCES and not closed:
             lit.append(ch)
             i += 1
             continue
@@ -166,6 +180,7 @@ class _Item:
     value: str  # repo-relative path at first; transformed by the filters
     pre: str = ""
     post: str = ""
+    path: bool = True  # still a path relative to cwd (no module/stem transform applied)
 
 
 def _outside(rel: str) -> bool:
@@ -183,6 +198,7 @@ def _module(item: _Item, root: str, cwd: str, legacy: bool, orig: str) -> None:
     elif p.suffix:
         p = p.with_suffix("")
     item.value = ".".join(p.parts)
+    item.path = False
 
 
 def _expand(ph: Placeholder, files: list[str], cwd: str, module_root: str | None) -> str:
@@ -200,6 +216,7 @@ def _expand(ph: Placeholder, files: list[str], cwd: str, module_root: str | None
         elif flt.name == "stem":
             for _, it in items:
                 it.value = PurePosixPath(it.value).stem
+                it.path = False
         elif flt.name == "dir":
             for _, it in items:
                 it.value = posixpath.dirname(it.value) or "."
@@ -222,7 +239,11 @@ def _expand(ph: Placeholder, files: list[str], cwd: str, module_root: str | None
         return shlex.quote(join.join(it.pre + it.value + it.post for _, it in items))
     # default: every item is its own shell word (value quoted; prefix/suffix are the
     # configuration's own text and stay unquoted)
-    return " ".join(it.pre + shlex.quote(it.value) + it.post for _, it in items)
+    # A path item that starts with `-` (and has no prefix in front of it) would be parsed as an
+    # option by the runner: render it as `./-name`.
+    return " ".join(
+        it.pre + shlex.quote("./" + it.value if it.path and not it.pre and it.value.startswith("-")
+                             else it.value) + it.post for _, it in items)
 
 
 def render(cmd: Command, test_files: list[str], cwd: str = ".", module_root: str | None = None) -> str:

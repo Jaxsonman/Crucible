@@ -54,6 +54,7 @@ ref: main                     # git ref; required when repo is not "fixture"
 check: ./check.sh             # optional; run from the workspace root, relative to the task dir
 timeout_minutes: 30           # optional, default 30
 max_turns: 100                # optional, default 100
+check_timeout_minutes: 45     # optional positive integer; how long `crucible run` lets `check` take
 ---
 
 ## What
@@ -63,6 +64,11 @@ max_turns: 100                # optional, default 100
 ## Acceptance criteria
 - ...
 ```
+
+`crucible run` kills a check after `--check-timeout` seconds if given, else after the task's
+`check_timeout_minutes`, else 300 s. Mined tasks get `check_timeout_minutes` from `scaffold`
+(the suites' `setup_timeout` plus `timeout`, rounded up to whole minutes), so a slow build is
+not killed by the default; `crucible mine prove` uses it too unless `--timeout` is given.
 
 The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) plus the
 What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
@@ -153,7 +159,9 @@ PR mining turns merged PRs into tasks.
 - A file is a **test file** if it matches a suite's `test_paths` globs; everything else is
   non-test. Globs: `**` crosses directories (and may match none), `*` stays inside one path
   segment, and a pattern without `/` (like `*.md`) matches the file name at any depth
-  (`config.path_matches`). A directory pattern, meaning a trailing `/` or no wildcard at all,
+  (`config.path_matches`). `{a,b}` is alternation (`*.{test,spec}.{ts,js}`, `{docs,vendor}/**`;
+  nesting works; a brace group without a top-level comma, like `{}` or `{x}`, is literal), in
+  `test_paths`, `runnable` and `exclude_paths`. A directory pattern, meaning a trailing `/` or no wildcard at all,
   also matches every file under that directory: `src/utils` and `src/utils/` are anchored at the
   repo root, while a name without `/` (`vendor`, `vendor/`) matches a directory (or file) of that
   name at any depth.
@@ -262,7 +270,7 @@ How each preset selects tests (exact commands and the reasoning are in the prese
 | pytest, rspec, minitest, mocha, jest, vitest, mix | the changed file paths (`python -m pytest`, `rspec`, `ruby -Itest ...`, `npx mocha`, `npx jest`, `npx vitest run`, `mix test`) |
 | django | dotted module labels for `manage.py test`, from `module_root: {suite_dir}` |
 | maven | Surefire `-Dtest=` with comma-joined class simple names plus `-Dsurefire.failIfNoSpecifiedTests=false` |
-| gradle | one `--tests \*.<Class>` per changed class |
+| gradle | one `--tests \*.<Class>` per changed class, with a temporary init script (`-I`) setting `filter.failOnNoMatchingTests = false` so multi-project builds do not fail sub-projects without matches |
 | go | one `go test -count=1 ./<dir>` per package directory (unique) |
 | cargo | `cargo test --workspace --test <stem>` per changed `tests/*.rs` file (inline unit tests are not selectable) |
 | phpunit | `--filter 'A\|B'`, a class-name regex, because the CLI takes a single path |
@@ -305,14 +313,18 @@ quoted with `shlex.quote`; `prefix`/`suffix` text is the configuration's own and
 unquoted, so `{tests|module:src/test/java|prefix:--tests }` gives `--tests com.A --tests com.B`.
 With any other separator the joined string, prefixes and suffixes included, is quoted as one
 word (`-Dtest={tests|stem|join:,}` gives `-Dtest=A,B`). `prefix`/`suffix` wrap the finished
-item, so `module`, `stem` and `dir` cannot follow them. File names with spaces, quotes,
+item, so `module`, `stem` and `dir` cannot follow them. A path item (not changed by `module` or
+`stem`) that starts with `-` and has no `prefix` in front is rendered as `./-name`, so the
+runner does not read it as an option. File names with spaces, quotes,
 `$(...)`, backticks, `;` or newlines reach the program verbatim.
 
-Only braces shaped like a placeholder are parsed: `{` not directly preceded by `$`, then an
-identifier, then `|` or `}`. `${VAR}`, `${VAR:-x}`, `{}`, `{a,b}`, `{1..3}` and
-`awk '{print $1}'` pass through untouched. An identifier other than `tests`/`modules` in that
-position (`{foo}`, `{Tests}`) is an error, as is an unclosed `{tests`; for a literal such brace
-group use a wrapper script. Inside an argument `\|`, `\}` and `\\` are literals and `\n`/`\t`
+Only `tests` and `modules` are placeholder sources. A `{` not directly preceded by `$` followed
+by `tests`/`modules` and then `|` or `}` is a placeholder; every other brace group passes
+through literally: `${VAR}`, `${VAR:-x}`, `{}`, `{a,b}`, `{1..3}`, `awk '{print}'`,
+`awk '{print $1}'`, Groovy `{ ... }`. Near-misses that are almost certainly typos are still
+errors naming the field: a name equal to `tests`/`modules` ignoring case (`{Tests}`), `{test}`,
+`{module}`, any word followed by `|` (filter syntax, `{foo|stem}`), whitespace around the
+source name (`{ tests }`, `{tests }`, `{ tests}`), and an unclosed `{tests`. Inside an argument `\|`, `\}` and `\\` are literals and `\n`/`\t`
 a newline/tab. Examples: pytest `{tests}`; Django `{tests|module:backend}`; Maven
 `-Dtest={tests|stem|join:,}`; Gradle `--tests` per class as above; Go
 `{tests|dir|unique|prefix:./}`.
@@ -325,9 +337,12 @@ same relative to the suite `cwd`) for wrapper scripts.
 
 Files in `<home>/scripts/` (`.crucible/scripts/`) are made available at `$CRUCIBLE_SCRIPTS`:
 `verify` exports the host directory; `scaffold` copies the whole tree to `<task>/scripts/`
-(modes and symlinks kept) and `check.sh` exports `CRUCIBLE_SCRIPTS="$TASK_DIR/scripts"`, so
+(modes kept; symlinks are dereferenced, so the task holds the content) and `check.sh` exports `CRUCIBLE_SCRIPTS="$TASK_DIR/scripts"`, so
 `test_command: bash "$CRUCIBLE_SCRIPTS/run-tests.sh"` behaves the same in verify, `prove` and
-`crucible run`. Without a scripts dir nothing is copied or exported. The workspace never
+`crucible run`. A symlink whose target lies outside the Crucible home (or is missing) is
+refused: `scaffold` fails with a `ScaffoldError` and `verify` exits 1 naming the link. The
+cache digest hashes the resolved contents, so editing a link target invalidates cached results.
+Without a scripts dir nothing is copied or exported. The workspace never
 contains `.crucible/`.
 
 ### Candidates (`mine/candidates.py`)
@@ -439,7 +454,8 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   homes; `repo` from `task.repo_relative`, here the relative path from the task dir to the repo
   root, so it also works when the home is not inside the repo). Front matter: `id`, `kind`
   (given or suggested), `repo`, `ref` = base SHA, `source` (PR URL or `commit:<merge>`),
-  `timeout_minutes: 30`, `max_turns: 100`, `check: ./check.sh`, and `_(...)_` placeholders in the
+  `timeout_minutes: 30`, `max_turns: 100`, `check_timeout_minutes` (the suites'
+  `setup_timeout` + `timeout`, rounded up), `check: ./check.sh`, and `_(...)_` placeholders in the
   three sections, so an unedited task fails `crucible task validate`.
 - **`hidden_tests/`.** The PR's test files (all changed test files, runnable or not) at their
   merge versions at repo-relative paths (git modes kept: exec bit, symlinks; `check.sh`'s `tar`
@@ -464,8 +480,8 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   the suites' `setup_timeout` and `timeout`, the default for `prove`'s per-run limit. The workspace never contains `.crucible/`, so a hidden file in the task
   dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only `task.md`.
 
-`crucible mine prove <task-dir> [--timeout S]` (default: `check_timeout_s` from `.mine.json`,
-else 600; one limit covers setup and tests of a run) loads the finished task (so placeholders must be
+`crucible mine prove <task-dir> [--timeout S]` (default: `check_timeout_minutes` from
+`task.md`, else `check_timeout_s` from `.mine.json` for older tasks, else 600; one limit covers setup and tests of a run) loads the finished task (so placeholders must be
 filled), exports `ref` with `workspace.export_tree` into a fresh dir under `paths.work_dir()/mine/`
 and runs the task's own `check.sh` through `checker.run_check`: it must fail. It then does the
 same on the merge commit, where it must pass. The merge SHA comes from `.mine.json`, else a
@@ -501,7 +517,7 @@ reason}` (exit code unchanged). Tuned to avoid false positives:
   (`leak.SYNTAX_BY_EXT`): `#` for py/rb/sh/yaml/toml/pl/r; `//` and `/* */` for java, kt,
   scala, go, rs, js, ts, cs, swift, dart, c/cpp and similar (`#` is not a comment there, nor is
   `--`, so `i--` stays code); `--` for sql (plus `/* */`), hs, lua, elm (in hs/elm `-->` is an
-  operator); `<!-- -->` for html/xml/vue/jsp/svelte; php takes `//`, `#` and `/* */`; css only
+  operator); `<!-- -->` plus the C-like `//` and `/* */` (embedded scripts) for html/htm/xml/vue/jsp/svelte/astro; lua also has `--[[ ]]` blocks; php takes `//`, `#` and `/* */`; css only
   `/* */`; an unknown extension keeps the permissive union of `#`, `//` and `/* */`. String
   and identifier handling is the same for every language. URL-path-like backticked text (`/api/x/`, `POST /api/x`) is one token, flagged only if
   the exact path is on an added non-test line, absent from the base tree and not in the test diff.

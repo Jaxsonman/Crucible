@@ -107,6 +107,7 @@ def test_empty_file_list_gives_empty_substitution():
 @pytest.mark.parametrize("cmd", [
     'echo "${HOME}" ${tests}', "echo ${A:-x}", "find . -exec ls {} \\;", "echo {a,b}.txt",
     "awk '{print $1}'", "echo {1..3}", "echo { }", "echo ${tests|stem}", "echo {",
+    "awk '{print}'", "echo {foo}", "echo { print }", "echo {tests_dir}", "echo {testsuite}",
 ])
 def test_brace_syntax_that_is_not_a_placeholder_passes_through(cmd):
     assert build(cmd, ["a.py"]) == cmd
@@ -140,7 +141,8 @@ def test_nasty_names_exact_roundtrip(tmp_path):
     cmd = build("printf '%s\\0' {tests}", NASTY)
     out = subprocess.run(["bash", "-c", cmd], cwd=tmp_path, capture_output=True,
                          check=True).stdout.decode()
-    assert out.split("\0")[:-1] == NASTY
+    # a leading `-` would be read as an option: path items get `./`
+    assert out.split("\0")[:-1] == ["./" + n if n.startswith("-") else n for n in NASTY]
     assert not (tmp_path / "pwned").exists()
 
 
@@ -157,8 +159,15 @@ def test_nasty_join_is_one_word(tmp_path):
 # --- errors ---
 
 @pytest.mark.parametrize("cmd,needle", [
-    ("x {foo}", "unknown placeholder {foo}"),
     ("x {foo|stem}", "unknown placeholder {foo}"),
+    ("x {test}", "unknown placeholder {test}"),
+    ("x {module}", "unknown placeholder {module}"),
+    ("x {TESTS}", "unknown placeholder {TESTS}"),
+    ("x {Modules|unique}", "unknown placeholder {Modules}"),
+    ("x { tests }", "whitespace inside placeholder"),
+    ("x {tests }", "whitespace inside placeholder"),
+    ("x { tests}", "whitespace inside placeholder"),
+    ("x { tests|stem}", "whitespace inside placeholder"),
     ("x {tests|zip}", "unknown filter 'zip'"),
     ("x {tests|stem:3}", "'stem' takes no argument"),
     ("x {tests|module}", "'module' needs an argument"),
@@ -187,3 +196,16 @@ def test_uses_placeholders_and_names():
 def test_module_outside_root_raises():
     with pytest.raises(ph.OutsideRoot):
         build("x {tests|module:backend}", ["other/test_a.py"])
+
+
+def test_dash_names_render_as_dot_slash_paths():
+    assert build("t {tests}", ["-x/a_test.py", "b.py"]) == "t ./-x/a_test.py b.py"
+    assert build("t {tests|dir|unique}", ["-x/a_test.py"]) == "t ./-x"
+    assert build("t {tests}", ["-x.py"], cwd=".") == "t ./-x.py"
+
+
+def test_dash_rule_skips_transformed_and_prefixed_items():
+    assert build("t {tests|stem}", ["-x.py"]) == "t -x"
+    assert build("t {tests|module:.}", ["-x.py"]) == "t -x"
+    assert build("t {tests|prefix:--f=}", ["-x.py"]) == "t --f=-x.py"
+    assert build("t {tests|join:,}", ["-x.py", "-y.py"]) == "t -x.py,-y.py"

@@ -84,7 +84,9 @@ DEFAULT_SYNTAX = CommentSyntax(("#", "//"), (("/*", "*/"),))
 _HASH = CommentSyntax(("#",))
 _DASH = CommentSyntax(("--",))
 _SQL = CommentSyntax(("--",), (("/*", "*/"),))
-_MARKUP = CommentSyntax((), (("<!--", "-->"),))
+# Markup files embed scripts and styles, so they take `<!-- -->` plus the C-like comments.
+_MARKUP = CommentSyntax(("//",), (("<!--", "-->"), ("/*", "*/")))
+_LUA = CommentSyntax(("--",), (("--[[", "]]"),))
 SYNTAX_BY_EXT: dict[str, CommentSyntax] = {
     **dict.fromkeys(
         ["py", "rb", "sh", "bash", "zsh", "yaml", "yml", "toml", "pl", "pm", "r", "ps1", "mk", "cmake", "tf"], _HASH),
@@ -93,8 +95,9 @@ SYNTAX_BY_EXT: dict[str, CommentSyntax] = {
     "php": CommentSyntax(("//", "#"), (("/*", "*/"),)),
     "css": CommentSyntax((), (("/*", "*/"),)),
     "sql": _SQL,
-    **dict.fromkeys(["hs", "lua", "elm"], _DASH),
-    **dict.fromkeys(["html", "htm", "xhtml", "xml", "vue", "jsp", "svelte"], _MARKUP),
+    **dict.fromkeys(["hs", "elm"], _DASH),
+    "lua": _LUA,
+    **dict.fromkeys(["html", "htm", "xhtml", "xml", "vue", "jsp", "svelte", "astro"], _MARKUP),
 }
 # Haskell and Elm: `--` followed by one of these is an operator (`-->`, `--|`), not a comment.
 _OPERATOR_CHARS = frozenset("!#$%&*+./<=>?@\\^|~:")
@@ -136,17 +139,16 @@ def strip_non_code(lines: list[str], ext: str | None = None) -> str:
     while i < n:
         ch = text[i]
         block = next((b for b in syntax.block if text.startswith(b[0], i)), None)
-        if _line_comment_at(text, i, syntax, ext):
+        end = text.find(block[1], i + len(block[0])) if block else -1
+        if block and end >= 0:  # a closed block comment (checked first: Lua `--[[` vs `--`)
+            i = end + len(block[1])
+            out.append(" ")
+        elif _line_comment_at(text, i, syntax, ext):
             while i < n and text[i] != "\n":
                 i += 1
-        elif block:
-            end = text.find(block[1], i + len(block[0]))
-            if end < 0:
-                out.append(ch)
-                i += 1
-            else:
-                i = end + len(block[1])
-                out.append(" ")
+        elif block:  # never closed: kept as code
+            out.append(ch)
+            i += 1
         elif ch in "\"'`":
             triple = text[i:i + 3] == ch * 3
             q = ch * 3 if triple else ch

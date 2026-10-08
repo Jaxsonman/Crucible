@@ -171,7 +171,8 @@ def test_good_config_loads(tmp_path):
 
 @pytest.mark.parametrize("old,new,needle", [
     ("    test_command: python manage.py test {modules}\n", "", "suites[0].test_command: required"),
-    ("{modules}", "{foo}", "suites[0].test_command: unknown placeholder {foo}"),
+    ("{modules}", "{Modules}", "suites[0].test_command: unknown placeholder {Modules}"),
+    ("{modules}", "{ modules }", "suites[0].test_command: whitespace inside placeholder"),
     ("    module_root: backend\n", "", "{modules} needs suites[0].module_root"),
     ("dummy-not-secret", "realvalue123", "suites[0].env.DJANGO_SECRET_KEY"),
     ("    cwd: backend\n", "    cwd: ../x\n", "suites[0].cwd"),
@@ -338,11 +339,11 @@ def test_mine_invalid_config_exits_1_naming_field(repo, capsys):
     main(["init"])
     (repo / ".crucible/mine.yaml").write_text(
         "suites:\n  - name: a\n    test_paths: ['t/**']\n"
-        "    test_command: run {foo}\n"
+        "    test_command: run {Tests}\n"
     )
     capsys.readouterr()
     assert main(["mine"]) == 1
-    assert "suites[0].test_command: unknown placeholder {foo}" in capsys.readouterr().err
+    assert "suites[0].test_command: unknown placeholder {Tests}" in capsys.readouterr().err
 
 
 def test_mine_adds_mine_to_existing_home_gitignore(repo):
@@ -371,3 +372,25 @@ def test_detected_suite_names_are_safe(tmp_path):
     (d / "package.json").write_text('{"devDependencies": {"vitest": "1"}}')
     names = [s.name for s in mc.detect_suites(tmp_path)]
     assert names and all(mc.SUITE_NAME_RE.match(n) for n in names)
+
+
+# --- brace alternation in globs ---
+
+@pytest.mark.parametrize("path,patterns,expected", [
+    ("a/x.test.ts", ["a/*.{test,spec}.{ts,js}"], True),
+    ("a/x.spec.js", ["a/*.{test,spec}.{ts,js}"], True),
+    ("a/x.spec.py", ["a/*.{test,spec}.{ts,js}"], False),
+    ("src/Foo.vue", ["**/*.{vue,svelte}"], True),
+    ("web/src/b.svelte", ["**/*.{vue,svelte}"], True),
+    ("docs/a.txt", ["{docs,vendor}/**"], True),
+    ("vendor/a.txt", ["{docs,vendor}/**"], True),
+    ("x/a.txt", ["{docs,vendor}/**"], False),
+    ("a.b", ["a.{b,{c,d}}"], True),
+    ("a.d", ["a.{b,{c,d}}"], True),
+    ("a.e", ["a.{b,{c,d}}"], False),
+    ("a{b}.py", ["a{b}.py"], True),          # no comma: literal braces
+    ("a{b.py", ["a{b.py"], True),            # unclosed: literal
+    ("deep/vendor/x", ["{vendor,node_modules}"], True),  # directory pattern still matches
+])
+def test_path_matches_brace_alternation(path, patterns, expected):
+    assert mc.path_matches(path, patterns) is expected

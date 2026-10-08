@@ -273,7 +273,10 @@ def test_scaffold_records_check_timeout_and_prove_uses_it(repo, crucible_home, m
                    "    timeout: 100\n    setup_timeout: 200\n", script=False)
     meta = json.loads((d / ".mine.json").read_text())
     assert meta["check_timeout_s"] == 300
+    # 300 s rounds up to 5 minutes, written to task.md for `crucible run` and `prove`
+    assert "\ncheck_timeout_minutes: 5\n" in (d / "task.md").read_text()
     task = load_task(d)
+    assert task.check_timeout_minutes == 5
     assert sc.check_timeout(task) == 300
     seen = []
     real = checker.run_check
@@ -283,8 +286,26 @@ def test_scaffold_records_check_timeout_and_prove_uses_it(repo, crucible_home, m
     seen.clear()
     assert sc.prove_task(task, 123).ok
     assert seen == [123, 123]
+    # older task: no task.md field, falls back to .mine.json, then the default
+    task.check_timeout_minutes = None
+    assert sc.check_timeout(task) == 300
     (d / ".mine.json").unlink()
     assert sc.check_timeout(task) == vf.DEFAULT_TIMEOUT_S
+
+
+def test_scaffold_rounds_check_timeout_up_to_whole_minutes(repo, crucible_home):
+    d = scaffolded(repo, crucible_home, f"{PYTEST} {{tests}}",
+                   "    timeout: 61\n    setup_timeout: 1\n", script=False)
+    assert "\ncheck_timeout_minutes: 2\n" in (d / "task.md").read_text()
+    assert load_task(d).check_timeout_minutes == 2
+
+
+def test_prove_prefers_task_md_timeout_over_mine_json(repo, crucible_home):
+    d = scaffolded(repo, crucible_home, f"{PYTEST} {{tests}}",
+                   "    timeout: 100\n    setup_timeout: 200\n", script=False)
+    md = d / "task.md"
+    md.write_text(md.read_text().replace("check_timeout_minutes: 5", "check_timeout_minutes: 9"))
+    assert sc.check_timeout(load_task(d)) == 540
 
 
 def test_scaffold_with_runnable_globs_passes_only_those(repo, crucible_home):
@@ -396,3 +417,101 @@ def test_check_text_uses_each_files_comment_syntax(tmp_path):
                             [("What", "Look at `zorgle` and `blorp`.")])
     spans = {f.span for f in flags if f.kind == "new-identifier"}
     assert spans == {"blorp"}  # the SQL comment word is not code; the JS call is
+
+
+@pytest.mark.parametrize("ext", ["vue", "svelte", "jsp", "html", "htm", "xml", "astro"])
+def test_markup_files_also_strip_embedded_script_comments(ext):
+    lines = ["<script>", "  const a = 1; // gone_line", "  /* gone_block */", "</script>",
+             "<!-- gone_markup --><p>kept_text</p>"]
+    out = code_of(lines, ext)
+    assert "kept_text" in out and "const a" in out
+    for gone in ("gone_line", "gone_block", "gone_markup"):
+        assert gone not in out
+
+
+def test_markup_decrement_and_urls_in_strings_stay_code():
+    out = code_of(['<script>while (i-- > 0) { kept_call(i) }</script>',
+                   '<a href="http://example.com/kept_path">x</a>'], "vue")
+    assert "kept_call" in out
+    assert "http" not in out  # the string literal is blanked as a string, not cut as a comment
+    assert "</a>" in out
+
+
+def test_lua_block_comments():
+    out = code_of(["local a = 1 --[[ gone_one", "gone_two ]] local b = 2 -- gone_three",
+                   "kept_name()"], "lua")
+    for gone in ("gone_one", "gone_two", "gone_three"):
+        assert gone not in out
+    assert "local b" in out and "kept_name" in out
+    # an unclosed `--[[` is still a line comment
+    assert "gone_open" not in code_of(["x = 1 --[[ gone_open", "kept_name()"], "lua")
+    assert "kept_name" in code_of(["x = 1 --[[ gone_open", "kept_name()"], "lua")
+
+
+# --- scripts symlinks ---
+
+def test_copy_scripts_dereferences_links_inside_the_home(crucible_home):
+    real = crucible_home / "shared" / "real.sh"
+    real.parent.mkdir()
+    real.write_text("#!/usr/bin/env bash\necho real\n")
+    real.chmod(0o755)
+    shdir = crucible_home / "shared" / "lib"
+    shdir.mkdir()
+    (shdir / "a.txt").write_text("A")
+    scripts = crucible_home / "scripts"
+    scripts.mkdir()
+    (scripts / "run.sh").symlink_to("../shared/real.sh")
+    (scripts / "lib").symlink_to("../shared/lib", target_is_directory=True)
+    dest = crucible_home / "out"
+    assert sc._copy_scripts(dest)
+    assert not (dest / "run.sh").is_symlink() and not (dest / "lib").is_symlink()
+    assert (dest / "run.sh").read_text() == real.read_text()
+    assert stat.S_IMODE((dest / "run.sh").stat().st_mode) & 0o111
+    assert (dest / "lib" / "a.txt").read_text() == "A"
+
+
+def test_copy_scripts_refuses_links_outside_the_home(crucible_home, tmp_path):
+    outside = tmp_path / "outside.sh"
+    outside.write_text("echo hi\n")
+    scripts = crucible_home / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.sh").symlink_to(outside)
+    with pytest.raises(sc.ScaffoldError, match=r"evil\.sh.*outside the Crucible home"):
+        sc._copy_scripts(crucible_home / "out")
+
+
+def test_scripts_digest_follows_link_targets(crucible_home):
+    real = crucible_home / "shared.sh"
+    real.write_text("one\n")
+    scripts = crucible_home / "scripts"
+    scripts.mkdir()
+    (scripts / "run.sh").symlink_to("../shared.sh")
+    before = vf.scripts_digest()
+    assert before
+    real.write_text("two\n")
+    assert vf.scripts_digest() != before
+
+
+def test_verify_refuses_scripts_links_outside_the_home(repo, crucible_home, tmp_path):
+    outside = tmp_path / "outside.sh"
+    outside.write_text("echo hi\n")
+    scripts = crucible_home / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.sh").symlink_to(outside)
+    with pytest.raises(vf.ScriptsLinkError, match="outside the Crucible home"):
+        vf.scripts_digest()
+    with pytest.raises(vf.ScriptsLinkError):
+        vf.step_env(mc.Suite("s", ["t/**"], "true"), [])
+
+
+def test_verify_cli_refuses_outside_links(repo, crucible_home, tmp_path, capsys):
+    outside = tmp_path / "outside.sh"
+    outside.write_text("echo hi\n")
+    scripts = crucible_home / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.sh").symlink_to(outside)
+    (f,) = ids(repo, "fix")
+    capsys.readouterr()
+    assert verify("--verify", f) == 1
+    assert "outside the Crucible home" in capsys.readouterr().err
+    assert not (crucible_home / "mine" / "verify" / f"{repo.sha['fix']}.json").exists()

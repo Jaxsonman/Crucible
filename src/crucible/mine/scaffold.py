@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 import os
 import re
 import shlex
@@ -128,11 +129,19 @@ def _write_hidden_tests(repo: Path, c: Candidate, dest: Path) -> None:
 
 
 def _copy_scripts(dest: Path) -> bool:
-    """Copy the home's wrapper scripts to `dest` (file modes kept). False if there are none."""
-    src = verify.scripts_dir()
-    if not verify.scripts_digest():
+    """Copy the home's wrapper scripts to `dest` (file modes kept). Symlinks are dereferenced
+    (the content is copied, so the task is self-contained); one pointing outside the Crucible
+    home raises ScaffoldError. False if there are no scripts."""
+    try:
+        files = verify.scripts_files()
+    except verify.ScriptsLinkError as e:
+        raise ScaffoldError(str(e)) from e
+    if not files:
         return False
-    shutil.copytree(src, dest, symlinks=True)
+    for name, target in files:
+        out = dest / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, out)
     return True
 
 
@@ -156,8 +165,10 @@ def scaffold_task_dir(
     tasks_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir()
     try:
+        check_s = sum(s.setup_timeout + s.timeout for s in suites)
         extra = (f"source: {json.dumps(c.source)}\n"
-                 f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
+                 f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n"
+                 f"check_timeout_minutes: {max(1, math.ceil(check_s / 60))}\n")
         (task_dir / "task.md").write_text(
             repo_task_md(slug, repo_relative(repo.resolve(), task_dir), c.base,
                          kind or c.suggested_kind, extra),
@@ -170,7 +181,7 @@ def scaffold_task_dir(
         (task_dir / MINE_META).write_text(json.dumps({
             "id": c.id, "base": c.base, "merge": c.merge, "suite": suites[0].name,
             "suites": [s.name for s in suites], "source": c.source,
-            "check_timeout_s": sum(s.setup_timeout + s.timeout for s in suites)},
+            "check_timeout_s": check_s},
             indent=2) + "\n", encoding="utf-8")
     except BaseException:
         shutil.rmtree(task_dir, ignore_errors=True)
@@ -230,8 +241,11 @@ def _check_at(task: Task, ref: str, label: str, timeout: float) -> checker.Check
 
 
 def check_timeout(task: Task) -> float:
-    """Seconds `prove` allows one check run (setup plus tests): the total the suites' timeouts
-    gave when the task was scaffolded (`.mine.json`), else the default."""
+    """Seconds `prove` allows one check run (setup plus tests): the task's
+    `check_timeout_minutes`, else (older tasks) the total the suites' timeouts gave when the
+    task was scaffolded (`.mine.json`), else the default."""
+    if task.check_timeout_minutes:
+        return task.check_timeout_minutes * 60.0
     try:
         meta = json.loads((task.task_dir / MINE_META).read_text(encoding="utf-8"))
         value = meta.get("check_timeout_s")

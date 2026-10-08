@@ -2,6 +2,10 @@
 # We pass `*.SimpleName`: Gradle's filter wildcards match any package, so no package/FQCN has
 # to be derived from a source-set root (src/test/java vs src/test/kotlin vs a sub-project).
 # The `\*` keeps the shell from globbing. Prefer the repo's wrapper when it has one.
+# In a multi-project build `--tests` fails every sub-project with no matching test ("No tests
+# found for given includes"), so the command writes a temporary init script (nothing in the repo
+# changes) that sets filter.failOnNoMatchingTests = false for every Test task and passes it
+# with -I. The Groovy braces are not placeholders (only `{tests}`/`{modules}` are).
 name: gradle
 markers:
   # a settings file that includes sub-projects builds them from the root: not separate suites
@@ -29,12 +33,14 @@ runnable:
 timeout: 1200
 setup_timeout: 3600
 setup: gradle testClasses --console=plain
-test_command: gradle test --console=plain {tests|stem|prefix:--tests \*.}
+test_command: >-
+  i=$(mktemp) && trap 'rm -f "$i"' EXIT && printf '%s\n' 'allprojects { tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }' > "$i" && gradle -I "$i" test --console=plain {tests|stem|prefix:--tests \*.}
 variants:
   - when: [gradlew]
     setup: ./gradlew testClasses --console=plain
-    test_command: ./gradlew test --console=plain {tests|stem|prefix:--tests \*.}
+    test_command: >-
+      i=$(mktemp) && trap 'rm -f "$i"' EXIT && printf '%s\n' 'allprojects { tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }' > "$i" && ./gradlew -I "$i" test --console=plain {tests|stem|prefix:--tests \*.}
 notes: >-
-  In a multi-project build Gradle fails a sub-project whose test task matches nothing ("No
-  tests found for given includes"); if calibration shows that, run one project
-  (./gradlew :sub:test ...) or set filter.failOnNoMatchingTests = false in the build.
+  The command passes a temporary init script (-I) that sets filter.failOnNoMatchingTests =
+  false, so a multi-project build does not fail a sub-project whose test task matches none of
+  the --tests patterns. It needs a Gradle version that has TestFilter.failOnNoMatchingTests.

@@ -9,7 +9,6 @@ from pathlib import Path
 from crucible import (
     __version__,
     aggregate,
-    checker,
     configs,
     judge,
     paths,
@@ -149,7 +148,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.max_budget_usd <= 0:
         print("--max-budget-usd must be positive", file=sys.stderr)
         return 1
-    if args.check_timeout <= 0:
+    if args.check_timeout is not None and args.check_timeout <= 0:
         print("--check-timeout must be positive", file=sys.stderr)
         return 1
     prompt_text = prompt.build_prompt(task)
@@ -473,6 +472,9 @@ def _mine_verify(args, top: Path, cfg, kept, excluded) -> int:
         try:
             r = mine_verify.verify_candidate(
                 top, c, mine_verify.involved_suites(c, cfg.suites), timeout=args.timeout, keep=args.keep, force=args.force)
+        except mine_verify.ScriptsLinkError as e:
+            print(e, file=sys.stderr)
+            return 1
         except (mine_candidates.MineGitError, workspace.WorkspaceError) as e:
             print(f"{cid}: skipped ({e})", file=sys.stderr)
             skipped = True
@@ -660,8 +662,9 @@ def build_parser() -> argparse.ArgumentParser:
             group.add_argument("--matrix", help="named matrix (configs/<name>.yaml)")
             p.add_argument("--repeat", type=int, default=1, help="attempts per config")
             p.add_argument("--max-budget-usd", type=float, default=5.0)
-            p.add_argument("--check-timeout", type=float, default=checker.DEFAULT_TIMEOUT_S,
-                           help="seconds before a hanging check is killed (default 300)")
+            p.add_argument("--check-timeout", type=float, default=None,
+                           help="seconds before a hanging check is killed (default: the task's "
+                                "check_timeout_minutes, else 300)")
             p.add_argument("--judge", action="store_true",
                            help="judge each attempt against the acceptance criteria")
             p.add_argument("--judge-config", help=f"judge model:effort (default {judge.DEFAULT_CONFIG})")

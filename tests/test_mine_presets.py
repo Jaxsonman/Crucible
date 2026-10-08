@@ -8,6 +8,16 @@ import pytest
 from crucible.mine import config as mc
 from crucible.mine import presets, verify
 
+
+def gradle_cmd(gradle: str) -> str:
+    """The gradle preset's test_command: a temporary init script lets `--tests` match nothing
+    in some sub-projects of a multi-project build."""
+    return ("i=$(mktemp) && trap 'rm -f \"$i\"' EXIT && printf '%s\\n' 'allprojects { "
+            "tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }' "
+            f"> \"$i\" && {gradle} -I \"$i\" test --console=plain "
+            "{tests|stem|prefix:--tests \\*.}")
+
+
 SHIPPED = {
     "pytest", "django", "jest", "vitest", "mocha", "maven", "gradle", "go", "cargo", "rspec",
     "minitest", "phpunit", "dotnet", "mix",
@@ -71,7 +81,7 @@ def test_good_preset_loads(tmp_path):
 
 @pytest.mark.parametrize("old,new,needle", [
     ("test_command: run {tests}\n", "", "good.yaml: test_command: required"),
-    ("test_command: run {tests}", "test_command: run {nope}", "good.yaml: test_command:"),
+    ("test_command: run {tests}", "test_command: run {Tests}", "good.yaml: test_command:"),
     ("markers: [{glob: good.cfg}]", "markers: []", "good.yaml: markers: must not be empty"),
     ("markers: [{glob: good.cfg}]", "markers: [{glob: ../x}]", "good.yaml: markers[0].glob"),
     ("markers: [{glob: good.cfg}]", "markers: [{glob: a, contains: '('}]",
@@ -143,15 +153,17 @@ CASES = {
         "-DfailIfNoTests=false")),
     "gradle": (
         {"build.gradle.kts": "", "src/test/kotlin/com/x/FooTest.kt": ""},
-        "gradle", ".", "gradle test --console=plain {tests|stem|prefix:--tests \\*.}",
+        "gradle", ".", gradle_cmd("gradle"),
         (["src/test/kotlin/FooTest.kt", "src/test/java/BarTests.java"], ["src/test/resources/x.yml"]),
         ["src/test/kotlin/com/x/FooTest.kt", "src/test/java/com/y/BarTest.java"],
-        "gradle test --console=plain --tests \\*.FooTest --tests \\*.BarTest"),
+        gradle_cmd("gradle").replace("{tests|stem|prefix:--tests \\*.}",
+                                     "--tests \\*.FooTest --tests \\*.BarTest")),
     "gradle-wrapper": (
         {"build.gradle": "", "gradlew": "", "src/test/java/FooTest.java": ""},
-        "gradle", ".", "./gradlew test --console=plain {tests|stem|prefix:--tests \\*.}",
+        "gradle", ".", gradle_cmd("./gradlew"),
         (["src/test/java/FooTest.java"], []),
-        ["src/test/java/FooTest.java"], "./gradlew test --console=plain --tests \\*.FooTest"),
+        ["src/test/java/FooTest.java"],
+        gradle_cmd("./gradlew").replace("{tests|stem|prefix:--tests \\*.}", "--tests \\*.FooTest")),
     "go": (
         {"go.mod": "module x\n", "pkg/a_test.go": "", "a_test.go": ""},
         "go", ".", "go test -count=1 {tests|dir|unique|prefix:./}",
@@ -397,3 +409,39 @@ def test_nothing_detected_template_is_not_language_specific(tmp_path):
     head = out.read_text().split("suites:")[0]
     assert "pytest, Django, Vitest or Jest" not in head
     assert "preset" in head
+
+
+def test_gradle_command_survives_render_and_runs_with_the_init_script(tmp_path):
+    import os
+    import shlex
+    import subprocess
+
+    from crucible.mine import scaffold
+
+    make(tmp_path, {"build.gradle": "", "gradlew": "", "src/test/java/FooTest.java": ""})
+    [s] = mc.detect_suites(tmp_path)
+    # the `{suite_dir}` substitution and the mine.yaml round trip keep the Groovy braces verbatim
+    out = tmp_path / "mine.yaml"
+    out.write_text(mc.render_default([s]), encoding="utf-8")
+    [s] = mc.load_config(out).suites
+    files = ["src/test/java/FooTest.java", "x/BarTest.java"]
+    cmd = verify.build_command(s, files)
+    assert "{ tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }" in cmd
+    assert cmd.endswith("--tests \\*.FooTest --tests \\*.BarTest")
+    assert subprocess.run(["bash", "-n", "-c", cmd], check=False).returncode == 0
+    # check.sh embeds the command via bash -c '<quoted>': still valid bash
+    check = tmp_path / "check.sh"
+    check.write_text(scaffold.check_script(s, files), encoding="utf-8")
+    assert subprocess.run(["bash", "-n", str(check)], check=False).returncode == 0
+    assert shlex.quote(cmd) in check.read_text(encoding="utf-8")
+    # a fake wrapper receives `-I <init script>` with the filter disabled; the file is removed after
+    fake = tmp_path / "gradlew"
+    fake.write_text('#!/bin/bash\necho "ARGS: $*"\ncat "$2"\necho "$2" > init.path\n')
+    fake.chmod(0o755)
+    r = subprocess.run(["bash", "-c", cmd], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"},
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert "ARGS: -I " in r.stdout
+    assert "test --console=plain --tests *.FooTest --tests *.BarTest" in r.stdout
+    assert "filter.failOnNoMatchingTests = false" in r.stdout
+    assert not os.path.exists((tmp_path / "init.path").read_text().strip())

@@ -63,21 +63,53 @@ def scripts_dir() -> Path:
     return paths.home() / SCRIPTS_DIRNAME
 
 
-def scripts_digest() -> str:
-    """Digest of the scripts dir (relative names, exec bits, contents); "" when there are none."""
+class ScriptsLinkError(ValueError):
+    """A symlink in the scripts dir points outside the Crucible home (or at nothing)."""
+
+
+def scripts_files() -> list[tuple[str, Path]]:
+    """(relative posix name, resolved file) for every file under the scripts dir, symlinks
+    followed (linked directories are walked). A link whose target lies outside the Crucible
+    home, or is missing, raises `ScriptsLinkError`."""
     root = scripts_dir()
     if not root.is_dir():
+        return []
+    home = paths.home().resolve()
+    out: list[tuple[str, Path]] = []
+
+    def walk(d: Path, rel: str, seen: frozenset) -> None:
+        for entry in sorted(d.iterdir(), key=lambda p: p.name):
+            name = f"{rel}{entry.name}"
+            target = entry.resolve()
+            if entry.is_symlink():
+                if not target.exists():
+                    raise ScriptsLinkError(f"scripts/{name} is a broken symlink")
+                if not target.is_relative_to(home):
+                    raise ScriptsLinkError(
+                        f"scripts/{name} links to {target}, outside the Crucible home "
+                        f"({home}); copy the file into the scripts dir or link inside the home")
+            if target.is_dir():
+                if target not in seen:  # a link loop is walked once
+                    walk(entry, name + "/", seen | {target})
+            else:
+                out.append((name, target))
+
+    walk(root, "", frozenset({root.resolve()}))
+    return out
+
+
+def scripts_digest() -> str:
+    """Digest of the scripts dir (relative names, exec bits, resolved contents, so editing a
+    link target changes it); "" when there are none. Raises `ScriptsLinkError`."""
+    files = scripts_files()
+    if not files:
         return ""
-    h, any_file = hashlib.sha256(), False
-    for f in sorted(p for p in root.rglob("*") if not p.is_dir() or p.is_symlink()):
-        any_file = True
-        h.update(f.relative_to(root).as_posix().encode() + b"\0")
-        if f.is_symlink():
-            h.update(b"L" + os.readlink(f).encode())
-        else:
-            h.update((b"x" if os.access(f, os.X_OK) else b"-") + f.read_bytes())
+    h = hashlib.sha256()
+    for name, f in files:
+        h.update(name.encode() + b"\0")
+        h.update((b"x" if os.access(f, os.X_OK) else b"-") + f.read_bytes())
         h.update(b"\0")
-    return h.hexdigest() if any_file else ""
+    return h.hexdigest()
 
 
 def suites_hash(suites: list[Suite]) -> str:
@@ -319,8 +351,9 @@ def verify_candidate(
     overlaid once, then each suite in order runs setup and its test command with only its own
     runnable files. Base is verified if at least one suite fails; merge needs every suite to
     pass. `timeout` (seconds) overrides every suite's test-step `timeout`; the setup step always
-    uses the suite's `setup_timeout`. Raises MineGitError / WorkspaceError only for git
-    problems."""
+    uses the suite's `setup_timeout`. Raises MineGitError / WorkspaceError for git problems and
+    ScriptsLinkError for a scripts symlink out of the home."""
+    scripts_files()  # refuse symlinks out of the home before anything runs (or is cached)
     involved = involved_suites(c, suites)
     multi = len(involved) > 1
     if not force:

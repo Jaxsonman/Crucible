@@ -1,6 +1,7 @@
 """`.crucible/mine.yaml`: per-repo test suites for mining, plus stack detection."""
 
 import hashlib
+import itertools
 import json
 import re
 from dataclasses import dataclass, field
@@ -130,12 +131,38 @@ def _match_one(path: str, pat: str) -> bool:
     return bool(_glob_regex(pat).match(target))
 
 
+def expand_braces(pattern: str) -> list[str]:
+    """`a/{b,c}.py` -> `a/b.py`, `a/c.py` (nesting works). A brace group with no top-level
+    comma (`{}`, `{a}`) or no closing brace is literal."""
+    start = pattern.find("{")
+    while start >= 0:
+        depth, commas, end = 0, [], -1
+        for i in range(start, len(pattern)):
+            c = pattern[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            elif c == "," and depth == 1:
+                commas.append(i)
+        if end >= 0 and commas:
+            bounds = [start, *commas, end]
+            alts = [pattern[a + 1:b] for a, b in itertools.pairwise(bounds)]
+            return [x for alt in alts
+                    for x in expand_braces(pattern[:start] + alt + pattern[end + 1:])]
+        start = pattern.find("{", start + 1)
+    return [pattern]
+
+
 def path_matches(path: str, patterns: list[str]) -> bool:
-    """True if repo-relative `path` matches any glob. A pattern with no `/` (like `*.md`)
+    """True if repo-relative `path` matches any glob (`{a,b}` alternation is supported). A pattern with no `/` (like `*.md`)
     matches the file name at any depth. A directory pattern (trailing `/`, or no wildcard)
     also matches every file under that directory: `src/utils` and `src/utils/` are anchored at the
     repo root; a name without a `/` (`vendor`, `vendor/`) matches a directory of that name at any depth."""
-    for pat in patterns:
+    for pat in (x for p in patterns for x in expand_braces(p)):
         if _match_one(path, pat):
             return True
         base = pat.rstrip("/")

@@ -52,6 +52,7 @@ class Task:
     criteria: list[str]
     task_dir: Path
     source: str | None = None  # mined tasks: PR URL, or `commit:<merge sha>`
+    check_timeout_minutes: int | None = None  # None: `crucible run` uses its 300 s default
 
     @property
     def repo_path(self) -> Path:
@@ -156,6 +157,8 @@ def load_task(path: str | Path) -> Task:
 
     timeout = _positive_int(fm, "timeout_minutes", 30, fail)
     max_turns = _positive_int(fm, "max_turns", 100, fail)
+    check_minutes = (_positive_int(fm, "check_timeout_minutes", 0, fail)
+                     if "check_timeout_minutes" in fm else None)
 
     sections = _sections(body)
     for name in SECTIONS:
@@ -185,6 +188,7 @@ def load_task(path: str | Path) -> Task:
         criteria=criteria,
         task_dir=task_dir,
         source=source,
+        check_timeout_minutes=check_minutes,
     )
 
 
