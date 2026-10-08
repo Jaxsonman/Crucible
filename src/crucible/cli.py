@@ -295,6 +295,8 @@ def _evidence(row: dict) -> str:
 
 
 def _format_recommendation(rec: dict) -> list[str]:
+    if rec["status"] == "no_common_tasks":
+        return ["Recommendation: none; no task was attempted by every config"]
     lines = []
     if rec["status"] == "recommended":
         lines.append(f"Recommendation: {rec['config']}")
@@ -351,6 +353,8 @@ def _cross_task_report(args: argparse.Namespace) -> int:
             print()
         print(f"## Kind: {rep['kind']}  ({rep['tasks']} tasks, {rep['attempts']} attempts)")
         print()
+        print(f"Compared on {len(rep['common_tasks'])} of {rep['tasks']} tasks attempted by "
+              "every config")
         print("\n".join(_format_recommendation(rep["recommendation"])))
         print()
         print(format_report_table(rep["configs"], KIND_COLUMNS))

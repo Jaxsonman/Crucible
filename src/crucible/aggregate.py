@@ -182,26 +182,55 @@ def recommend(
             "runner_up": rated[1] if len(rated) > 1 else None}
 
 
+def common_tasks(records: list[Record]) -> list[str]:
+    """Sorted task ids attempted by every config that has at least one attempt in `records`."""
+    by_config: dict[str, set] = {}
+    for r in records:
+        by_config.setdefault(config_label(r), set()).add(r.get("task_id"))
+    if not by_config:
+        return []
+    return sorted(t for t in set.intersection(*by_config.values()) if t is not None)
+
+
+def _add_task_counts(rows: list[Row], records: list[Record]) -> list[Row]:
+    for row in rows:
+        row["tasks"] = len(
+            {r.get("task_id") for r in records if config_label(r) == row["config"]}
+        )
+    return rows
+
+
 def kind_reports(
     records: list[Record],
     min_attempts: int = DEFAULT_MIN_ATTEMPTS,
     threshold: float = DEFAULT_THRESHOLD,
 ) -> list[dict[str, Any]]:
-    """Per task kind: pooled per-config rows (with `tasks` counts) and a recommendation."""
+    """Per task kind: pooled per-config rows (`configs`, with `tasks` counts), the
+    `common_tasks` every config attempted, `comparable` rows over only those tasks, and a
+    recommendation from `comparable` so configs are compared on the same tasks. With no common
+    task the recommendation status is `no_common_tasks`."""
     by_kind: dict[str, list[Record]] = {}
     for r in records:
         by_kind.setdefault(r.get("task_kind") or NO_KIND, []).append(r)
     reports = []
     for kind in sorted(by_kind):
         recs = by_kind[kind]
-        rows = aggregate_configs(recs)
-        for row in rows:
-            row["tasks"] = len({r.get("task_id") for r in recs if config_label(r) == row["config"]})
+        rows = _add_task_counts(aggregate_configs(recs), recs)
+        common = common_tasks(recs)
+        wanted = set(common)
+        comp_recs = [r for r in recs if r.get("task_id") in wanted]
+        comparable = _add_task_counts(aggregate_configs(comp_recs), comp_recs)
+        rec = recommend(comparable, min_attempts, threshold)
+        if not common:
+            # Same shape as every other recommendation; only the status differs.
+            rec = {**rec, "status": "no_common_tasks"}
         reports.append({
             "kind": kind,
             "tasks": len({r.get("task_id") for r in recs}),
             "attempts": len(recs),
             "configs": rows,
-            "recommendation": recommend(rows, min_attempts, threshold),
+            "common_tasks": common,
+            "comparable": comparable,
+            "recommendation": rec,
         })
     return reports

@@ -47,7 +47,10 @@ def test_two_kinds_each_get_recommendation_and_table(crucible_home, capsys):
     bug, feat = kind_section(out, "bugfix"), kind_section(out, "feature")
     assert "Recommendation: opus:high" in bug
     assert "Runner-up: sonnet:high" in bug
-    assert "2 tasks" in bug and "5 attempts" in bug  # opus:high evidence
+    assert "Compared on 1 of 2 tasks attempted by every config" in bug
+    assert "1 tasks, 3 attempts" in bug  # opus:high evidence: b1 only, the one common task
+    assert bug.index("Compared on") < bug.index("Recommendation:")
+    assert "Compared on 1 of 1 tasks attempted by every config" in feat
     assert "no config meets the bar" in feat
     assert "Highest success rate: opus:high" in feat
     for sec, cfgs in ((bug, ["sonnet:medium", "opus:high", "sonnet:high", "sonnet:low"]),
@@ -102,8 +105,8 @@ def test_json_matches_text(crucible_home, capsys):
     assert bug["kind"] == "bugfix" and bug["tasks"] == 2 and bug["attempts"] == 15
     rec = bug["recommendation"]
     assert rec["status"] == "recommended" and rec["config"] == "opus:high"
-    assert rec["evidence"]["success_rate"] == 1.0 and rec["evidence"]["tasks"] == 2
-    assert rec["evidence"]["median_cost"] == 4.0 and rec["evidence"]["attempts"] == 5
+    assert rec["evidence"]["success_rate"] == 1.0 and rec["evidence"]["tasks"] == 1
+    assert rec["evidence"]["median_cost"] == 4.0 and rec["evidence"]["attempts"] == 3
     assert rec["runner_up"]["config"] == "sonnet:high"
     assert rec["runner_up"]["median_cost"] == 10.0
     assert f"${rec['evidence']['median_cost']:.4f}" in kind_section(out, "bugfix")
@@ -111,6 +114,12 @@ def test_json_matches_text(crucible_home, capsys):
     assert feat["recommendation"]["best_effort"]["config"] == "opus:high"
     assert [c["config"] for c in bug["configs"]] == [
         "sonnet:medium", "opus:high", "sonnet:high", "sonnet:low"]
+    assert bug["common_tasks"] == ["b1"] and feat["common_tasks"] == ["f1"]
+    assert [c["config"] for c in bug["comparable"]] == [
+        "sonnet:medium", "opus:high", "sonnet:high", "sonnet:low"]
+    assert all(c["tasks"] == 1 for c in bug["comparable"])
+    comp_low = next(c for c in bug["comparable"] if c["config"] == "sonnet:low")
+    assert comp_low["attempts"] == 3 and comp_low["successes"] == 2
 
 
 def test_empty_results_error(capsys):
@@ -149,3 +158,23 @@ def test_recommendation_ranks_by_cost_per_success(crucible_home, capsys):
     assert "Recommendation: opus:high" in out
     assert "Runner-up: sonnet:low" in out
     assert "cost per success $2.2000" in out
+
+
+def test_disjoint_tasks_give_no_recommendation(crucible_home, capsys):
+    for n in (1, 2, 3):
+        make_record(crucible_home, task="d1", kind="docs", config="sonnet:low", n=n,
+                    success=True)
+        make_record(crucible_home, task="d2", kind="docs", config="opus:high", n=n,
+                    success=True, tokens_by_model=opus(M))
+    code, out, _ = run(capsys)
+    assert code == 0
+    assert "Compared on 0 of 2 tasks attempted by every config" in out
+    assert "Recommendation: none; no task was attempted by every config" in out
+    table = [ln for ln in out.splitlines() if ln.startswith("|")]
+    assert len(table) == 4  # the pooled table still lists both configs
+    code, jout, _ = run(capsys, "--json")
+    (kind,) = json.loads(jout)["kinds"]
+    assert kind["common_tasks"] == [] and kind["comparable"] == []
+    assert kind["recommendation"]["status"] == "no_common_tasks"
+    assert kind["recommendation"]["config"] is None
+    assert len(kind["configs"]) == 2

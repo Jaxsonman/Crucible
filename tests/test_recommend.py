@@ -142,3 +142,41 @@ def test_cost_per_success_tie_broken_by_wall_time():
                                row("fast:low", cost=3.0, cps=2.0, wall=5.0)])
     assert out["config"] == "fast:low"
     assert out["runner_up"]["config"] == "slow:low"
+
+
+def test_kind_reports_compare_on_common_tasks():
+    recs = ([rec("t1", "bugfix", "a:low", True) for _ in range(3)]
+            + [rec("t2", "bugfix", "a:low", False) for _ in range(3)]
+            + [rec("t1", "bugfix", "b:low", True, 2 * M) for _ in range(3)])
+    (bug,) = aggregate.kind_reports(recs)
+    assert bug["common_tasks"] == ["t1"]
+    pooled = {r["config"]: r for r in bug["configs"]}
+    comp = {r["config"]: r for r in bug["comparable"]}
+    assert pooled["a:low"]["attempts"] == 6 and pooled["a:low"]["tasks"] == 2
+    assert pooled["a:low"]["success_rate"] == 0.5
+    assert set(comp) == {"a:low", "b:low"}
+    assert comp["a:low"]["attempts"] == 3 and comp["a:low"]["tasks"] == 1
+    out = bug["recommendation"]
+    assert out["status"] == "recommended" and out["config"] == "a:low"
+    assert out["evidence"]["attempts"] == 3 and out["runner_up"]["config"] == "b:low"
+
+
+def test_kind_with_disjoint_tasks_has_no_common_tasks():
+    recs = ([rec("t1", "bugfix", "a:low", True) for _ in range(3)]
+            + [rec("t2", "bugfix", "b:low", True) for _ in range(3)])
+    (bug,) = aggregate.kind_reports(recs)
+    assert bug["common_tasks"] == [] and bug["comparable"] == []
+    assert [r["config"] for r in bug["configs"]] == ["a:low", "b:low"]
+    out = bug["recommendation"]
+    assert out["status"] == "no_common_tasks" and out["config"] is None
+    assert out["evidence"] is None and out["best_effort"] is None and out["runner_up"] is None
+    assert out["min_attempts"] == 3 and out["threshold"] == 0.8
+    assert set(out) == set(aggregate.recommend([]))
+
+
+def test_common_tasks_helper():
+    assert aggregate.common_tasks([]) == []
+    recs = [rec("t2", "k", "a:low", True), rec("t1", "k", "a:low", True),
+            rec("t1", "k", "b:low", True), rec("t2", "k", "b:low", True),
+            rec("t3", "k", "b:low", True)]
+    assert aggregate.common_tasks(recs) == ["t1", "t2"]

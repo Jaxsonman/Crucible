@@ -204,6 +204,18 @@ task's `max_budget_usd`, else at 5.0; `--dry-run` prints the effective cap and i
 (`max budget per attempt: $1.25 (task)`). `crucible task new` templates show the field
 commented out.
 
+**Kind reports.** The cross-task report (`crucible report` without a task id) groups records
+by `task_kind`. Each kind prints the pooled per-config table (`configs`: every attempt in the
+kind, each row with `tasks`), but recommends only from `comparable`: rows aggregated over the
+kind's `common_tasks`, the task ids attempted by every config that has at least one attempt in
+that kind, so a config that only ran the easy task is not compared with one that ran them all.
+The text prints `Compared on N of M tasks attempted by every config` before the recommendation
+lines. With no common task (for example each config ran a different task) `comparable` is
+empty, the recommendation status is `no_common_tasks` with a null config, and the report says
+`Recommendation: none; no task was attempted by every config`. `--json` adds `common_tasks` and
+`comparable` to each kind; the recommendation's `evidence`, `runner_up` and `best_effort` are
+`comparable` rows.
+
 ## Mining
 
 PR mining turns merged PRs into tasks.
