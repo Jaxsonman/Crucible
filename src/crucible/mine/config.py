@@ -31,8 +31,18 @@ _SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_roo
 _RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
 
 
+# Snapshots, data and media are test files (they belong to a suite) but never runnable.
+_NON_CODE_SUFFIXES = frozenset({
+    ".snap", ".json", ".md", ".markdown", ".txt", ".csv", ".yml", ".yaml", ".html", ".css",
+    ".scss", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".pdf", ".map"})
+
+
 def default_is_runnable(path: str) -> bool:
+    """The built-in rule: test-named files, or any file under `__tests__`, except
+    `__snapshots__` and non-code files (`.snap`, `.json`, `.md`, images...)."""
     p = PurePosixPath(path)
+    if "__snapshots__" in p.parts or p.suffix.lower() in _NON_CODE_SUFFIXES:
+        return False
     return bool(_RUNNABLE_NAME.match(p.name)) or "__tests__" in p.parts[:-1]
 _TOP_KEYS = {"suites", "exclude_paths", "max_changed_lines"}
 
@@ -161,7 +171,17 @@ def path_matches(path: str, patterns: list[str]) -> bool:
     """True if repo-relative `path` matches any glob (`{a,b}` alternation is supported). A pattern with no `/` (like `*.md`)
     matches the file name at any depth. A directory pattern (trailing `/`, or no wildcard)
     also matches every file under that directory: `src/utils` and `src/utils/` are anchored at the
-    repo root; a name without a `/` (`vendor`, `vendor/`) matches a directory of that name at any depth."""
+    repo root; a name without a `/` (`vendor`, `vendor/`) matches a directory of that name at any depth.
+    A pattern starting with `!` excludes: the path matches the list when it matches some
+    positive pattern and no `!` pattern (a list of only `!` patterns matches nothing)."""
+    positive = [p for p in patterns if not p.startswith("!")]
+    negative = [p[1:] for p in patterns if p.startswith("!") and len(p) > 1]
+    if negative and _matches_any(path, negative):
+        return False
+    return _matches_any(path, positive)
+
+
+def _matches_any(path: str, patterns: list[str]) -> bool:
     for pat in (x for p in patterns for x in expand_braces(p)):
         if _match_one(path, pat):
             return True
@@ -340,7 +360,7 @@ _DETECTED_HEADER = """\
 """
 _TEMPLATE_HEADER = """\
 # NOTHING DETECTED. `crucible mine` found no marker of a framework preset ({presets}) in the
-# repo root or up to two levels below it, so `suites` is empty. Fill it in (one entry per test
+# repo root or up to three levels below it, so `suites` is empty. Fill it in (one entry per test
 # stack, or copy the closest preset from src/crucible/data/presets/), then run
 # `crucible mine calibrate`.
 #

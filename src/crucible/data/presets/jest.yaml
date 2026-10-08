@@ -1,5 +1,9 @@
-# Jest. Positional arguments are regular expressions matched against file paths; our repo-relative
-# paths contain no regex that matches other files in practice, so `jest <file> ...` runs those files.
+# Jest. `--runTestsByPath` treats the arguments as literal file paths instead of regular
+# expressions, so a path like app/[id]/page.test.tsx (Next.js) selects exactly that file.
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
 name: jest
 markers:
   - {glob: package.json, contains: '"jest"\s*:'}
@@ -10,13 +14,34 @@ test_paths:
   - "{suite_dir}/**/__tests__/**"
   - "{suite_dir}/**/__snapshots__/**"
   - "{suite_dir}/**/__mocks__/**"
-# runnable omitted: the built-in rule (*.test.* / *.spec.* and files under __tests__) matches
-# Jest's default testMatch
-setup: npm install --silent
-test_command: npx jest {tests}
+runnable:
+  # Jest's default testMatch; snapshots and data files under __tests__ are test files but not runnable
+  - "{suite_dir}/**/*.{test,spec}.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"
+  - "{suite_dir}/**/__tests__/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"
+  - "!**/__snapshots__/**"
+setup: npm install --no-package-lock --silent
+test_command: npx jest --runTestsByPath {tests}
 variants:
-  - when: [package-lock.json]
-    setup: npm ci --silent
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup: "{lock_cd}pnpm install --frozen-lockfile"
+    test_command: pnpm exec jest --runTestsByPath {tests}
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+    test_command: yarn jest --runTestsByPath {tests}
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup: "{lock_cd}bun install --frozen-lockfile"
+    test_command: bunx jest --runTestsByPath {tests}
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup: "{lock_cd}npm ci --silent"
+    test_command: npx jest --runTestsByPath {tests}
 notes: >-
-  Uses npm; for yarn or pnpm edit setup (e.g. pnpm install --frozen-lockfile). Add --ci or
-  --runInBand if the suite is flaky in parallel.
+  A changed snapshot (.snap) alone is a test file but selects nothing runnable, so such a
+  candidate is rejected as "no runnable tests". Add --ci or --runInBand if the suite is flaky in
+  parallel. A project whose testMatch differs from the default needs its own runnable globs.

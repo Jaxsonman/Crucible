@@ -1,5 +1,11 @@
-# Mocha. `mocha <file> ...` loads exactly the spec files named (it also reads .mocharc.* for
-# require/ts-node settings). Mocha's default spec is ./test/*.{js,cjs,mjs}.
+# Mocha. `mocha <file> ...` loads the spec files named; it also reads .mocharc.* (require,
+# ts-node, ...). Runnable files are the conventional test-named ones (*.test.*, *.spec.*,
+# test-*, *-test, *_test) plus Mocha's own default spec, the files directly in test/; helpers,
+# fixtures and data under test/ are test files but are not passed to Mocha.
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
 name: mocha
 markers:
   - {glob: package.json, contains: '"mocha"\s*:'}
@@ -11,19 +17,38 @@ test_paths:
   - "{suite_dir}/**/*.spec.js"
   - "{suite_dir}/**/*.spec.ts"
 runnable:
-  - "{suite_dir}/test/**/*.js"
-  - "{suite_dir}/test/**/*.cjs"
-  - "{suite_dir}/test/**/*.mjs"
-  - "{suite_dir}/test/**/*.ts"
-  - "{suite_dir}/**/*.test.js"
-  - "{suite_dir}/**/*.test.ts"
-  - "{suite_dir}/**/*.spec.js"
-  - "{suite_dir}/**/*.spec.ts"
-setup: npm install --silent
+  - "{suite_dir}/**/*.{test,spec}.{js,jsx,cjs,mjs,ts,tsx,mts,cts}"
+  - "{suite_dir}/**/test-*.{js,cjs,mjs,ts,mts,cts}"
+  - "{suite_dir}/**/*-test.{js,cjs,mjs,ts,mts,cts}"
+  - "{suite_dir}/**/*_test.{js,cjs,mjs,ts,mts,cts}"
+  - "{suite_dir}/test/*.{js,cjs,mjs,ts,mts,cts}"
+  - "!**/{fixtures,fixture,helpers,support,mocks,data}/**"
+  - "!**/{helper,helpers,setup,common}.*"
+setup: npm install --no-package-lock --silent
 test_command: npx mocha {tests}
 variants:
-  - when: [package-lock.json]
-    setup: npm ci --silent
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup: "{lock_cd}pnpm install --frozen-lockfile"
+    test_command: pnpm exec mocha {tests}
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+    test_command: yarn mocha {tests}
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup: "{lock_cd}bun install --frozen-lockfile"
+    test_command: bunx mocha {tests}
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup: "{lock_cd}npm ci --silent"
+    test_command: npx mocha {tests}
 notes: >-
-  Helper files under test/ also count as runnable; Mocha loads them harmlessly. TypeScript
-  specs need ts-node configured in .mocharc.
+  A `spec` entry in .mocharc.* is MERGED with the files given on the command line, so a repo
+  whose .mocharc lists spec globs runs the whole configured suite plus the named files:
+  selection degrades to whole-suite (calibration shows it as every test running; remove `spec`
+  from the config or drop {tests} from the command). TypeScript specs need ts-node (or
+  tsx) configured in .mocharc.

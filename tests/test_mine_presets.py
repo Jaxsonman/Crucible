@@ -20,7 +20,7 @@ def gradle_cmd(gradle: str) -> str:
 
 SHIPPED = {
     "pytest", "django", "jest", "vitest", "mocha", "maven", "gradle", "go", "cargo", "rspec",
-    "minitest", "phpunit", "dotnet", "mix",
+    "minitest", "phpunit", "dotnet", "mix", "playwright", "node-test", "npm-test", "make-test",
 }
 
 
@@ -113,23 +113,28 @@ def test_non_mapping_and_bad_yaml_presets(tmp_path):
 CASES = {
     "pytest": (
         {"pytest.ini": "[pytest]\n"},
-        "pytest", ".", "python -m pytest {tests}", (["tests/test_a.py"], ["tests/conftest.py"]),
-        ["tests/test_a.py", "tests/test_b.py"], "python -m pytest tests/test_a.py tests/test_b.py"),
+        "pytest", ".", ".venv/bin/python -m pytest {tests}",
+        (["tests/test_a.py"], ["tests/conftest.py"]),
+        ["tests/test_a.py", "tests/test_b.py"],
+        ".venv/bin/python -m pytest tests/test_a.py tests/test_b.py"),
     "django": (
         {"manage.py": ""},
-        "django", ".", "python manage.py test {modules}", (["app/tests.py"], ["app/tests/x.txt"]),
-        ["app/tests/test_x.py"], "python manage.py test app.tests.test_x"),
+        "django", ".", ".venv/bin/python manage.py test {modules}",
+        (["app/tests.py"], ["app/tests/x.txt"]),
+        ["app/tests/test_x.py"], ".venv/bin/python manage.py test app.tests.test_x"),
     "jest": (
         {"package.json": pkg("jest")},
-        "jest", ".", "npx jest {tests}", (["src/a.test.ts"], ["src/a.test.js.snap"]),
-        ["src/a.test.ts"], "npx jest src/a.test.ts"),
+        "jest", ".", "npx jest --runTestsByPath {tests}",
+        (["src/a.test.ts"], ["src/a.test.js.snap", "src/__tests__/__snapshots__/a.snap"]),
+        ["src/a.test.ts"], "npx jest --runTestsByPath src/a.test.ts"),
     "vitest": (
         {"package.json": pkg("vitest")},
         "vitest", ".", "npx vitest run {tests}", (["src/a.spec.ts"], ["src/a.ts"]),
         ["src/a.spec.ts"], "npx vitest run src/a.spec.ts"),
     "mocha": (
         {"package.json": pkg("mocha")},
-        "mocha", ".", "npx mocha {tests}", (["test/a.test.js", "test/unit/b.js"], ["src/a.js", "test/data.json"]),
+        "mocha", ".", "npx mocha {tests}",
+        (["test/a.test.js", "test/b.js"], ["src/a.js", "test/data.json", "test/unit/b.js"]),
         ["test/a.test.js"], "npx mocha test/a.test.js"),
     "maven": (
         {"pom.xml": "<project/>", "src/test/java/com/x/FooTest.java": ""},
@@ -212,6 +217,26 @@ CASES = {
         (["Tests/FooTests.cs"], []),
         ["Tests/FooTests.cs", "Tests/BarTest.cs"],
         "dotnet test --filter 'FullyQualifiedName~FooTests|FullyQualifiedName~BarTest'"),
+    "playwright": (
+        {"package.json": pkg("@playwright/test"), "playwright.config.ts": ""},
+        "playwright", ".", "npx playwright test {tests}",
+        (["e2e/a.spec.ts", "a.spec.js"], ["e2e/helpers.ts", "e2e/a.test.ts"]),
+        ["e2e/a.spec.ts"], "npx playwright test e2e/a.spec.ts"),
+    "node-test": (
+        {"package.json": json.dumps({"scripts": {"test": "node --test"}})},
+        "node-test", ".", "node --test {tests}",
+        (["test/a.js", "src/b.test.mjs"], ["test/data.json", "src/b.js"]),
+        ["test/a.js"], "node --test test/a.js"),
+    "npm-test": (
+        {"package.json": json.dumps({"scripts": {"test": "tap"}})},
+        "npm-test", ".", "npm test",
+        (["test/a.test.js", "src/b_test.go"], ["src/b.js"]),
+        ["test/a.test.js"], "npm test"),
+    "make-test": (
+        {"Makefile": "test:\n\techo\n"},
+        "make-test", ".", "make test",
+        (["tests/test_a.py", "src/FooTest.java"], ["src/a.py"]),
+        ["tests/test_a.py"], "make test"),
     "mix": (
         {"mix.exs": "defmodule X do\nend\n", "test/a_test.exs": ""},
         "mix", ".", "mix test {tests}",
@@ -264,7 +289,7 @@ def test_spring_boot_backend_plus_react_frontend(tmp_path):
     b, f = suites["backend"], suites["frontend"]
     assert (b.cwd, f.cwd) == ("backend", "frontend")
     assert b.test_command.startswith("./mvnw ") and b.setup.startswith("./mvnw ")
-    assert f.test_command == "npx jest {tests}" and f.setup == "npm ci --silent"
+    assert f.test_command == "npx jest --runTestsByPath {tests}" and f.setup == "npm ci --silent"
     assert mc.path_matches("backend/src/test/java/com/x/FooTest.java", b.test_paths)
     assert mc.path_matches("backend/src/test/resources/a.yml", b.test_paths)
     assert not mc.path_matches("frontend/src/App.test.tsx", b.test_paths)
@@ -290,7 +315,8 @@ def test_django_in_subdir_gets_a_repo_relative_module_root(tmp_path):
     make(tmp_path, {"backend/manage.py": "", "backend/app/tests.py": ""})
     [s] = mc.detect_suites(tmp_path)
     assert (s.cwd, s.module_root) == ("backend", "backend")
-    assert verify.build_command(s, ["backend/app/tests.py"]) == "python manage.py test app.tests"
+    assert verify.build_command(s, ["backend/app/tests.py"]) == (
+        ".venv/bin/python manage.py test app.tests")
     assert mc.path_matches("backend/app/tests/test_x.py", s.test_paths)
     assert not mc.path_matches("other/app/tests.py", s.test_paths)
 
@@ -346,7 +372,7 @@ def test_pytest_config_beats_django_but_conftest_alone_does_not(tmp_path):
     make(tmp_path / "b", {"manage.py": "", "conftest.py": ""})
     assert [(s.name, s.cwd) for s in mc.detect_suites(tmp_path)] == [("a", "a"), ("b", "b")]
     assert [s.test_command for s in mc.detect_suites(tmp_path)] == [
-        "python -m pytest {tests}", "python manage.py test {modules}"]
+        ".venv/bin/python -m pytest {tests}", ".venv/bin/python manage.py test {modules}"]
 
 
 def test_two_presets_in_one_dir_get_unique_names(tmp_path):
@@ -357,7 +383,7 @@ def test_two_presets_in_one_dir_get_unique_names(tmp_path):
 def test_scan_depth_and_skipped_dirs(tmp_path):
     test_go = {"go.mod": "module x\n", "a_test.go": ""}
     make(tmp_path / "services" / "api", test_go)            # depth 2: found
-    make(tmp_path / "a" / "b" / "c", test_go)               # depth 3: not scanned
+    make(tmp_path / "a" / "b" / "c" / "d", test_go)         # depth 4: not scanned
     for skipped in ("vendor", "target", "build", "node_modules", "testdata", ".hidden",
                     "venv", "fixtures"):
         make(tmp_path / skipped, test_go)

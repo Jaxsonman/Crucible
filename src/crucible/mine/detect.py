@@ -2,11 +2,15 @@
 
 Rules (docs/design.md, "Detection"):
 
-- the repo root and up to two levels below it are scanned, skipping dot directories, vendored
+- the repo root and up to three levels below it are scanned, skipping dot directories, vendored
   and build output (`node_modules`, `vendor`, `target`, `build`, ...), virtualenvs and fixture
   directories;
 - a preset matches a directory when any of its markers matches (a file glob in that directory,
-  optionally with a regex over its content);
+  optionally with a regex over its content, optionally also needing test files below it);
+- a `fallback` preset (generic whole-suite runners such as `npm test`) counts only in a
+  directory where no other preset matched;
+- looking for test files ("evidence") skips only dependency and VCS directories (`EVIDENCE_SKIP`),
+  not every name the project scan skips: `build`, `out`, `deps` or `bin` can hold real tests;
 - one suite per (directory, preset); several presets may match one directory (a Django backend
   and its Jest tooling), unless one supersedes the other;
 - a preset with `evidence` only matches a directory with test sources below it;
@@ -26,7 +30,7 @@ from pathlib import Path
 from crucible.mine import config, presets
 from crucible.mine.presets import Preset
 
-MAX_DEPTH = 2
+MAX_DEPTH = 3
 SKIP_DIRS = {
     # dependencies and build output
     "node_modules", "vendor", "target", "build", "dist", "out", "bin", "obj", "deps", "_build",
@@ -34,6 +38,13 @@ SKIP_DIRS = {
     # sample projects used by tests of other tools
     "testdata", "fixtures", "__fixtures__",
 }
+# Evidence for "this project has tests" skips only dependency trees, VCS data and package caches:
+# `target` (cargo packages copy tests/ under target/package; Maven puts reports there) and
+# virtualenvs hold copies that are not the project's tests. Generic names (`build`, `out`,
+# `bin`, `dist`, `env`, `deps`, `obj`, `testdata`) are scanned: they can hold real test sources
+# (the cost is a false positive from a generated copy, which calibration then exposes).
+EVIDENCE_SKIP = {"node_modules", "vendor", "target", "site-packages", "__pycache__", "venv",
+                 "Pods", "_build"}
 _MAX_EVIDENCE_FILES = 200_000
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f*?]")
 
@@ -102,7 +113,8 @@ def _rel(root: Path, d: Path) -> str:
 
 
 def _match_dir(d: Path, preset: Preset) -> _Match | None:
-    hits = [m for m in preset.markers if presets.marker_matches(m, d)]
+    hits = [m for m in preset.markers if presets.marker_matches(m, d)
+            and (not m.evidence or _has_evidence(d, m.evidence))]
     if not hits:
         return None
     strong = [m for m in hits if not m.weak]
@@ -137,10 +149,16 @@ def _retarget_weak(matches: list[_Match], root: Path) -> list[_Match]:
     return out
 
 
+def _vendored(directory: Path) -> bool:
+    name = directory.name
+    return (name.startswith(".") or name in EVIDENCE_SKIP or name.endswith(".egg-info")
+            or (directory / "pyvenv.cfg").is_file())
+
+
 def _has_evidence(d: Path, globs: tuple[str, ...]) -> bool:
     seen = 0
     for base, dirs, files in os.walk(d):
-        dirs[:] = sorted(x for x in dirs if _scannable(Path(base) / x))
+        dirs[:] = sorted(x for x in dirs if not _vendored(Path(base) / x))
         for name in files:
             seen += 1
             rel = (Path(base) / name).relative_to(d).as_posix()
@@ -163,6 +181,12 @@ def _resolve(matches: list[_Match]) -> list[_Match]:
         superseded = {s for m in group for s in m.preset.supersedes}
         kept.extend(m for m in group if m.preset.name not in superseded)
     return kept
+
+
+def _drop_fallbacks(matches: list[_Match]) -> list[_Match]:
+    """A fallback preset only counts in a directory where no other preset matched."""
+    framework_dirs = {m.directory for m in matches if not m.preset.fallback}
+    return [m for m in matches if not (m.preset.fallback and m.directory in framework_dirs)]
 
 
 def _drop_aggregated(matches: list[_Match]) -> list[_Match]:
@@ -195,7 +219,7 @@ def detect(repo_root: Path, catalog: dict[str, Preset] | None = None) -> list[De
                 matches.append(m)
     matches = _retarget_weak(matches, root)
     matches = [m for m in matches if not m.preset.evidence or _has_evidence(m.directory, m.preset.evidence)]
-    matches = _drop_aggregated(_resolve(matches))
+    matches = _drop_aggregated(_drop_fallbacks(_resolve(matches)))
     matches.sort(key=lambda m: (-len(m.directory.relative_to(root).parts), _rel(root, m.directory),
                                 m.preset.name))
     used: set[str] = set()
@@ -203,7 +227,7 @@ def detect(repo_root: Path, catalog: dict[str, Preset] | None = None) -> list[De
     for m in matches:
         rel = _rel(root, m.directory)
         name = _unique_name(m.directory.name if rel != "." else m.preset.name, m.preset.name, used)
-        fields = presets.build_fields(m.preset, rel, m.directory)
+        fields = presets.build_fields(m.preset, rel, m.directory, root)
         suite = config.Suite(name=name, cwd=rel, **fields)
         found.append(Detection(suite, m.preset.name, m.marker, m.preset.notes))
     return found

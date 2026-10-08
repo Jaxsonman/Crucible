@@ -1,0 +1,37 @@
+# Generic fallback: a Makefile (GNUmakefile, makefile) with a `test` target, or a justfile with a
+# `test` recipe, and no framework preset matched this directory. Runs the whole suite.
+name: make-test
+fallback: true
+markers:
+  - {glob: "{Makefile,GNUmakefile,makefile}", contains: '^test\s*:'}
+  - {glob: "{justfile,Justfile,.justfile}", contains: '^@?test(?:\s[^:\n]*)?:'}
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/tests/**"
+  - "{suite_dir}/spec/**"
+  - "{suite_dir}/**/__tests__/**"
+  - "{suite_dir}/**/test_*"
+  - "{suite_dir}/**/*_test.*"
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/*_spec.*"
+  - "{suite_dir}/**/*Test.*"
+  - "{suite_dir}/**/*Tests.*"
+runnable:
+  - "{suite_dir}/**/test_*"
+  - "{suite_dir}/**/*_test.*"
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/*_spec.*"
+  - "{suite_dir}/**/*Test.*"
+  - "{suite_dir}/**/*Tests.*"
+setup: ""
+test_command: just test
+variants:
+  - when: [Makefile, GNUmakefile, makefile]
+    test_command: make test
+notes: >-
+  Lowest fidelity: no {tests} placeholder, so every candidate runs the whole `test` target (slow,
+  and it may need toolchains or services that setup must provide). A starting point for
+  `crucible mine calibrate` or discovery to refine. When both a Makefile and a justfile exist,
+  `make test` is used.

@@ -8,10 +8,11 @@ markers:
   - {glob: "*.sln", aggregator: true}
   - {glob: "*.slnx", aggregator: true}
   - {glob: "*.csproj", contains: 'Microsoft\.NET\.Test\.Sdk'}
-evidence: ["**/*Test.cs", "**/*Tests.cs"]
+evidence: ["**/*Test.cs", "**/*Tests.cs", "**/UnitTest*.cs"]
 test_paths:
   - "{suite_dir}/**/*Tests.cs"
   - "{suite_dir}/**/*Test.cs"
+  - "{suite_dir}/**/UnitTest*.cs"
   - "{suite_dir}/**/*.Tests/**"
   - "{suite_dir}/**/*.Test/**"
   - "{suite_dir}/**/Tests/**"
@@ -19,6 +20,7 @@ test_paths:
 runnable:
   - "*Tests.cs"
   - "*Test.cs"
+  - "UnitTest*.cs"
 timeout: 1200
 setup_timeout: 3600
 setup: dotnet restore

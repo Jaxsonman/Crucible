@@ -4,7 +4,7 @@
 name: minitest
 markers:
   - {glob: test/test_helper.rb}
-  - {glob: Gemfile, contains: 'minitest'}
+  - {glob: Gemfile, contains: '(?m)^\s*gem\s+[''"]minitest'}
   - {glob: Rakefile, contains: 'TestTask'}
 evidence: ["test/**/*_test.rb", "test/**/test_*.rb", "**/test/**/*_test.rb", "**/test/**/test_*.rb"]
 test_paths:

@@ -25,6 +25,10 @@ def pkg(deps: str) -> str:
     return json.dumps({"devDependencies": {deps: "^1.0.0"}})
 
 
+VENV = "python3 -m venv .venv && .venv/bin/python -m pip install -q -U pip"
+PIP = ".venv/bin/python -m pip install -q"
+
+
 def by_name(suites):
     return {s.name: s for s in suites}
 
@@ -36,9 +40,9 @@ def test_detect_django(tmp_path):
     write(tmp_path, "requirements.txt")
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "django"
-    assert s.test_command == "python manage.py test {modules}"
+    assert s.test_command == ".venv/bin/python manage.py test {modules}"
     assert s.module_root == "."
-    assert s.setup == "pip install -q -r requirements.txt"
+    assert s.setup == f"{VENV} && {PIP} -r requirements.txt"
     assert s.cwd == "."
     assert mc.path_matches("app/tests/test_x.py", s.test_paths)
 
@@ -47,8 +51,8 @@ def test_detect_pytest_pyproject(tmp_path):
     write(tmp_path, "pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = ['tests']\n")
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "pytest"
-    assert s.test_command == "python -m pytest {tests}"
-    assert s.setup == "pip install -q -e ."
+    assert s.test_command == ".venv/bin/python -m pytest {tests}"
+    assert s.setup == f"{VENV} && {PIP} pytest"
     assert mc.path_matches("tests/test_a.py", s.test_paths)
     assert not mc.path_matches("src/a.py", s.test_paths)
 
@@ -64,14 +68,14 @@ def test_conftest_only_subdir_is_not_its_own_project(tmp_path):
     write(tmp_path, "requirements.txt")
     write(tmp_path, "tests/conftest.py")
     [s] = mc.detect_suites(tmp_path)
-    assert (s.name, s.cwd, s.setup) == ("pytest", ".", "pip install -q -r requirements.txt")
+    assert (s.name, s.cwd, s.setup) == ("pytest", ".", f"{VENV} && {PIP} -r requirements.txt && {PIP} pytest")
 
 
 def test_conftest_in_subdir_with_bare_pyproject_gives_root_suite(tmp_path):
     write(tmp_path, "pyproject.toml", "[project]\nname = 'x'\n")
     write(tmp_path, "tests/conftest.py")
     [s] = mc.detect_suites(tmp_path)
-    assert (s.name, s.cwd, s.setup) == ("pytest", ".", "pip install -q -e .")
+    assert (s.name, s.cwd, s.setup) == ("pytest", ".", f"{VENV} && {PIP} -e . && {PIP} pytest")
     assert mc.path_matches("tests/test_a.py", s.test_paths)
 
 
@@ -90,8 +94,8 @@ def test_detect_jest_without_lockfile(tmp_path):
     write(tmp_path, "package.json", pkg("jest"))
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "jest"
-    assert s.test_command == "npx jest {tests}"
-    assert s.setup == "npm install --silent"
+    assert s.test_command == "npx jest --runTestsByPath {tests}"
+    assert s.setup == "npm install --no-package-lock --silent"
 
 
 def test_detect_django_plus_vitest_gives_two_suites(tmp_path):

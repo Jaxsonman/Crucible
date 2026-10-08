@@ -3,7 +3,7 @@
 name: rspec
 markers:
   - {glob: .rspec}
-  - {glob: Gemfile, contains: '\brspec'}
+  - {glob: Gemfile, contains: '(?m)^\s*gem\s+[''"]rspec'}
   - {glob: spec/spec_helper.rb}
 supersedes: [minitest]
 evidence: ["spec/**/*_spec.rb", "**/spec/**/*_spec.rb"]

@@ -164,7 +164,9 @@ PR mining turns merged PRs into tasks.
   `test_paths`, `runnable` and `exclude_paths`. A directory pattern, meaning a trailing `/` or no wildcard at all,
   also matches every file under that directory: `src/utils` and `src/utils/` are anchored at the
   repo root, while a name without `/` (`vendor`, `vendor/`) matches a directory (or file) of that
-  name at any depth.
+  name at any depth. A pattern starting with `!` excludes: a path matches a list when it matches
+  some positive pattern and no `!` pattern (`**/__tests__/**/*.js` with `!**/__snapshots__/**`);
+  a list of only `!` patterns matches nothing.
 - Mining state lives under `.crucible/mine/` and is git-ignored (`crucible init` adds `mine/`
   to `.crucible/.gitignore`; an existing home gets it on the next `crucible mine`).
 - Task front matter gains an optional `source:` (PR URL, or `commit:<merge sha>` without `gh`).
@@ -200,7 +202,7 @@ placeholder, an unknown name or filter is an error naming `suites[i].test_comman
 `{modules}` needs `module_root`. A command with no placeholder is allowed and runs the whole
 suite. `runnable` (optional, a non-empty list of globs, matched like `test_paths`) says which
 of a suite's changed test files are passed to the runner; omitted, the built-in rule applies
-(see Verification). `timeout` (test step, default 600) and `setup_timeout` (setup step,
+(see Verification; `runnable` and `test_paths` accept `!` negations). `timeout` (test step, default 600) and `setup_timeout` (setup step,
 default 1800) are positive numbers of seconds. `cwd` and `module_root` must stay inside the repo. `env`
 values longer than 7 characters whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
 `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
@@ -213,38 +215,65 @@ pasting real secrets). Unknown fields are errors (non-string keys are reported t
 
 Language knowledge lives in data, not code: `src/crucible/data/presets/<name>.yaml` (one file
 per test runner; shipped in the wheel and read with `importlib.resources`, so it works from an
-installed plugin). Shipped: pytest, django, jest, vitest, mocha, maven, gradle (Java and
-Kotlin), go, cargo, rspec, minitest, phpunit, dotnet, mix. `mine/presets.py` loads and validates
+installed plugin). Shipped: pytest, django, jest, vitest, mocha, playwright, node-test, maven,
+gradle (Java and Kotlin), go, cargo, rspec, minitest, phpunit, dotnet, mix, and two generic
+fallbacks, npm-test and make-test. `mine/presets.py` loads and validates
 them (a bad file is an error naming `<file>: <field>`; a test loads every shipped preset).
 
 A preset has `name` (= file name), `markers`, `test_paths`, `test_command`, `notes` (why the
 command is right) and optionally `runnable`, `setup`, `module_root`, `env`, `timeout`,
-`setup_timeout`, `evidence`, `supersedes`, `project_files` and `variants`:
+`setup_timeout`, `evidence`, `supersedes`, `fallback`, `project_files` and `variants`:
 
-- `markers`: `{glob, contains?, weak?, aggregator?, wins_over?}`. `glob` names files in the
-  directory itself (`pom.xml`, `*.sln`, `test/test_helper.rb`); `contains` is a regex searched in
-  the file. A directory matches the preset when any marker matches.
+- `markers`: `{glob, contains?, evidence?, weak?, aggregator?, wins_over?}`. `glob` names files in
+  the directory itself (`pom.xml`, `*.sln`, `test/test_helper.rb`; `{a,b}` alternation works);
+  `contains` is a regex searched in the file (multi-line, so `^` anchors a line; commented-out
+  lines such as `# gem 'rspec'` must be excluded by the regex); a marker's own `evidence` globs
+  must also find a file below the directory (pytest: `test_*.py` under `tests/` next to any
+  Python project file). A directory matches the preset when any marker matches.
 - `{suite_dir}` (in `test_paths`, `runnable`, `module_root`, `test_command`) is the suite's
   directory relative to the repo root, substituted at detection time; for the root it is `.`
   and a following `/` vanishes (`{suite_dir}/src/test/**` becomes `src/test/**`). This is how a
   preset yields correct repo-relative globs and `module:` roots for a suite in `backend/`.
   Inside a `test_command` placeholder argument the directory is escaped (`\`, `|`, `}`).
-- `variants`: `[{when: [file globs], setup?, test_command?, module_root?}]`; the first whose
-  file exists in the directory overrides those fields (`mvnw`/`gradlew` wrappers, `package-lock.json`
-  for `npm ci`, `Gemfile` for `bundle exec`).
+- `variants`: `[{when: [file globs], ancestors?, setup?, test_command?, module_root?}]`; the first
+  whose file exists in the directory overrides those fields (`mvnw`/`gradlew` wrappers, the JS
+  lockfiles, `Gemfile` for `bundle exec`, `uv.lock`/`poetry.lock`/`Pipfile.lock`). With
+  `ancestors: true` the file is also looked for in the directories above the suite up to the repo
+  root (a workspace root); the suite directory is tried first with every variant, then each parent,
+  so the nearest lockfile wins. `{lock_cd}` in such a `setup` is `cd <that directory> && ` (empty
+  when it is the suite directory) and `{suite_cd}` the `cd` back.
+- `setup` is a string or a list of steps, joined with ` && ` at detection time so `mine.yaml`
+  holds one plain command. A step is a string, or `{run, when?, contains?, unless?}` (included
+  when a `when` file exists, optionally containing `contains`, and no `unless` file exists), or
+  `{first: [steps]}` (the first included alternative wins). The Python presets use this to
+  create `.venv`, install the requirements files that exist, then the project with a
+  `test`/`tests`/`testing`/`dev` extra when one is declared (else plain `-e .`).
+- `fallback: true` marks a generic whole-suite preset (`npm-test`, `make-test`): it counts only
+  in a directory where no non-fallback preset matched.
+- `runnable` and `test_paths` accept `!pattern` negations (see Mining, globs).
 - `evidence`: globs (relative to the suite dir, searched recursively) of which one must match
   some file, so a `pom.xml` or `go.mod` without any test source is not a suite.
 - `supersedes` / marker `wins_over` / `weak`: see precedence below. `project_files` lists what
   makes a directory a project of the ecosystem. `aggregator`: see below.
 
-`detect_suites(repo_root)` (`mine/detect.py`) scans the repo root and up to two levels below
+`detect_suites(repo_root)` (`mine/detect.py`) scans the repo root and up to three levels below
 it, skipping dot directories, `node_modules`, `vendor`, `target`, `build`, `dist`, `out`, `bin`,
 `obj`, `deps`, `_build`, virtualenvs (`venv`, `env`, any directory with `pyvenv.cfg`), `testdata`,
-`fixtures`, and directory names containing control characters or `*`/`?`. It makes one suite per
+`fixtures`, and directory names containing control characters or `*`/`?`. Looking for test files
+(`evidence`) skips less: only `node_modules`, `vendor`, `target`, `site-packages`, `__pycache__`,
+`venv`, `Pods`, `_build`, dot directories and virtualenvs, so test sources under `build/`, `out/`,
+`deps/` or `bin/` count (`target/` is skipped because `cargo package` copies `tests/` there).
+It makes one suite per
 (directory, preset). Suite names are the directory name (the preset name for the root),
 sanitised to `[A-Za-z0-9_.-]`; a clash appends `-<preset>` (then a counter). Suites are listed
-deepest directory first, so a nested suite owns its files (first suite whose `test_paths`
-match) before an enclosing suite's `**` globs can.
+deepest directory first.
+
+Ownership of a test file (`candidates.owning_suite`, also used for the verification plan): among
+the suites whose `test_paths` match, the deepest `cwd` wins; within that depth, a suite whose
+`runnable` rule accepts the file; then config order. So a root Cargo suite's `**/tests/**` does
+not take `tests/test_a.py` from a pytest suite in the same directory, and an `e2e/` Playwright
+suite owns its specs over a root Jest suite. Files nobody can run (helpers, fixtures) go to the
+first of the deepest matching suites.
 
 Precedence in one directory: a strong (`pytest.ini`, `[tool.pytest]`, `[tool:pytest]`, tox
 `[pytest]`) pytest marker beats Django, since a Django project with an explicit pytest config
@@ -267,7 +296,9 @@ How each preset selects tests (exact commands and the reasoning are in the prese
 
 | preset | selection |
 | --- | --- |
-| pytest, rspec, minitest, mocha, jest, vitest, mix | the changed file paths (`python -m pytest`, `rspec`, `ruby -Itest ...`, `npx mocha`, `npx jest`, `npx vitest run`, `mix test`) |
+| pytest, rspec, minitest, mocha, vitest, playwright, node-test, mix | the changed file paths (`.venv/bin/python -m pytest`, `rspec`, `ruby -Itest ...`, `npx mocha`, `npx vitest run`, `npx playwright test`, `node --test`, `mix test`) |
+| jest | `npx jest --runTestsByPath <files>` (literal paths, so `app/[id]/page.test.tsx` works) |
+| npm-test, make-test | whole suite (`<pm> test`, `make test`, `just test`); lowest fidelity, refined by calibration or discovery |
 | django | dotted module labels for `manage.py test`, from `module_root: {suite_dir}` |
 | maven | Surefire `-Dtest=` with comma-joined class simple names plus `-Dsurefire.failIfNoSpecifiedTests=false` |
 | gradle | one `--tests \*.<Class>` per changed class, with a temporary init script (`-I`) setting `filter.failOnNoMatchingTests = false` so multi-project builds do not fail sub-projects without matches |
@@ -275,6 +306,18 @@ How each preset selects tests (exact commands and the reasoning are in the prese
 | cargo | `cargo test --workspace --test <stem>` per changed `tests/*.rs` file (inline unit tests are not selectable) |
 | phpunit | `--filter 'A\|B'`, a class-name regex, because the CLI takes a single path |
 | dotnet | `--filter 'FullyQualifiedName~A\|FullyQualifiedName~B'` |
+
+The JS presets (jest, vitest, mocha, playwright, node-test, npm-test) pick the package manager
+from the lockfile: `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile` and `pnpm exec <runner>`,
+`yarn.lock` `yarn install --frozen-lockfile` (`--immutable` with `.yarnrc.yml`) and `yarn <runner>`,
+`bun.lockb`/`bun.lock` `bun install --frozen-lockfile` and `bunx <runner>`, `package-lock.json`
+`npm ci` and `npx <runner>`; without a lockfile `npm install --no-package-lock` (the tree gets no
+lockfile). The lockfile may sit in an ancestor directory (workspace root): install then runs there
+(`cd ../.. && pnpm install ...`). Python presets use a `.venv` in the suite directory, or
+`uv run`/`poetry run`/`pipenv run` with a lockfile. pytest is detected from a config file, from
+being listed as a dependency (pyproject, requirements, setup.cfg/py, tox, Pipfile) or from
+`test_*.py` files under `tests/` or `test/` next to a Python project file. Mocha's `.mocharc`
+`spec` entries are merged with the positional files, which degrades selection to whole-suite.
 
 Gradle matches by simple name with a wildcard instead of deriving a fully qualified class name:
 that works for Java and Kotlin source sets and multi-project builds without a package root.
@@ -352,7 +395,7 @@ contains `.crucible/`.
 (added + deleted over every changed file), `counted_lines` (the same, skipping non-test files
 that match `exclude_paths`, so lockfiles, docs and generated files do not count; test files
 always count; this is what `max_changed_lines`/`--max-lines` is compared with, and the
-"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning the test files, config order; each test file is owned by the first suite whose `test_paths` match it; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional `url`, `labels`, `branch`, `issues`, `body`.
+"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning the test files, config order; each test file is owned by the suite `owning_suite` picks: deepest `cwd`, then one whose `runnable` accepts it, then config order; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional `url`, `labels`, `branch`, `issues`, `body`.
 File lists come from `git diff --name-status/--numstat -z --no-renames base merge` (a rename is a
 delete plus an add; binary files count 0 lines). Sources build candidates with `make_candidate`;
 `filter_candidates` applies the exclusions. `crucible mine --json` prints
@@ -396,7 +439,9 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   *runnable* are passed to the test command. A suite with `runnable` globs uses them (each file
   follows the rule of the suite owning it). Otherwise the built-in rule applies: file name
   `test_*.py`, `*_test.py`, `tests.py`, `*.test.<ext>` or `*.spec.<ext>`, or any file under a
-  `__tests__` directory (`config.default_is_runnable`). Other files under `test_paths`
+  `__tests__` directory (`config.default_is_runnable`), but never a file under `__snapshots__` or
+  with a non-code suffix (`.snap`, `.json`, `.md`, images...), so a candidate whose only test
+  change is a snapshot has no runnable tests. Other files under `test_paths`
   (conftest, fixtures, helpers) are overlaid but not passed. No runnable file means rejected
   `no runnable tests`, also for a command without placeholders (which then runs the whole suite).
 - **Several suites.** A candidate whose test files fall in more than one suite is a normal

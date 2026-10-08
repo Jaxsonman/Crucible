@@ -132,7 +132,7 @@ def suite_plan(c: Candidate, suites: list[Suite]) -> list[tuple[Suite, list[str]
 
 def suite_plan_for(suites: list[Suite], files: list[str], *, only_runnable: bool = False,
                    ) -> list[tuple[Suite, list[str]]]:
-    """Split `files` by owner: each belongs to the first suite whose `test_paths` match it.
+    """Split `files` by owner: each belongs to the suite `owning_suite` picks.
     With `only_runnable`, a suite keeps just the files its own runnable rule accepts."""
     plan = []
     for s in suites:

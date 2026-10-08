@@ -10,8 +10,10 @@ test_paths:
   - "{suite_dir}/**/test/**"
 runnable:
   - "*_test.exs"
-setup: mix deps.get
+setup: mix local.hex --force --if-missing && mix local.rebar --force --if-missing && mix deps.get
+env:
+  MIX_ENV: test
 test_command: mix test {tests}
 notes: >-
   Umbrella projects resolve paths per app; if calibration reports "no tests", run mix from the
-  app directory instead. Hex/rebar may need `mix local.hex --force` in setup on a fresh machine.
+  app directory instead. Setup installs Hex and rebar (needed on a fresh machine) and runs with MIX_ENV=test.

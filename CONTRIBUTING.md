@@ -45,12 +45,19 @@ test case; no Python changes.
    `docs/design.md` ("Presets and detection"):
    - `markers`: how to recognise the runner (`glob` for files in the directory itself, optional
      `contains` regex). Add `aggregator: true` to the marker of a multi-module root.
-   - `evidence`: add it when the marker alone does not prove tests exist (build files).
+   - `evidence`: add it when the marker alone does not prove tests exist (build files); a
+     marker can carry its own `evidence` globs. `contains` regexes must ignore commented lines
+     (`(?m)^\s*gem\s+['"]rspec`).
    - `test_paths` (include fixtures and resources), `runnable` (the real file naming of that
      ecosystem; omit it only for the built-in Python/JS rule), `setup`, `test_command`.
    - Write the command from the runner's documented CLI and justify it in a comment at the top
      of the file; `notes` says what to watch for. Use `{suite_dir}` so globs and `module:` roots
-     are right for a suite in a sub-directory. `variants` switch on wrapper scripts or lockfiles.
+     are right for a suite in a sub-directory. `variants` switch on wrapper scripts or lockfiles
+     (`ancestors: true` also looks in parent directories, for a workspace-root lockfile).
+   - `runnable` and `test_paths` accept `!pattern` exclusions (a snapshot directory, helpers).
+     `setup` may be a list of conditional steps (`{run, when, contains, unless}` or `{first: [...]}`)
+     joined into one command at detection time. Set `fallback: true` only for a generic
+     whole-suite runner that must apply when no framework preset matched.
 2. Add a case to `CASES` in `tests/test_mine_presets.py`: a tiny fixture layout, the expected
    suite name, `cwd` and `test_command`, which paths are runnable, and the command rendered for
    sample test files. `test_shipped_presets_load_and_validate` already loads every preset, and a

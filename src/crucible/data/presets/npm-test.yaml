@@ -1,0 +1,59 @@
+# Generic fallback: package.json has a real `scripts.test` (not npm's "no test specified"
+# placeholder) and no framework preset matched this directory. Runs the whole suite through the
+# package manager, so nothing is selected per file.
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
+name: npm-test
+fallback: true
+markers:
+  - {glob: package.json, contains: '(?s)"scripts"\s*:\s*\{[^{}]*?"test"\s*:\s*"(?!"|(?:[^"\\]|\\.)*no test specified)'}
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/tests/**"
+  - "{suite_dir}/spec/**"
+  - "{suite_dir}/**/__tests__/**"
+  - "{suite_dir}/**/test_*"
+  - "{suite_dir}/**/*_test.*"
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/*_spec.*"
+  - "{suite_dir}/**/*Test.*"
+  - "{suite_dir}/**/*Tests.*"
+runnable:
+  - "{suite_dir}/**/test_*"
+  - "{suite_dir}/**/*_test.*"
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/*_spec.*"
+  - "{suite_dir}/**/*Test.*"
+  - "{suite_dir}/**/*Tests.*"
+  - "!**/__snapshots__/**"
+setup: npm install --no-package-lock --silent
+test_command: npm test
+variants:
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup: "{lock_cd}pnpm install --frozen-lockfile"
+    test_command: pnpm test
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+    test_command: yarn test
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup: "{lock_cd}bun install --frozen-lockfile"
+    test_command: bun run test
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup: "{lock_cd}npm ci --silent"
+    test_command: npm test
+notes: >-
+  Lowest fidelity: no {tests} placeholder, so every candidate runs the whole `npm test` script
+  (slow, and the base side must fail for the verdict to mean anything). It is a starting point
+  for `crucible mine calibrate` or discovery to refine: replace it with the real runner's
+  command once known.
