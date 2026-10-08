@@ -13,9 +13,10 @@ config can run unchanged. Use the `crucible` command (on PATH while the plugin i
 
 ## 0. Make sure there is a Crucible home
 
-If the repo has no `.crucible/` directory, run `crucible init` first (it needs a git repo). Run every later `crucible` command from inside the
-repo. The task format is a `task.md` with `## What`, `## Why` and `## Acceptance criteria`
-sections; the scaffold from step 2 shows the exact front matter.
+If the repo has no `.crucible/` directory, run `crucible init` first (it needs a git repo). Run
+every later `crucible` command from inside the repo. The task format is a `task.md` with
+`## What`, `## Why` and `## Acceptance criteria` sections; the scaffold from step 2 shows the
+exact front matter.
 
 ## 1. Gather inputs (ask only for what's missing, one question at a time)
 
@@ -29,7 +30,8 @@ sections; the scaffold from step 2 shows the exact front matter.
   (`crucible task new` pins its SHA); it warns if the working tree is dirty: uncommitted
   changes are **not** included.
 - **Kind:** `feature`, `bugfix`, `refactor`, `docs`, `test`, or the user's own label. Reports
-  group recommendations by kind, so reuse existing kinds (`grep -h '^kind:' .crucible/tasks/*/task.md`).
+  group recommendations by kind, so reuse existing kinds
+  (`grep -h '^kind:' .crucible/tasks/*/task.md`).
 - **Task id:** kebab-case, `^[a-z0-9][a-z0-9-]{0,63}$`, and not already in `.crucible/tasks/`.
 
 ## 2. Scaffold and write `task.md`
@@ -96,5 +98,8 @@ W=$(mktemp -d) && git -C <repo> archive <ref> | tar -x -C "$W"
   criteria the check covers and which only the judge covers, and whether step 4 confirmed
   fail-before and pass-after. Then give the run command
   (`/crucible:run <id> --matrix default --repeat 3`, or
-  `crucible run .crucible/tasks/<id> --matrix default --repeat 3 --judge`).
-- Do not start a real run yourself; it spends the user's usage. Do not commit unless asked (`.crucible/results/` is git-ignored; tasks are yours to commit).
+  `crucible run .crucible/tasks/<id> --matrix default --repeat 3`). `--judge` is optional when
+  the task has a `check.sh` (the check decides success and the judge is only advisory); add it
+  only for a task with no check or when the user wants the extra opinion.
+- Do not start a real run yourself; it spends the user's usage. Do not commit unless asked
+  (`.crucible/results/` is git-ignored; tasks are yours to commit).

@@ -41,7 +41,8 @@ set `CRUCIBLE_HOME` to a pytest `tmp_path` copy and never write into the real `t
 - **Task**: one unit of work, defined in `tasks/<task-id>/task.md`.
 - **Config**: a model + effort level, written `model:effort`, e.g. `opus:high`, `sonnet:medium`.
 - **Batch**: one `crucible run` invocation. Id: `YYYYMMDDTHHMMSSZ-<4 hex>` (UTC).
-- **Attempt**: one config running the task once inside a batch. `--repeat N` gives N attempts per config.
+- **Attempt**: one config running the task once inside a batch. `--repeat N` gives N attempts
+  per config.
 
 ## Task document
 
@@ -67,7 +68,8 @@ source_lines: 42              # optional; written by mine scaffold (counted chan
 ```
 
 The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) plus the
-What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
+What, Why and Acceptance criteria sections, passed through as written except that wrapped
+criteria are joined into single lines (rules below). The prompt text and its SHA-256 are
 stored in every attempt record so identical input can be proven.
 
 Acceptance criteria are the section's bullets (`-` or `*`), used by both the agent prompt and
@@ -80,6 +82,18 @@ criterion each. A blank line ends a bullet. A section with no bullet fails valid
 blank line) fails with `has text outside bullets`. Fixing the old first-line-only parsing
 changed the prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed
 warning covers that and no attempt was rerun.
+
+## Executor
+
+Each attempt runs the `claude` CLI headless in a fresh workspace (flags and output format in
+`docs/claude-headless.md`).
+
+**Isolation versus fidelity.** By default every attempt runs with `--safe-mode`, which drops
+CLAUDE.md, skills, hooks, auto memory and MCP servers. Attempts are therefore reproducible and
+comparable across machines, but they run without the project's own instructions: a config is
+measured on the task text alone, not on how it behaves with the team's CLAUDE.md. That is
+deliberate. `CRUCIBLE_ISOLATION=bare` swaps in the stricter `--bare`. A flag to include the
+project's CLAUDE.md at `ref` is an open follow-up.
 
 ## Results layout
 
@@ -270,10 +284,11 @@ message per problem, each naming its field, e.g. `suites[0].test_command: requir
 `{modules}` needs `module_root`. `regression_command` is optional, a plain command with no
 placeholders (`{tests}` or `{modules}` in it is an error). `cwd` and `module_root` must stay
 inside the repo. `env` values longer than 7 characters whose names contain `KEY`, `TOKEN`,
-`SECRET`, `PASSWORD`, `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
-start with `dummy`; and any value that is a URL with embedded credentials
-(`scheme://user:pass@host`) is rejected unless the password starts with `dummy` (guard against
-pasting real secrets). Unknown fields are errors (non-string keys are reported too).
+`SECRET`, `PASSWORD`, `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`,
+so `PATH` is fine) must start with `dummy`; and any value that is a URL with embedded
+credentials (`scheme://user:pass@host`) is rejected unless the password starts with `dummy`
+(guard against pasting real secrets). Unknown fields are errors (non-string keys are reported
+too).
 `exclude_paths` and `max_changed_lines` default to the values above when omitted.
 
 `detect_suites(repo_root)` looks in the repo root and one level down for pytest (`pytest.ini`,
@@ -299,7 +314,10 @@ empty `regression_command`, so the written file loads back to exactly the detect
 (added + deleted over every changed file), `counted_lines` (the same, skipping non-test files
 that match `exclude_paths`, so lockfiles, docs and generated files do not count; test files
 always count; this is what `max_changed_lines`/`--max-lines` is compared with, and the
-"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning the test files, config order; each test file is owned by the first suite whose `test_paths` match it; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional `url`, `labels`, `branch`, `issues`, `body`.
+"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning
+the test files, config order; each test file is owned by the first suite whose `test_paths`
+match it; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional
+`url`, `labels`, `branch`, `issues`, `body`.
 File lists come from `git diff --name-status/--numstat -z --no-renames base merge` (a rename is a
 delete plus an add; binary files count 0 lines). Sources build candidates with `make_candidate`;
 `filter_candidates` applies the exclusions. `crucible mine --json` prints
@@ -329,8 +347,9 @@ local source; `--local` forces it.
 
 `crucible mine show <id> [--json]` prints one candidate (listed or excluded, either source) plus
 `test_diff` and `non_test_diff` (the diffs base->merge of its test and non-test files) and
-`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional subcommand (`show`, `scaffold`,
-`prove`, `leakcheck`) and shares `--branch --limit --max-lines --local --json` with it.
+`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional
+subcommand (`show`, `scaffold`, `prove`, `leakcheck`) and shares
+`--branch --limit --max-lines --local --json` with it.
 
 ### Verification (`mine/verify.py`)
 
@@ -357,11 +376,12 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   fresh dir under `paths.work_dir()/mine/`, overlay the PR's test files at their merge versions
   (added and modified are written with their git mode, so `100755` stays executable and `120000`
   becomes a symlink; deleted are removed; a write whose parent directory is a symlink, or that
-  resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run `setup` (if any) in the suite `cwd`,
-  then the test command, which must exit non-zero. Then export merge to another fresh dir, setup,
-  same command, which must exit zero. Setup and tests run via `bash -c` in their own process
-  group, with `os.environ` plus the suite `env`, each step killed after `--timeout` seconds
-  (default 600). Dirs are removed afterwards unless `--keep`, which prints their paths.
+  resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run
+  `setup` (if any) in the suite `cwd`, then the test command, which must exit non-zero. Then
+  export merge to another fresh dir, setup, same command, which must exit zero. Setup and tests
+  run via `bash -c` in their own process group, with `os.environ` plus the suite `env`, each
+  step killed after `--timeout` seconds (default 600). Dirs are removed afterwards unless
+  `--keep`, which prints their paths.
 - **Placeholders.** `{tests}`: runnable files relative to the suite `cwd`. `{modules}`: the same
   files relative to `module_root`, `.py` stripped, `/` turned into `.`. Each path is
   shell-quoted with `shlex.quote`. A suite with `module_root` rejects a candidate whose runnable
@@ -370,10 +390,13 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   `setup failed at base|merge` (setup failing is never counted as "fails before"), `timeout`,
   `test outside module_root` or `no runnable tests`.
 - **Cache.** `<home>/mine/verify/<merge sha>.json` (outcome, reason, suite, `suite_hash`,
-  command, timings, log paths) with the step logs beside it (`<merge>.<base|merge>-<setup|test>.log`; with several suites `<merge>.<side>-<suite>-<setup|test>.log`).
-  An entry is reused only while the involved suites' settings are unchanged (one suite: its
-  `settings_hash()`, so older entries stay valid; several: a hash over every suite's hash); `--force` reruns. `timeout` and `setup failed at ...` are transient and never cached (the logs
-  are still written), so a rerun with a longer `--timeout` or fixed setup really runs.
+  command, timings, log paths) with the step logs beside it
+  (`<merge>.<base|merge>-<setup|test>.log`; with several suites
+  `<merge>.<side>-<suite>-<setup|test>.log`). An entry is reused only while the involved
+  suites' settings are unchanged (one suite: its `settings_hash()`, so older entries stay
+  valid; several: a hash over every suite's hash); `--force` reruns. `timeout` and
+  `setup failed at ...` are transient and never cached (the logs are still written), so a
+  rerun with a longer `--timeout` or fixed setup really runs.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
   (the same string, or null) read from the cache.
 
@@ -415,13 +438,16 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
   copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
   paths, exports the suite `env`, `cd`s to the suite `cwd`, runs `setup` and then exec's the test
-  command, each via `bash -c '<quoted command>'`, with the `{tests}`/`{modules}` filled by
+  command (unless `regression_command` is set, in which case the test command runs via
+  `bash -c` with its exit code kept and the regression command follows), each via
+  `bash -c '<quoted command>'`, with the `{tests}`/`{modules}` filled by
   `verify.build_command` from `verify.runnable_files`, exactly what `--verify` ran. A failing
   setup prints `crucible-check: setup failed` and exits 97 (so `prove` never counts a broken
   install as "fails before"); a failed copy exits 98.
-- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`) records the merge
-  SHA deterministically. The workspace never contains `.crucible/`, so a hidden file in the task
-  dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only `task.md`.
+- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`) records
+  the merge SHA deterministically. The workspace never contains `.crucible/`, so a hidden file
+  in the task dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only
+  `task.md`.
 
 `crucible mine prove <task-dir> [--timeout S]` loads the finished task (so placeholders must be
 filled), exports `ref` with `workspace.export_tree` into a fresh dir under `paths.work_dir()/mine/`
