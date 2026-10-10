@@ -25,6 +25,10 @@ def pkg(deps: str) -> str:
     return json.dumps({"devDependencies": {deps: "^1.0.0"}})
 
 
+VENV = "python3 -m venv .venv && .venv/bin/python -m pip install -q -U pip"
+PIP = ".venv/bin/python -m pip install -q"
+
+
 def by_name(suites):
     return {s.name: s for s in suites}
 
@@ -36,9 +40,9 @@ def test_detect_django(tmp_path):
     write(tmp_path, "requirements.txt")
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "django"
-    assert s.test_command == "python manage.py test {modules}"
+    assert s.test_command == ".venv/bin/python manage.py test {modules}"
     assert s.module_root == "."
-    assert s.setup == "pip install -q -r requirements.txt"
+    assert s.setup == f"{VENV} && {PIP} -r requirements.txt"
     assert s.cwd == "."
     assert mc.path_matches("app/tests/test_x.py", s.test_paths)
 
@@ -47,8 +51,8 @@ def test_detect_pytest_pyproject(tmp_path):
     write(tmp_path, "pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = ['tests']\n")
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "pytest"
-    assert s.test_command == "python -m pytest {tests}"
-    assert s.setup == "pip install -q -e ."
+    assert s.test_command == ".venv/bin/python -m pytest {tests}"
+    assert s.setup == f"{VENV} && {PIP} pytest"
     assert mc.path_matches("tests/test_a.py", s.test_paths)
     assert not mc.path_matches("src/a.py", s.test_paths)
 
@@ -64,14 +68,14 @@ def test_conftest_only_subdir_is_not_its_own_project(tmp_path):
     write(tmp_path, "requirements.txt")
     write(tmp_path, "tests/conftest.py")
     [s] = mc.detect_suites(tmp_path)
-    assert (s.name, s.cwd, s.setup) == ("pytest", ".", "pip install -q -r requirements.txt")
+    assert (s.name, s.cwd, s.setup) == ("pytest", ".", f"{VENV} && {PIP} -r requirements.txt && {PIP} pytest")
 
 
 def test_conftest_in_subdir_with_bare_pyproject_gives_root_suite(tmp_path):
     write(tmp_path, "pyproject.toml", "[project]\nname = 'x'\n")
     write(tmp_path, "tests/conftest.py")
     [s] = mc.detect_suites(tmp_path)
-    assert (s.name, s.cwd, s.setup) == ("pytest", ".", "pip install -q -e .")
+    assert (s.name, s.cwd, s.setup) == ("pytest", ".", f"{VENV} && {PIP} -e . && {PIP} pytest")
     assert mc.path_matches("tests/test_a.py", s.test_paths)
 
 
@@ -90,8 +94,8 @@ def test_detect_jest_without_lockfile(tmp_path):
     write(tmp_path, "package.json", pkg("jest"))
     [s] = mc.detect_suites(tmp_path)
     assert s.name == "jest"
-    assert s.test_command == "npx jest {tests}"
-    assert s.setup == "npm install --silent"
+    assert s.test_command == "npx jest --runTestsByPath {tests}"
+    assert s.setup == "npm install --no-package-lock --silent"
 
 
 def test_detect_django_plus_vitest_gives_two_suites(tmp_path):
@@ -171,7 +175,8 @@ def test_good_config_loads(tmp_path):
 
 @pytest.mark.parametrize("old,new,needle", [
     ("    test_command: python manage.py test {modules}\n", "", "suites[0].test_command: required"),
-    ("{modules}", "{foo}", "suites[0].test_command: unknown placeholder {foo}"),
+    ("{modules}", "{Modules}", "suites[0].test_command: unknown placeholder {Modules}"),
+    ("{modules}", "{ modules }", "suites[0].test_command: whitespace inside placeholder"),
     ("    module_root: backend\n", "", "{modules} needs suites[0].module_root"),
     ("dummy-not-secret", "realvalue123", "suites[0].env.DJANGO_SECRET_KEY"),
     ("    cwd: backend\n", "    cwd: ../x\n", "suites[0].cwd"),
@@ -228,9 +233,10 @@ def test_short_or_dummy_secrets_allowed(tmp_path):
     assert load(tmp_path, text).suites[0].env["MODE"] == "realvalue123"
 
 
-def test_command_needs_a_placeholder(tmp_path):
+def test_command_without_placeholder_runs_the_whole_suite(tmp_path):
+    # changed on purpose: a placeholder used to be required, now it is optional
     text = GOOD.replace("test {modules}", "test")
-    assert any("must contain" in e for e in errors_of(tmp_path, text))
+    assert load(tmp_path, text).suites[0].test_command == "python manage.py test"
 
 
 def test_duplicate_suite_names_and_not_a_mapping(tmp_path):
@@ -337,11 +343,11 @@ def test_mine_invalid_config_exits_1_naming_field(repo, capsys):
     main(["init"])
     (repo / ".crucible/mine.yaml").write_text(
         "suites:\n  - name: a\n    test_paths: ['t/**']\n"
-        "    test_command: run {foo}\n"
+        "    test_command: run {Tests}\n"
     )
     capsys.readouterr()
     assert main(["mine"]) == 1
-    assert "suites[0].test_command: unknown placeholder {foo}" in capsys.readouterr().err
+    assert "suites[0].test_command: unknown placeholder {Tests}" in capsys.readouterr().err
 
 
 def test_mine_adds_mine_to_existing_home_gitignore(repo):
@@ -405,17 +411,19 @@ def test_regression_command_allows_shell_variables(tmp_path):
     assert s.regression_command == "echo ${HOME}"
 
 
-@pytest.mark.parametrize("files,expected", [
-    ({"pyproject.toml": "[tool.pytest.ini_options]\n"}, "python -m pytest -q"),
-    ({"manage.py": ""}, "python manage.py test"),
-    ({"package.json": json.dumps({"devDependencies": {"vitest": "^1"}})}, "npx vitest run"),
-    ({"package.json": json.dumps({"devDependencies": {"jest": "^1"}})}, "npx jest"),
+@pytest.mark.parametrize("files,runner", [
+    ({"pyproject.toml": "[tool.pytest.ini_options]\n"}, "pytest"),
+    ({"manage.py": ""}, "manage.py test"),
+    ({"package.json": json.dumps({"devDependencies": {"vitest": "^1"}})}, "vitest run"),
+    ({"package.json": json.dumps({"devDependencies": {"jest": "^1"}})}, "jest"),
 ])
-def test_suggest_regression_per_stack(tmp_path, files, expected):
+def test_suggest_regression_per_stack(tmp_path, files, runner):
     for rel, text in files.items():
         write(tmp_path, rel, text)
     [s] = mc.detect_suites(tmp_path)
-    assert mc.suggest_regression(s) == expected
+    suggestion = mc.suggest_regression(s)
+    # the detected test command with its test selection dropped
+    assert suggestion.endswith(runner) and s.test_command.startswith(suggestion)
     assert s.regression_command == ""  # suggested, never switched on by detection
 
 
@@ -425,13 +433,13 @@ def test_written_default_suggests_regression_commented_out(tmp_path):
     out = tmp_path / "mine.yaml"
     mc.write_default(out, tmp_path)
     text = out.read_text()
-    assert "  # regression_command: python manage.py test\n" in text
+    assert "  # regression_command: .venv/bin/python manage.py test\n" in text
     assert "  # regression_command: npx vitest run\n" in text
     assert "whole suite" in text and "prove" in text
     assert [s.regression_command for s in mc.load_config(out).suites] == ["", ""]
     out.write_text(text.replace("  # regression_command:", "  regression_command:"))
     assert [s.regression_command for s in mc.load_config(out).suites] == [
-        "python manage.py test", "npx vitest run"]
+        ".venv/bin/python manage.py test", "npx vitest run"]
 
 
 def test_empty_template_mentions_regression_command(tmp_path):
@@ -451,3 +459,25 @@ def test_suggestion_in_default_file_works_when_uncommented(tmp_path):
     out.write_text(text.replace(marker, f"  regression_command: {suggestion}\n"))
     [loaded] = mc.load_config(out).suites
     assert loaded.regression_command == suggestion
+
+
+# --- brace alternation in globs ---
+
+@pytest.mark.parametrize("path,patterns,expected", [
+    ("a/x.test.ts", ["a/*.{test,spec}.{ts,js}"], True),
+    ("a/x.spec.js", ["a/*.{test,spec}.{ts,js}"], True),
+    ("a/x.spec.py", ["a/*.{test,spec}.{ts,js}"], False),
+    ("src/Foo.vue", ["**/*.{vue,svelte}"], True),
+    ("web/src/b.svelte", ["**/*.{vue,svelte}"], True),
+    ("docs/a.txt", ["{docs,vendor}/**"], True),
+    ("vendor/a.txt", ["{docs,vendor}/**"], True),
+    ("x/a.txt", ["{docs,vendor}/**"], False),
+    ("a.b", ["a.{b,{c,d}}"], True),
+    ("a.d", ["a.{b,{c,d}}"], True),
+    ("a.e", ["a.{b,{c,d}}"], False),
+    ("a{b}.py", ["a{b}.py"], True),          # no comma: literal braces
+    ("a{b.py", ["a{b.py"], True),            # unclosed: literal
+    ("deep/vendor/x", ["{vendor,node_modules}"], True),  # directory pattern still matches
+])
+def test_path_matches_brace_alternation(path, patterns, expected):
+    assert mc.path_matches(path, patterns) is expected

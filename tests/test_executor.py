@@ -158,6 +158,9 @@ def test_keyboard_interrupt_kills_group(tmp_path, monkeypatch):
 
     pid_file = tmp_path / "pids"
     monkeypatch.setenv("FAKE_CLAUDE_PID_FILE", str(pid_file))
+    # A process started as a background job (or by some CI runners) inherits SIGINT as ignored,
+    # and Python then installs no handler: the signal below would do nothing and the test hang.
+    old = signal.signal(signal.SIGINT, signal.default_int_handler)
 
     def interrupter():
         end = time.monotonic() + 10
@@ -170,7 +173,10 @@ def test_keyboard_interrupt_kills_group(tmp_path, monkeypatch):
         os.kill(os.getpid(), signal.SIGINT)
 
     threading.Thread(target=interrupter, daemon=True).start()
-    with pytest.raises(KeyboardInterrupt):
-        run(tmp_path, "hang", timeout_s=60)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run(tmp_path, "hang", timeout_s=60)
+    finally:
+        signal.signal(signal.SIGINT, old)
     fake_pid, grandchild = map(int, pid_file.read_text().split())
     assert wait_gone(fake_pid, grandchild)

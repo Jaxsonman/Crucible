@@ -1,6 +1,7 @@
 """`.crucible/mine.yaml`: per-repo test suites for mining, plus stack detection."""
 
 import hashlib
+import itertools
 import json
 import re
 from dataclasses import dataclass, field
@@ -8,8 +9,12 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from crucible.mine import placeholders
+
 CONFIG_NAME = "mine.yaml"
-PLACEHOLDERS = ("tests", "modules")
+PLACEHOLDERS = placeholders.SOURCES
+DEFAULT_TEST_TIMEOUT_S = 600.0
+DEFAULT_SETUP_TIMEOUT_S = 1800.0
 SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE", "CREDENTIAL")
 SECRET_TOKENS = ("PAT",)  # whole `_`-separated words only, so `PATH` is not a secret
 _URL_CREDENTIALS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:([^/\s@]*)@")
@@ -17,9 +22,28 @@ DEFAULT_MAX_LINES = 800
 DEFAULT_EXCLUDE = [
     "**/package-lock.json", "**/*.lock", "**/migrations/**", "docs/**", "*.md",
 ]
+SUITE_NAME_MAX = 64
 SUITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env",
-               "regression_command"}
+               "runnable", "timeout", "setup_timeout", "regression_command"}
+# A changed test file is *runnable* (passed to the test command) when its name matches this or
+# it lives under a `__tests__` directory: the rule used when a suite has no `runnable` globs.
+_RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
+
+
+# Snapshots, data and media are test files (they belong to a suite) but never runnable.
+_NON_CODE_SUFFIXES = frozenset({
+    ".snap", ".json", ".md", ".markdown", ".txt", ".csv", ".yml", ".yaml", ".html", ".css",
+    ".scss", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".pdf", ".map"})
+
+
+def default_is_runnable(path: str) -> bool:
+    """The built-in rule: test-named files, or any file under `__tests__`, except
+    `__snapshots__` and non-code files (`.snap`, `.json`, `.md`, images...)."""
+    p = PurePosixPath(path)
+    if "__snapshots__" in p.parts or p.suffix.lower() in _NON_CODE_SUFFIXES:
+        return False
+    return bool(_RUNNABLE_NAME.match(p.name)) or "__tests__" in p.parts[:-1]
 _TOP_KEYS = {"suites", "exclude_paths", "max_changed_lines"}
 
 
@@ -40,10 +64,31 @@ class Suite:
     setup: str = ""
     module_root: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    runnable: list[str] | None = None  # None: the built-in rule (`default_is_runnable`)
+    timeout: float = DEFAULT_TEST_TIMEOUT_S
+    setup_timeout: float = DEFAULT_SETUP_TIMEOUT_S
     regression_command: str = ""  # optional whole-suite command run after the PR's tests
 
+    def is_runnable(self, path: str) -> bool:
+        """Is this changed test file passed to the test command?"""
+        if self.runnable is None:
+            return default_is_runnable(path)
+        return path_matches(path, self.runnable)
+
     def to_dict(self) -> dict:
-        """Plain-data form (stable key order), e.g. for hashing a suite's settings."""
+        """Plain-data form (stable key order); optional fields appear only when set."""
+        d = self.hashed_dict()
+        if self.timeout != DEFAULT_TEST_TIMEOUT_S:
+            d["timeout"] = int(self.timeout) if self.timeout.is_integer() else self.timeout
+        if self.setup_timeout != DEFAULT_SETUP_TIMEOUT_S:
+            d["setup_timeout"] = (int(self.setup_timeout) if self.setup_timeout.is_integer()
+                                  else self.setup_timeout)
+        return d
+
+    def hashed_dict(self) -> dict:
+        """The settings that decide a verification result. Timeouts are left out on purpose:
+        a run that hit one is never cached, and a result produced within a limit stays valid
+        under a longer one. Fields at their default are omitted so older caches stay valid."""
         d = {"name": self.name, "test_paths": self.test_paths, "cwd": self.cwd}
         if self.setup:
             d["setup"] = self.setup
@@ -54,10 +99,12 @@ class Suite:
             d["module_root"] = self.module_root
         if self.env:
             d["env"] = self.env
+        if self.runnable is not None:
+            d["runnable"] = self.runnable
         return d
 
     def settings_hash(self) -> str:
-        blob = json.dumps(self.to_dict(), sort_keys=True).encode()
+        blob = json.dumps(self.hashed_dict(), sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()
 
 
@@ -97,12 +144,48 @@ def _match_one(path: str, pat: str) -> bool:
     return bool(_glob_regex(pat).match(target))
 
 
+def expand_braces(pattern: str) -> list[str]:
+    """`a/{b,c}.py` -> `a/b.py`, `a/c.py` (nesting works). A brace group with no top-level
+    comma (`{}`, `{a}`) or no closing brace is literal."""
+    start = pattern.find("{")
+    while start >= 0:
+        depth, commas, end = 0, [], -1
+        for i in range(start, len(pattern)):
+            c = pattern[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            elif c == "," and depth == 1:
+                commas.append(i)
+        if end >= 0 and commas:
+            bounds = [start, *commas, end]
+            alts = [pattern[a + 1:b] for a, b in itertools.pairwise(bounds)]
+            return [x for alt in alts
+                    for x in expand_braces(pattern[:start] + alt + pattern[end + 1:])]
+        start = pattern.find("{", start + 1)
+    return [pattern]
+
+
 def path_matches(path: str, patterns: list[str]) -> bool:
-    """True if repo-relative `path` matches any glob. A pattern with no `/` (like `*.md`)
+    """True if repo-relative `path` matches any glob (`{a,b}` alternation is supported). A pattern with no `/` (like `*.md`)
     matches the file name at any depth. A directory pattern (trailing `/`, or no wildcard)
     also matches every file under that directory: `src/utils` and `src/utils/` are anchored at the
-    repo root; a name without a `/` (`vendor`, `vendor/`) matches a directory of that name at any depth."""
-    for pat in patterns:
+    repo root; a name without a `/` (`vendor`, `vendor/`) matches a directory of that name at any depth.
+    A pattern starting with `!` excludes: the path matches the list when it matches some
+    positive pattern and no `!` pattern (a list of only `!` patterns matches nothing)."""
+    positive = [p for p in patterns if not p.startswith("!")]
+    negative = [p[1:] for p in patterns if p.startswith("!") and len(p) > 1]
+    if negative and _matches_any(path, negative):
+        return False
+    return _matches_any(path, positive)
+
+
+def _matches_any(path: str, patterns: list[str]) -> bool:
+    for pat in (x for p in patterns for x in expand_braces(p)):
         if _match_one(path, pat):
             return True
         base = pat.rstrip("/")
@@ -133,6 +216,14 @@ def _check_relative(value: str, field_name: str, errors: list[str]) -> None:
     p = PurePosixPath(value)
     if p.is_absolute() or ".." in p.parts:
         errors.append(f"{field_name}: must be a path inside the repo, got {value!r}")
+
+
+def _seconds(raw: dict, key: str, default: float, where: str, errors: list[str]) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        errors.append(f"{where}.{key}: must be a positive number of seconds, got {value!r}")
+        return default
+    return float(value)
 
 
 def _secret_like(name: str) -> bool:
@@ -176,27 +267,36 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         errors.append(f"{where}.test_command: required")
         command = ""
     else:
-        used = re.findall(r"\{([^{}]*)\}", command)
-        for ph in sorted(set(used) - set(PLACEHOLDERS)):
-            errors.append(
-                f"{where}.test_command: unknown placeholder {{{ph}}} "
-                f"(allowed: {', '.join('{' + p + '}' for p in PLACEHOLDERS)})"
-            )
-        if not used:
-            errors.append(f"{where}.test_command: must contain {{tests}} or {{modules}}")
-        if "modules" in used and module_root is None:
-            errors.append(f"{where}.test_command: {{modules}} needs {where}.module_root")
+        try:
+            parsed = placeholders.parse(command)
+        except placeholders.PlaceholderError as e:
+            errors.append(f"{where}.test_command: {e}")
+        else:
+            if any(p.source == "modules" for p in parsed.placeholders) and module_root is None:
+                errors.append(f"{where}.test_command: {{modules}} needs {where}.module_root")
+    runnable = raw.get("runnable")
+    if runnable is not None:
+        runnable = _str_list(runnable, f"{where}.runnable", errors, required=False)
+        if not runnable and not any(e.startswith(f"{where}.runnable") for e in errors):
+            errors.append(f"{where}.runnable: must not be empty (omit it for the built-in rule)")
+        runnable = runnable or None
+    timeout = _seconds(raw, "timeout", DEFAULT_TEST_TIMEOUT_S, where, errors)
+    setup_timeout = _seconds(raw, "setup_timeout", DEFAULT_SETUP_TIMEOUT_S, where, errors)
     regression = raw.get("regression_command") or ""
     if not isinstance(regression, str):
         errors.append(f"{where}.regression_command: must be a string")
         regression = ""
     else:
-        found = sorted(set(re.findall(r"\{(tests|modules)\}", regression)))
-        if found:
-            errors.append(
-                f"{where}.regression_command: must not contain placeholders "
-                f"({', '.join('{' + p + '}' for p in found)}); it runs the whole suite"
-            )
+        try:
+            found = sorted({p.source for p in placeholders.parse(regression).placeholders})
+        except placeholders.PlaceholderError as e:
+            errors.append(f"{where}.regression_command: {e}")
+        else:
+            if found:
+                errors.append(
+                    f"{where}.regression_command: must not contain placeholders "
+                    f"({', '.join('{' + p + '}' for p in found)}); it runs the whole suite"
+                )
         regression = regression.strip()
     env = raw.get("env") or {}
     if not isinstance(env, dict):
@@ -222,7 +322,8 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         clean_env[str(k)] = v
     if len(errors) > start:
         return None
-    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env, regression)
+    return Suite(name, test_paths, command, cwd, setup, module_root, clean_env, runnable,
+                 timeout, setup_timeout, regression)
 
 
 def load_config(path: Path) -> MineConfig:
@@ -264,136 +365,56 @@ def load_config(path: Path) -> MineConfig:
 
 # --- stack detection ---
 
-_SKIP_DIRS = {"node_modules", "venv", "env", "build", "dist", "site-packages"}
-
-
-def _candidate_dirs(root: Path) -> list[Path]:
-    subs = sorted(
-        d for d in root.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and d.name not in _SKIP_DIRS
-        and not d.name.endswith(".egg-info")
-    )
-    return [root, *subs]
-
-
-def _has_pytest_config(d: Path) -> bool:
-    if (d / "pytest.ini").is_file():
-        return True
-    pyproject = d / "pyproject.toml"
-    if pyproject.is_file():
-        text = pyproject.read_text(encoding="utf-8", errors="replace")
-        return "[tool.pytest" in text
-    return False
-
-
-def _js_runner(d: Path) -> str | None:
-    pkg = d / "package.json"
-    if not pkg.is_file():
-        return None
-    try:
-        data = json.loads(pkg.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-    for runner in ("vitest", "jest"):
-        if runner in deps:
-            return runner
-    return None
-
-
-def _python_setup(d: Path) -> str:
-    if (d / "requirements.txt").is_file():
-        return "pip install -q -r requirements.txt"
-    if (d / "pyproject.toml").is_file() or (d / "setup.py").is_file():
-        return "pip install -q -e ."
-    return ""
-
-
-_PYTHON_MARKERS = ("pytest.ini", "pyproject.toml", "setup.cfg", "setup.py", "manage.py")
-
-
-def _has_python_marker(d: Path) -> bool:
-    return any((d / m).is_file() for m in _PYTHON_MARKERS) or any(d.glob("requirements*.txt"))
-
-
-def _root_pytest(root: Path):
-    return (root, "pytest", "python -m pytest {tests}",
-            ["**/test_*.py", "**/*_test.py", "**/conftest.py"], _python_setup(root), None)
-
-
 def detect_suites(repo_root: Path) -> list[Suite]:
-    """Guess test suites (pytest, Django, Vitest, Jest) in the repo root or one level down."""
-    repo_root = Path(repo_root)
-    found: list[tuple[Path, str, str, list[str], str, str | None]] = []
-    root_marked = _has_python_marker(repo_root)
-    for d in _candidate_dirs(repo_root):
-        prefix = "" if d == repo_root else d.name + "/"
-        explicit_pytest = _has_pytest_config(d)
-        django = (d / "manage.py").is_file()
-        conftest_only = (d / "conftest.py").is_file() and not django and not explicit_pytest
-        if conftest_only and d != repo_root and root_marked and not _has_python_marker(d):
-            # a conftest.py-only dir (typically `tests/`) belongs to the root's python project
-            if not any(f[0] == repo_root and f[1] in ("pytest", "django") for f in found):
-                found.insert(0, _root_pytest(repo_root))
-        elif explicit_pytest or ((d / "conftest.py").is_file() and not django):
-            found.append((d, "pytest", "python -m pytest {tests}",
-                          [f"{prefix}**/test_*.py", f"{prefix}**/*_test.py", f"{prefix}**/conftest.py"],
-                          _python_setup(d), None))
-        elif django:
-            found.append((d, "django", "python manage.py test {modules}",
-                          [f"{prefix}**/tests/**", f"{prefix}**/test_*.py", f"{prefix}**/tests.py"],
-                          _python_setup(d), "."))
-        runner = _js_runner(d)
-        if runner:
-            cmd = "npx vitest run {tests}" if runner == "vitest" else "npx jest {tests}"
-            setup = "npm ci --silent" if (d / "package-lock.json").is_file() else "npm install --silent"
-            found.append((d, runner, cmd,
-                          [f"{prefix}**/*.test.*", f"{prefix}**/*.spec.*", f"{prefix}**/__tests__/**"],
-                          setup, None))
-    suites: list[Suite] = []
-    used: set[str] = set()
-    for d, kind, cmd, test_paths, setup, module_root in found:
-        name = d.name if d != repo_root else kind
-        name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or kind
-        if name in used:
-            name = f"{name}-{kind}"
-        used.add(name)
-        rel = "." if d == repo_root else d.name
-        suites.append(Suite(name, test_paths, cmd, rel, setup, module_root and rel))
-    return suites
+    """Guess the repo's test suites from the framework presets (`mine/detect.py`)."""
+    from crucible.mine import detect
+    return [d.suite for d in detect.detect(repo_root)]
 
 
-REGRESSION_SUGGESTIONS = {
-    "python -m pytest {tests}": "python -m pytest -q",
-    "python manage.py test {modules}": "python manage.py test",
-    "npx vitest run {tests}": "npx vitest run",
-    "npx jest {tests}": "npx jest",
-}
+# Runners that run the whole suite when given no test selection. For these, the detected
+# test_command minus its trailing selection is the suggested regression_command.
+_WHOLE_SUITE_RUNNER = re.compile(r"(?:^|[\s/])(?:pytest|manage\.py test|vitest run|jest)(?:\s|\Z)")
+_TRAILING_SELECTION = re.compile(r"\s+(?:--runTestsByPath\s+)?\{(?:tests|modules)\}\s*\Z")
 
 
 def suggest_regression(suite: Suite) -> str:
     """The whole-suite `regression_command` suggested for a detected stack ('' if none)."""
-    return REGRESSION_SUGGESTIONS.get(suite.test_command, "")
+    cmd = _TRAILING_SELECTION.sub("", suite.test_command)
+    if cmd == suite.test_command or not _WHOLE_SUITE_RUNNER.search(cmd):
+        return ""
+    try:
+        return "" if placeholders.parse(cmd).placeholders else cmd
+    except placeholders.PlaceholderError:
+        return ""
 
 
 _DETECTED_HEADER = """\
-# AUTO-DETECTED by `crucible mine`. Check every line before relying on it:
-# the test_paths globs, the setup and test commands, and env (names + dummy values only,
-# never real secrets). Run `crucible mine` again once it looks right.
+# AUTO-DETECTED by `crucible mine` from its framework presets. Every suite below is a first
+# guess: check each line (the test_paths globs, the setup and test commands, and env: names +
+# dummy values only, never real secrets), then run `crucible mine calibrate` to prove the
+# commands actually run the selected tests. Run `crucible mine` again once it looks right.
 """
 _TEMPLATE_HEADER = """\
-# NOTHING DETECTED. `crucible mine` could not find pytest, Django, Vitest or Jest in this repo,
-# so `suites` is empty. Fill it in (one entry per test stack), then run `crucible mine` again.
+# NOTHING DETECTED. `crucible mine` found no marker of a framework preset ({presets}) in the
+# repo root or up to three levels below it, so `suites` is empty. Fill it in (one entry per test
+# stack, or copy the closest preset from src/crucible/data/presets/), then run
+# `crucible mine calibrate`.
 #
 # suites:
 #   - name: backend
 #     test_paths: ["backend/**/tests/**", "backend/**/test_*.py"]   # globs of test files
 #     cwd: backend                       # where setup and test commands run (relative to repo root)
 #     setup: pip install -q -r requirements.txt
-#     test_command: python manage.py test {modules}   # {tests}: file paths relative to cwd
+#     test_command: python manage.py test {{tests|module:backend}}
+#         # {{tests}}: changed test files relative to cwd; filters after `|` reshape them:
+#         # module:<root> stem dir unique prefix:<s> suffix:<s> join:<sep>. No placeholder at
+#         # all runs the whole suite. See docs/design.md ("Placeholders").
 #     regression_command: python manage.py test   # optional; whole suite, no placeholders
-#     module_root: backend               # optional; enables {modules} (dotted paths, .py stripped)
-#     env: {DJANGO_SECRET_KEY: dummy-not-secret}      # dummy values only
+#     module_root: backend               # optional; {{modules}} = {{tests|module:<module_root>}}
+#     runnable: ["**/*Test.java"]        # optional; which changed test files are passed to the runner
+#     timeout: 600                       # optional, seconds for the test step
+#     setup_timeout: 1800                # optional, seconds for the setup step
+#     env: {{DJANGO_SECRET_KEY: dummy-not-secret}}      # dummy values only
 """
 _TAIL = """\
 # Files that never count as the change itself (globs; a pattern without `/` matches any depth).
@@ -406,36 +427,44 @@ _REGRESSION_NOTE = """\
   #   optional: runs the whole suite at check time, after the PR's tests (no placeholders);
   #   the check fails if it fails. `crucible mine prove` rejects a task whose regression fails
   #   at the merge commit, so exclude pre-existing failures in the command or remove the line.
-  #   The check is killed after --check-timeout (default 300 s) at run time, so the whole suite
-  #   must finish within it, or raise the timeout.
+  #   It gets the suite's `timeout` again in the task's check_timeout_minutes, so the whole
+  #   suite must finish within that, or raise `timeout`.
 """
 
 
-def render_default(suites: list[Suite]) -> str:
-    """The commented mine.yaml text `crucible mine` writes on first use. Each detected suite
+def render_default(suites: list[Suite], comments: dict[str, list[str]] | None = None) -> str:
+    """The commented mine.yaml text `crucible mine` writes on first use. `comments` maps a
+    suite name to the comment lines written above it (where the guess came from). Each suite
     is followed by its suggested `regression_command`, commented out."""
     exclude = json.dumps(DEFAULT_EXCLUDE)
     tail = _TAIL.format(exclude=exclude, max_lines=DEFAULT_MAX_LINES)
     if not suites:
-        return _TEMPLATE_HEADER + "suites: []\n" + tail
-    body = "suites:\n"
+        from crucible.mine import presets
+        names = ", ".join(presets.shipped())
+        return _TEMPLATE_HEADER.format(presets=names) + "suites: []\n" + tail
+    parts = [_DETECTED_HEADER, "suites:\n"]
     for s in suites:
-        body += yaml.safe_dump([s.to_dict()], sort_keys=False, default_flow_style=None,
-                               width=100)
+        parts += [f"# {ln}\n".replace("# \n", "#\n") for ln in (comments or {}).get(s.name, [])]
+        parts.append(yaml.safe_dump([s.to_dict()], sort_keys=False, default_flow_style=None,
+                                    width=100))
         cmd = suggest_regression(s)
         if cmd:
-            body += _REGRESSION_NOTE.format(cmd=cmd)
-    return _DETECTED_HEADER + body + tail
+            parts.append(_REGRESSION_NOTE.format(cmd=cmd))
+    return "".join(parts) + tail
 
 
-def write_default(path: Path, repo_root: Path) -> list[Suite]:
-    """Detect suites and write a commented mine.yaml at `path`. Never overwrites."""
+def write_default(path: Path, repo_root: Path, jdk_lookup=None) -> list[Suite]:
+    """Detect suites and write a commented mine.yaml at `path`. Never overwrites.
+    `jdk_lookup(version)` finds a local JDK for Maven/Gradle suites (tests inject one)."""
+    from crucible.mine import detect
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
-    suites = detect_suites(repo_root)
+    found = detect.detect(repo_root, jdk_lookup=jdk_lookup)
+    suites = [d.suite for d in found]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_default(suites), encoding="utf-8")
+    path.write_text(render_default(suites, {d.suite.name: d.comment() for d in found}),
+                    encoding="utf-8")
     return suites
 
 

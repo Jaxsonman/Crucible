@@ -354,3 +354,17 @@ def test_nested_bullet_under_indented_parent_still_joins(crucible_home):
     body = criteria_body("  - Parent\n    - sub one\n  - Next\n")
     t = load_task(make_task(crucible_home, body=body))
     assert t.criteria == ["Parent - sub one", "Next"]
+
+
+def test_check_timeout_minutes_field(crucible_home):
+    assert load_task(make_task(crucible_home)).check_timeout_minutes is None
+    t = load_task(make_task(crucible_home, name="t2",
+                            front="id: t2\nkind: feature\nrepo: fixture\ncheck_timeout_minutes: 45"))
+    assert t.check_timeout_minutes == 45
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "1.5", "'x'", "true"])
+def test_check_timeout_minutes_must_be_a_positive_int(crucible_home, bad):
+    d = make_task(crucible_home, front=f"id: t1\nkind: feature\nrepo: fixture\ncheck_timeout_minutes: {bad}")
+    with pytest.raises(TaskError, match="check_timeout_minutes"):
+        load_task(d)

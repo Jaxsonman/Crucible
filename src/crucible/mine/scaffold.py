@@ -5,6 +5,8 @@
 """
 
 import json
+import math
+import os
 import re
 import shlex
 import shutil
@@ -13,12 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from crucible import checker, paths, workspace
-from crucible.mine import verify
+from crucible.mine import jdk, placeholders, verify
 from crucible.mine.candidates import Candidate
 from crucible.mine.config import Suite
 from crucible.task import ID_RE, Task, repo_relative, repo_task_md
 
 MINE_META = ".mine.json"
+SCRIPTS_DIRNAME = verify.SCRIPTS_DIRNAME
 SETUP_FAILED = "crucible-check: setup failed"
 SETUP_EXIT = 97
 DEFAULT_TIMEOUT_MINUTES = 30
@@ -43,8 +46,40 @@ def default_slug(c: Candidate) -> str:
     return slug if ID_RE.match(slug) else f"{prefix}-{re.sub(r'[^a-z0-9]', '', c.id.lower())}"
 
 
-def _suite_prelude(suite: Suite) -> list[str]:
-    lines = [f"export {k}={shlex.quote(v)}" for k, v in suite.env.items()]
+def _machine_path(value: str) -> bool:
+    """An env value that is an absolute path existing on this machine: baked into a task it
+    would only be right here, so `check.sh` guards it instead of exporting it blindly."""
+    return os.path.isabs(value) and os.path.exists(value)
+
+
+def jdk_requirements(suites: list[Suite]) -> list[str]:
+    """`["jdk N"]` when a suite's `env: JAVA_HOME` points at a local JDK (N: its real major)."""
+    majors = {m for s in suites if (home := s.env.get("JAVA_HOME")) and _machine_path(home)
+              and (m := jdk.release_major(home))}
+    return [f"jdk {m}" for m in sorted(majors)]
+
+
+def recorded_requires(task_dir: Path) -> list[str]:
+    """The `requires` list recorded in the task's `.mine.json` (empty when absent)."""
+    try:
+        meta = json.loads((task_dir / MINE_META).read_text(encoding="utf-8"))
+        return [str(x) for x in meta.get("requires", [])]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+
+
+def _suite_prelude(suite: Suite, files: list[str]) -> list[str]:
+    lines = []
+    for k, v in suite.env.items():
+        q = shlex.quote(v)
+        if _machine_path(v) or (k == "JAVA_HOME" and os.path.isabs(v)):
+            test = "-d" if k == "JAVA_HOME" else "-e"
+            lines.append(f"if [ {test} {q} ]; then export {k}={q}; fi")
+        else:
+            lines.append(f"export {k}={q}")
+    lines.append(f"export CRUCIBLE_TEST_FILES={shlex.quote(chr(10).join(files))}")
+    lines.append("export CRUCIBLE_TEST_FILES_CWD="
+                 + shlex.quote(chr(10).join(os.path.relpath(f, suite.cwd) for f in files)))
     lines.append(f"cd -- {shlex.quote(suite.cwd)} || exit 98" if suite.cwd != "." else "cd . || exit 98")
     return lines
 
@@ -54,27 +89,41 @@ def _collect_rc() -> str:
     return '[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code'
 
 
-def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
-    """The task's `check.sh`: self-contained, run with the workspace as cwd. It installs the
-    hidden tests once, then for each suite runs exactly the setup and test command `verify`
-    ran (`bash -c`, same placeholder filling, only that suite's runnable files). One suite
-    without a regression_command exec's its test command; with one, the test command runs via
-    `bash -c` with its exit code kept and the regression command follows. Several suites each
-    run in a subshell (own env and cwd); a setup failure exits 97 at once, test failures are
-    collected so every suite runs, and the script exits with the first failing code. A suite's
-    optional regression_command runs after its tests in the same cwd and env. A failed copy of
-    the hidden tests exits 98."""
+def _command(suite: Suite, files: list[str]) -> str:
+    try:
+        return verify.build_command(suite, files)
+    except placeholders.OutsideRoot as e:
+        raise ScaffoldError(f"test outside module_root ({suite.name}): {e}") from e
+
+
+def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: bool = False) -> str:
+    """The task's `check.sh`: self-contained, run with the workspace as cwd. It runs every suite's
+    setup first (a failure exits 97 at once), then installs the hidden tests once (a failed copy
+    exits 98), then runs each suite's test command, exactly what `verify` ran (`bash -c`, same
+    placeholder filling, only that suite's runnable files). One suite without a
+    regression_command exec's its test command; with one, the test command runs via `bash -c`
+    with its exit code kept and the regression command follows. Several suites each run in a
+    subshell (own env and cwd); test failures are collected so every suite runs, and the script
+    exits with the first failing code. A suite's optional regression_command runs after its
+    tests in the same cwd and env. Every step gets `CRUCIBLE_TEST_FILES` and
+    `CRUCIBLE_TEST_FILES_CWD` (the suite's runnable files, as in `verify`); with `scripts` the
+    task's own `scripts/` dir is exported as `CRUCIBLE_SCRIPTS`."""
     suites = verify.as_suites(suites)
     plan = verify.suite_plan_for(suites, runnable)
     names = ", ".join(repr(s.name) for s in suites)
-    lines = [
+    header = [
         "#!/usr/bin/env bash",
         f"# Generated by `crucible mine scaffold` from suite(s) {names}.",
-        "# Run with the workspace as cwd; installs the hidden tests, then runs each suite's own test command.",
+        ("# Run with the workspace as cwd; runs each suite's setup, installs the hidden tests, "
+         "then runs each suite's own test command."),
         "set -u -o pipefail",
         'WS="$PWD"',
         'TASK_DIR="${CRUCIBLE_TASK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"',
         'HIDDEN="$TASK_DIR/hidden_tests"',
+    ]
+    # Setup runs before the hidden tests are installed (as in `verify`): a setup that compiles
+    # must not see test files that reference code the base does not have yet.
+    install = [
         '( cd "$HIDDEN" && tar -cf - --exclude=DELETED . ) | tar -xf - -C "$WS" || {',
         '  echo "crucible-check: could not install hidden tests" >&2; exit 98; }',
         'if [ -f "$HIDDEN/DELETED" ]; then',
@@ -83,13 +132,22 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
         '  done < "$HIDDEN/DELETED"',
         "fi",
     ]
+    lines = list(header)
+    for req in jdk_requirements(suites):
+        major = req.split()[1]
+        lines.append(f"# Requires JDK {major}: the JAVA_HOME below is used only if it exists on this "
+                     f"machine; otherwise provide a JDK {major} (JAVA_HOME or PATH).")
+    if scripts:
+        lines.append(f'export CRUCIBLE_SCRIPTS="$TASK_DIR/{SCRIPTS_DIRNAME}"')
     if len(suites) == 1:
         suite = suites[0]
-        lines += _suite_prelude(suite)
+        prelude = _suite_prelude(suite, runnable)
         if suite.setup:
-            lines.append(f'bash -c {shlex.quote(suite.setup)} || {{ echo "{SETUP_FAILED}" >&2; '
-                         f"exit {SETUP_EXIT}; }}")
-        test_cmd = verify.build_command(suite, runnable)
+            lines += ["( " + "; ".join(prelude) + f"; bash -c {shlex.quote(suite.setup)} ) || {{ "
+                      f'echo "{SETUP_FAILED}" >&2; exit {SETUP_EXIT}; }}']
+        lines += install
+        lines += prelude
+        test_cmd = _command(suite, runnable)
         if not suite.regression_command:
             lines.append(f"exec bash -c {shlex.quote(test_cmd)}")
             return "\n".join(lines) + "\n"
@@ -99,14 +157,18 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
         lines.append(_collect_rc())
         lines.append('exit "$rc"')
         return "\n".join(lines) + "\n"
+    for suite, files in plan:
+        if suite.setup:
+            pre = "; ".join(_suite_prelude(suite, files))
+            lines.append(f"( {pre}; bash -c {shlex.quote(suite.setup)} ) || {{ "
+                         f'echo {shlex.quote(f"{SETUP_FAILED} ({suite.name})")} >&2; '
+                         f"exit {SETUP_EXIT}; }}")
+    lines += install
     lines.append("rc=0")
     for suite, files in plan:
-        pre = "; ".join(_suite_prelude(suite))
+        pre = "; ".join(_suite_prelude(suite, files))
         lines.append(f"echo {shlex.quote(f'== suite {suite.name} ==')}")
-        if suite.setup:
-            lines.append(f"( {pre}; bash -c {shlex.quote(suite.setup)} ) || {{ "
-                         f'echo {shlex.quote(f"{SETUP_FAILED} ({suite.name})")} >&2; exit {SETUP_EXIT}; }}')
-        cmd = verify.build_command(suite, files)
+        cmd = _command(suite, files)
         lines.append(f"( {pre}; bash -c {shlex.quote(cmd)} ); code=$?")
         lines.append(_collect_rc())
         if suite.regression_command:
@@ -132,6 +194,40 @@ def _write_hidden_tests(repo: Path, c: Candidate, dest: Path) -> None:
         (dest / "DELETED").write_text("\n".join(deleted) + "\n", encoding="utf-8")
 
 
+def _copy_scripts(dest: Path) -> bool:
+    """Copy the home's wrapper scripts to `dest` (file modes kept). Symlinks are dereferenced
+    (the content is copied, so the task is self-contained); one pointing outside the Crucible
+    home raises ScaffoldError. False if there are no scripts."""
+    try:
+        files = verify.scripts_files()
+    except verify.ScriptsLinkError as e:
+        raise ScaffoldError(str(e)) from e
+    if not files:
+        return False
+    for name, target in files:
+        out = dest / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, out)
+    return True
+
+
+_DOCKER = re.compile(r"(?<![\w./-])docker(?![\w-])")
+
+
+def requires(task_dir: Path) -> list[str]:
+    """External tools the task's `check.sh` and copied scripts need on the machine that runs
+    it (only `docker` is recognised): a task whose wrapper starts containers cannot be run
+    elsewhere without it."""
+    texts = [task_dir / "check.sh", *sorted((task_dir / SCRIPTS_DIRNAME).rglob("*"))]
+    for f in texts:
+        try:
+            if f.is_file() and _DOCKER.search(f.read_text(encoding="utf-8", errors="replace")):
+                return ["docker"]
+        except OSError:
+            continue
+    return []
+
+
 def scaffold_task_dir(
     repo: Path, c: Candidate, suites: Suite | list[Suite], tasks_dir: Path, *, slug: str | None = None,
     kind: str | None = None,
@@ -142,7 +238,8 @@ def scaffold_task_dir(
     slug = slug or default_slug(c)
     if not ID_RE.match(slug):
         raise ScaffoldError(f"invalid task id {slug!r}: must match {ID_RE.pattern}")
-    if not verify.runnable_files(c):
+    runnable = verify.runnable_files(c, suites)
+    if not runnable:
         raise ScaffoldError("candidate has no runnable test files")
     tasks_dir = tasks_dir.resolve()
     task_dir = tasks_dir / slug
@@ -151,20 +248,29 @@ def scaffold_task_dir(
     tasks_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir()
     try:
+        # setup + tests, and the tests' limit again for a whole-suite regression run
+        check_s = sum(s.setup_timeout + s.timeout * (2 if s.regression_command else 1)
+                      for s in suites)
         extra = (f"source: {json.dumps(c.source)}\n"
                  + (f"source_lines: {c.size}\n" if c.size > 0 else "")
-                 + f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
+                 + f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n"
+                 + f"check_timeout_minutes: {max(1, math.ceil(check_s / 60))}\n")
         (task_dir / "task.md").write_text(
             repo_task_md(slug, repo_relative(repo.resolve(), task_dir), c.base,
                          kind or c.suggested_kind, extra),
             encoding="utf-8")
         _write_hidden_tests(repo, c, task_dir / "hidden_tests")
         check = task_dir / "check.sh"
-        check.write_text(check_script(suites, verify.runnable_files(c)), encoding="utf-8")
+        has_scripts = _copy_scripts(task_dir / SCRIPTS_DIRNAME)
+        check.write_text(check_script(suites, runnable, scripts=has_scripts), encoding="utf-8")
         check.chmod(0o755)
-        (task_dir / MINE_META).write_text(json.dumps({
-            "id": c.id, "base": c.base, "merge": c.merge, "suite": suites[0].name,
-            "suites": [s.name for s in suites], "source": c.source}, indent=2) + "\n", encoding="utf-8")
+        meta = {"id": c.id, "base": c.base, "merge": c.merge, "suite": suites[0].name,
+                "suites": [s.name for s in suites], "source": c.source,
+                "check_timeout_s": check_s}
+        needs = requires(task_dir) + jdk_requirements(suites)
+        if needs:
+            meta["requires"] = needs
+        (task_dir / MINE_META).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     except BaseException:
         shutil.rmtree(task_dir, ignore_errors=True)
         raise
@@ -223,9 +329,28 @@ def _check_at(task: Task, ref: str, label: str, timeout: float) -> checker.Check
         shutil.rmtree(ws, ignore_errors=True)
 
 
-def prove_task(task: Task, timeout: float = verify.DEFAULT_TIMEOUT_S) -> ProveResult:
-    """Run the task's own check at `ref` (must fail) and at the merge (must pass). Raises
-    ScaffoldError / WorkspaceError for problems finding the task's inputs."""
+def check_timeout(task: Task) -> float:
+    """Seconds `prove` allows one check run (setup plus tests): the task's
+    `check_timeout_minutes`, else (older tasks) the total the suites' timeouts gave when the
+    task was scaffolded (`.mine.json`), else the default."""
+    if task.check_timeout_minutes:
+        return task.check_timeout_minutes * 60.0
+    try:
+        meta = json.loads((task.task_dir / MINE_META).read_text(encoding="utf-8"))
+        value = meta.get("check_timeout_s")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return verify.DEFAULT_TIMEOUT_S
+
+
+def prove_task(task: Task, timeout: float | None = None) -> ProveResult:
+    """Run the task's own check at `ref` (must fail) and at the merge (must pass), each within
+    `timeout` seconds (default `check_timeout`). Raises ScaffoldError / WorkspaceError for
+    problems finding the task's inputs."""
+    if timeout is None:
+        timeout = check_timeout(task)
     if not task.check_path:
         raise ScaffoldError("task has no `check:`; nothing to prove")
     if not task.ref:
@@ -249,8 +374,12 @@ __all__ = [
     "ProveResult",
     "ScaffoldError",
     "check_script",
+    "check_timeout",
     "default_slug",
+    "jdk_requirements",
     "merge_sha",
     "prove_task",
+    "recorded_requires",
+    "requires",
     "scaffold_task_dir",
 ]

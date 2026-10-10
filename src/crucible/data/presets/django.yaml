@@ -1,0 +1,52 @@
+# Django's own runner. `manage.py test` takes dotted module labels (app.tests.test_x), not file
+# paths, so `module:` turns each file into a label relative to the project root.
+# The root is the directory that holds manage.py: the suite dir, spelled as a repo-relative path.
+# Setup builds a virtualenv in the suite directory (.venv) like the pytest preset does.
+name: django
+markers:
+  - {glob: manage.py}
+supersedes: [pytest]
+test_paths:
+  - "{suite_dir}/**/tests/**"
+  - "{suite_dir}/**/test_*.py"
+  - "{suite_dir}/**/tests.py"
+# runnable omitted: the built-in rule (test_*.py, *_test.py, tests.py) is what Django imports
+setup:
+  - python3 -m venv .venv && .venv/bin/python -m pip install -q -U pip
+  - {when: [requirements.txt], run: .venv/bin/python -m pip install -q -r requirements.txt}
+  - {when: [requirements-dev.txt], run: .venv/bin/python -m pip install -q -r requirements-dev.txt}
+  - {when: [requirements-test.txt], run: .venv/bin/python -m pip install -q -r requirements-test.txt}
+  - {when: [requirements/test.txt], run: .venv/bin/python -m pip install -q -r requirements/test.txt}
+  - {when: [requirements/dev.txt], run: .venv/bin/python -m pip install -q -r requirements/dev.txt}
+  - first:
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*test\s*=|["'']test["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[test]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*tests\s*=|["'']tests["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[tests]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*testing\s*=|["'']testing["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[testing]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*dev\s*=|["'']dev["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[dev]"
+      - {when: [setup.py], run: .venv/bin/python -m pip install -q -e .}
+      - when: [pyproject.toml]
+        contains: '^\[(?:project|build-system)\]'
+        run: .venv/bin/python -m pip install -q -e .
+test_command: .venv/bin/python manage.py test {modules}
+module_root: "{suite_dir}"
+variants:
+  - when: [uv.lock]
+    setup: uv sync --frozen
+    test_command: uv run python manage.py test {modules}
+  - when: [poetry.lock]
+    setup: poetry install --no-interaction
+    test_command: poetry run python manage.py test {modules}
+  - when: [Pipfile.lock]
+    setup: pipenv install --dev --deploy
+    test_command: pipenv run python manage.py test {modules}
+notes: >-
+  Needs DJANGO_SETTINGS_MODULE and a database the settings can reach; add dummy values under env
+  or point the settings at SQLite. {modules} = {tests|module:<module_root>}.

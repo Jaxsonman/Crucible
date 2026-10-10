@@ -145,3 +145,39 @@ def test_check_log_is_redacted(crucible_home, monkeypatch):
 def test_check_timeout_must_be_positive(crucible_home, capsys):
     assert run(crucible_home, "--check-timeout", "0") == 1
     assert "--check-timeout" in capsys.readouterr().err
+
+
+def _spy_timeouts(monkeypatch):
+    from crucible import checker
+    seen = []
+    real = checker.run_check
+    monkeypatch.setattr(checker, "run_check",
+                        lambda t, w, timeout=checker.DEFAULT_TIMEOUT_S:
+                        (seen.append(timeout), real(t, w, timeout))[1])
+    return seen
+
+
+def _set_check_minutes(home, minutes):
+    md = home / "tasks" / "example-fizzbuzz" / "task.md"
+    text = md.read_text()
+    md.write_text(text.replace("check: ./check.sh\n", f"check: ./check.sh\ncheck_timeout_minutes: {minutes}\n", 1))
+
+
+def test_run_uses_task_check_timeout_minutes(crucible_home, monkeypatch):
+    seen = _spy_timeouts(monkeypatch)
+    _set_check_minutes(crucible_home, 45)
+    assert run(crucible_home) == 0
+    assert seen == [2700.0]
+
+
+def test_run_cli_check_timeout_beats_the_task(crucible_home, monkeypatch):
+    seen = _spy_timeouts(monkeypatch)
+    _set_check_minutes(crucible_home, 45)
+    assert run(crucible_home, "--check-timeout", "90") == 0
+    assert seen == [90.0]
+
+
+def test_run_defaults_to_300_without_either(crucible_home, monkeypatch):
+    seen = _spy_timeouts(monkeypatch)
+    assert run(crucible_home) == 0
+    assert seen == [300.0]

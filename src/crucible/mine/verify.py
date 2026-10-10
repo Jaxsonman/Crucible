@@ -1,27 +1,28 @@
 """Fail-before / pass-after verification of mining candidates.
 
-Runs the repo's own tests in two throwaway exports (base with the PR's test files overlaid,
-then merge). Never calls `claude`; never touches the user's checkout, index or refs.
+Runs the repo's own tests in two throwaway exports (base: setup, then the PR's test files
+overlaid; then merge). Never calls `claude`; never touches the user's checkout, index or refs.
 """
 
 import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from crucible import executor, paths, workspace
-from crucible.mine.candidates import Candidate, _git, owning_suite
-from crucible.mine.config import Suite
+from crucible.mine import diagnostics, placeholders
+from crucible.mine.candidates import Candidate, MineGitError, _git, owning_suite
+from crucible.mine.config import DEFAULT_TEST_TIMEOUT_S, Suite, default_is_runnable
 
-DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_TIMEOUT_S = DEFAULT_TEST_TIMEOUT_S
+SCRIPTS_DIRNAME = "scripts"
 
 # Outcomes that depend on the machine or the time limit, not on the candidate: never cached
 # (the logs are still written), so a rerun with a longer timeout or a fixed setup really runs.
@@ -33,20 +34,18 @@ def is_transient(reason: str) -> bool:
     return reason in TRANSIENT_REASONS or any(
         reason.startswith(r + " (") for r in TRANSIENT_REASONS)
 
-# A changed test file is *runnable* (passed to the test command) when its name matches one of
-# these or it lives under a `__tests__` directory. Everything else under `test_paths`
-# (conftest.py, fixtures, helpers) is overlaid but never passed.
-_RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
+is_runnable_test = default_is_runnable  # the rule for a suite without `runnable` globs
 
 
-def is_runnable_test(path: str) -> bool:
-    p = PurePosixPath(path)
-    return bool(_RUNNABLE_NAME.match(p.name)) or "__tests__" in p.parts[:-1]
-
-
-def runnable_files(c: Candidate) -> list[str]:
-    """The candidate's non-deleted runnable test files: what the test command is given."""
-    return [f.path for f in c.test_files if f.status != "deleted" and is_runnable_test(f.path)]
+def runnable_files(c: Candidate, suites: "Suite | list[Suite] | None" = None) -> list[str]:
+    """The candidate's non-deleted runnable test files: what the test command is given. With
+    `suites`, each file follows the rule of the suite owning it (its `runnable` globs, else the
+    built-in rule); without, the built-in rule."""
+    live = [f.path for f in c.test_files if f.status != "deleted"]
+    if suites is None:
+        return [p for p in live if default_is_runnable(p)]
+    return [f for _, files in suite_plan_for(as_suites(suites), live, only_runnable=True)
+            for f in files]
 
 
 def as_suites(suites: "Suite | list[Suite]") -> list[Suite]:
@@ -60,24 +59,86 @@ def involved_suites(c: Candidate, suites: "Suite | list[Suite]") -> list[Suite]:
     return mine or all_s
 
 
+def scripts_dir() -> Path:
+    """Wrapper scripts for test commands live in `<home>/scripts/` (`.crucible/scripts/`)."""
+    return paths.home() / SCRIPTS_DIRNAME
+
+
+class ScriptsLinkError(ValueError):
+    """A symlink in the scripts dir points outside the Crucible home (or at nothing)."""
+
+
+def scripts_files() -> list[tuple[str, Path]]:
+    """(relative posix name, resolved file) for every file under the scripts dir, symlinks
+    followed (linked directories are walked). A link whose target lies outside the Crucible
+    home, or is missing, raises `ScriptsLinkError`."""
+    root = scripts_dir()
+    if not root.is_dir():
+        return []
+    home = paths.home().resolve()
+    out: list[tuple[str, Path]] = []
+
+    def walk(d: Path, rel: str, seen: frozenset) -> None:
+        for entry in sorted(d.iterdir(), key=lambda p: p.name):
+            name = f"{rel}{entry.name}"
+            target = entry.resolve()
+            if entry.is_symlink():
+                if not target.exists():
+                    raise ScriptsLinkError(f"scripts/{name} is a broken symlink")
+                if not target.is_relative_to(home):
+                    raise ScriptsLinkError(
+                        f"scripts/{name} links to {target}, outside the Crucible home "
+                        f"({home}); copy the file into the scripts dir or link inside the home")
+            if target.is_dir():
+                if target not in seen:  # a link loop is walked once
+                    walk(entry, name + "/", seen | {target})
+            else:
+                out.append((name, target))
+
+    walk(root, "", frozenset({root.resolve()}))
+    return out
+
+
+def scripts_digest() -> str:
+    """Digest of the scripts dir (relative names, exec bits, resolved contents, so editing a
+    link target changes it); "" when there are none. Raises `ScriptsLinkError`."""
+    files = scripts_files()
+    if not files:
+        return ""
+    h = hashlib.sha256()
+    for name, f in files:
+        h.update(name.encode() + b"\0")
+        h.update((b"x" if os.access(f, os.X_OK) else b"-") + f.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def suites_hash(suites: list[Suite]) -> str:
     """Hash of every involved suite's settings. One suite: that suite's own `settings_hash()`
-    (so single-suite cache entries stay valid)."""
+    (so single-suite cache entries stay valid). When the home has wrapper scripts their digest
+    is mixed in, so editing a script invalidates the cache."""
     if len(suites) == 1:
-        return suites[0].settings_hash()
-    return hashlib.sha256(json.dumps([s.settings_hash() for s in suites]).encode()).hexdigest()
+        base = suites[0].settings_hash()
+    else:
+        base = hashlib.sha256(json.dumps([s.settings_hash() for s in suites]).encode()).hexdigest()
+    digest = scripts_digest()
+    return hashlib.sha256((base + digest).encode()).hexdigest() if digest else base
 
 
 def suite_plan(c: Candidate, suites: list[Suite]) -> list[tuple[Suite, list[str]]]:
     """(suite, its runnable files) for every suite in order that has some."""
-    return suite_plan_for(suites, runnable_files(c))
+    live = [f.path for f in c.test_files if f.status != "deleted"]
+    return suite_plan_for(suites, live, only_runnable=True)
 
 
-def suite_plan_for(suites: list[Suite], files: list[str]) -> list[tuple[Suite, list[str]]]:
-    """Split `files` by owner: each belongs to the first suite whose `test_paths` match it."""
+def suite_plan_for(suites: list[Suite], files: list[str], *, only_runnable: bool = False,
+                   ) -> list[tuple[Suite, list[str]]]:
+    """Split `files` by owner: each belongs to the suite `owning_suite` picks.
+    With `only_runnable`, a suite keeps just the files its own runnable rule accepts."""
     plan = []
     for s in suites:
-        own = [f for f in files if owning_suite(f, suites) == s.name]
+        own = [f for f in files if owning_suite(f, suites) == s.name
+               and (not only_runnable or s.is_runnable(f))]
         if own:
             plan.append((s, own))
     return plan
@@ -95,6 +156,8 @@ class VerifyResult:
     logs: dict = field(default_factory=dict)
     kept: list[str] = field(default_factory=list)  # workspace dirs kept by --keep
     command: str = ""
+    warnings: list[str] = field(default_factory=list)  # weak-task flags; never a rejection
+    hints: list[dict] = field(default_factory=list)  # diagnostics for a rejection (not cached)
 
     @property
     def verified(self) -> bool:
@@ -108,7 +171,8 @@ class VerifyResult:
                 "reason": self.reason, "cached": self.cached, "suite": self.suite,
                 "suites": self.suite.split("+") if self.suite else [],
                 "timings": self.timings, "logs": self.logs, "kept": self.kept,
-                "command": self.command}
+                "command": self.command, "warnings": self.warnings,
+                "hints": self.hints}
 
 
 # --- cache ---
@@ -133,9 +197,15 @@ def cached_result(c: Candidate, suites: "Suite | list[Suite]") -> VerifyResult |
             id=c.id, merge=c.merge, outcome=data["outcome"], reason=data.get("reason", ""),
             cached=True, suite=data.get("suite", ""), timings=data.get("timings", {}),
             logs=data.get("logs", {}), command=data.get("command", ""),
+            warnings=list(data.get("warnings", [])),
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def has_stale_cache(c: Candidate) -> bool:
+    """A cache entry exists for `c` but was produced with other settings than the current."""
+    return _cache_file(c.merge).is_file()
 
 
 def verified_label(c: Candidate, suites: list[Suite]) -> str | None:
@@ -154,25 +224,100 @@ def _write_cache(c: Candidate, suites: list[Suite], r: VerifyResult) -> None:
         "suites": [s.name for s in suites],
         "suite_hash": suites_hash(suites), "outcome": r.outcome, "reason": r.reason,
         "command": r.command, "timings": r.timings, "logs": r.logs,
-        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "warnings": r.warnings, "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }, indent=2) + "\n", encoding="utf-8")
+
+
+# --- weak-task warnings ---
+
+# Markers of tests that are skipped or pending: a task whose tests do not really run is weak.
+_JS_FILE = re.compile(r"\.(?:[cm]?[jt]sx?)$")
+# (label, regex, only for files matching this pattern or None for any file)
+SKIP_MARKERS: tuple[tuple[str, re.Pattern, re.Pattern | None], ...] = (
+    ("@Disabled", re.compile(r"@Disabled\b"), None),
+    ("@Ignore", re.compile(r"@Ignore\b"), None),
+    (".skip(", re.compile(r"\b(?:it|describe|test)\.skip\("), _JS_FILE),
+    ("xit(", re.compile(r"\bxit\("), None),
+    ("xdescribe(", re.compile(r"\bxdescribe\("), None),
+    ("pytest.mark.skip", re.compile(r"pytest\.mark\.skip"), None),
+    ("t.Skip(", re.compile(r"\bt\.Skip\("), None),
+    ('skip "', re.compile(r"""^\s*skip\s+["']""", re.MULTILINE), None),
+    ("pending", re.compile(r"""^\s*pending\s*(?:\(|['"]|$)""", re.MULTILINE), None),
+    ("[Fact(Skip=", re.compile(r"\[Fact\(\s*Skip\s*="), None),
+)
+
+
+def skip_marker_warnings(repo: Path, c: Candidate, files: list[str]) -> list[str]:
+    """One warning per runnable changed test file (merge version) that holds a skip marker."""
+    out = []
+    for path in files:
+        try:
+            text = _git(repo, "cat-file", "blob", f"{c.merge}:{path}").decode(
+                "utf-8", "replace")
+        except MineGitError:  # an unreadable blob is no reason to warn
+            text = ""
+        found = [name for name, rx, only in SKIP_MARKERS
+                 if (only is None or only.search(path)) and rx.search(text)]
+        if found:
+            out.append(f"{path} contains skip marker(s) {', '.join(found)}: "
+                       "some tests may not really run")
+    return out
+
+
+def compile_only_warning(res: "VerifyResult", failed_base: list[str]) -> list[str]:
+    """Warn when every failing base step died with a compile/type error and showed no test
+    counts: the tests fail because they use code the PR adds, not by assertion."""
+    if not failed_base:
+        return []
+    table = diagnostics.load_table()
+    for key in failed_base:
+        try:
+            text = Path(res.logs[key]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        body, code = diagnostics.split_log(text)
+        if diagnostics.ran_tests(body, table) or not any(
+                h.category == "compile" for h in diagnostics.diagnose(body, code, "test", table)):
+            return []
+    return [("base fails only with a compile/type error (the tests use code the PR adds), "
+             "not by a failing assertion: a weak task")]
+
+
+def rejection_diagnosis(res: "VerifyResult") -> tuple[str, list[diagnostics.Hint]]:
+    """(log path, diagnostics hints) of the step a rejection stopped at; ("", []) when none."""
+    if res.verified or not res.logs:
+        return "", []
+    key = list(res.logs)[-1]
+    path = res.logs[key]
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return path, []
+    body, code = diagnostics.split_log(text)
+    stage = "setup" if key.rsplit("-", 1)[-1] == "setup" else "test"
+    return path, diagnostics.diagnose(body, code, stage)
 
 
 # --- command building ---
 
 def build_command(suite: Suite, test_files: list[str]) -> str:
-    """Fill `{tests}` (paths relative to the suite cwd) and `{modules}` (dotted, relative to
-    `module_root`, `.py` stripped); every substituted path is shell-quoted."""
-    tests = [os.path.relpath(f, suite.cwd) for f in test_files]
-    mods = []
-    if suite.module_root is not None:
-        for f in test_files:
-            rel = PurePosixPath(os.path.relpath(f, suite.module_root))
-            mods.append(".".join(rel.with_suffix("").parts) if rel.suffix == ".py"
-                        else ".".join(rel.parts))
-    fills = {"tests": " ".join(shlex.quote(t) for t in tests),
-             "modules": " ".join(shlex.quote(m) for m in mods)}
-    return re.sub(r"\{(tests|modules)\}", lambda m: fills[m.group(1)], suite.test_command)
+    """Fill the suite's `test_command` placeholders (see `placeholders`) from the repo-relative
+    `test_files`. Raises `placeholders.OutsideRoot` for a `module` filter / `{modules}` meeting
+    a file outside its root."""
+    return placeholders.render(placeholders.parse(suite.test_command), test_files, suite.cwd,
+                               suite.module_root)
+
+
+def step_env(suite: Suite, test_files: list[str]) -> dict[str, str]:
+    """Environment of every setup/test step: the process env, the suite `env`, then Crucible's
+    own variables (they win): the suite's runnable files for wrapper scripts, and the scripts
+    dir when the home has one."""
+    env = {**os.environ, **suite.env,
+           "CRUCIBLE_TEST_FILES": "\n".join(test_files),
+           "CRUCIBLE_TEST_FILES_CWD": "\n".join(os.path.relpath(f, suite.cwd) for f in test_files)}
+    if scripts_digest():
+        env["CRUCIBLE_SCRIPTS"] = str(scripts_dir().resolve())
+    return env
 
 
 # --- running ---
@@ -190,10 +335,11 @@ def _run_step(command: str, cwd: Path, env: dict, timeout: float, log: Path) -> 
                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
             )
         except OSError as e:
-            out.write(f"could not start: {e}\n".encode())
+            out.write(f"could not start: {e}\nexit code: 127\n".encode())
             return 127, time.monotonic() - start
         try:
             code = proc.wait(timeout=timeout)
+            out.write(f"\nexit code: {code}\n".encode())
         except subprocess.TimeoutExpired:
             executor._terminate_group(proc)
             out.write(f"\ntimed out after {timeout}s and was killed\n".encode())
@@ -278,14 +424,17 @@ def _make_dir(label: str, c: Candidate) -> Path:
 
 
 def verify_candidate(
-    repo: Path, c: Candidate, suites: "Suite | list[Suite]", *, timeout: float = DEFAULT_TIMEOUT_S,
+    repo: Path, c: Candidate, suites: "Suite | list[Suite]", *, timeout: float | None = None,
     keep: bool = False, force: bool = False,
 ) -> VerifyResult:
     """Verify one candidate, or return its cached result. `suites` are the suites owning its
-    test files (a single Suite is accepted). Per side the tree is exported and the tests are
-    overlaid once, then each suite in order runs setup and its test command with only its own
-    runnable files. Base is verified if at least one suite fails; merge needs every suite to
-    pass. Raises MineGitError / WorkspaceError only for git problems."""
+    test files (a single Suite is accepted). Per side the tree is exported, every suite's
+    setup runs, then (base only) the PR's tests are overlaid once, then each suite in order runs
+    its test command with only its own runnable files. Base is verified if at least one suite fails; merge needs every suite to
+    pass. `timeout` (seconds) overrides every suite's test-step `timeout`; the setup step always
+    uses the suite's `setup_timeout`. Raises MineGitError / WorkspaceError for git problems and
+    ScriptsLinkError for a scripts symlink out of the home."""
+    scripts_files()  # refuse symlinks out of the home before anything runs (or is cached)
     involved = involved_suites(c, suites)
     multi = len(involved) > 1
     if not force:
@@ -316,24 +465,44 @@ def verify_candidate(
         if suite.module_root is not None and any(
                 os.path.relpath(f, suite.module_root).startswith("..") for f in files):
             return finish(tag("test outside module_root", suite))
-    commands = {s.name: build_command(s, files) for s, files in plan}
+    commands = {}
+    for suite, files in plan:
+        try:
+            commands[suite.name] = build_command(suite, files)
+        except placeholders.OutsideRoot:
+            return finish(tag("test outside module_root", suite))
     res.command = (next(iter(commands.values())) if not multi
                    else "\n".join(f"[{n}] {cmd}" for n, cmd in commands.items()))
+
+    plan_files = {s.name: files for s, files in plan}
 
     def step(side: str, suite: Suite, name: str, command: str, cwd: Path) -> int | None:
         key = f"{side}-{suite.name}-{name}" if multi else f"{side}-{name}"
         log = log_dir / f"{c.merge}.{key}.log"
         res.logs[key] = str(log)
-        code, secs = _run_step(command, cwd, {**os.environ, **suite.env}, timeout, log)
+        limit = suite.setup_timeout if name == "setup" else (
+            suite.timeout if timeout is None else timeout)
+        code, secs = _run_step(command, cwd, step_env(suite, plan_files[suite.name]), limit, log)
         res.timings[key] = round(secs, 3)
         return code
 
     dirs: list[Path] = []
+    failed_base: list[str] = []
     try:
         for side, ref in (("base", c.base), ("merge", c.merge)):
             ws = _make_dir(side, c)
             dirs.append(ws)
             workspace.export_tree(repo, ref, ws)
+            # Setup first, on the plain tree: build-tool setups that compile (Maven
+            # test-compile, Gradle testClasses) would fail on the PR's tests, which reference
+            # classes the base does not have yet. The tests are overlaid only afterwards.
+            for suite, _ in plan:
+                if suite.setup:
+                    code = step(side, suite, "setup", suite.setup, ws / suite.cwd)
+                    if code is None:
+                        return finish("timeout")
+                    if code != 0:
+                        return finish(tag(f"setup failed at {side}", suite))
             if side == "base":
                 try:
                     _overlay(repo, c, ws)
@@ -341,22 +510,19 @@ def verify_candidate(
                     return finish(UNSAFE_PATH)
             failed: list[str] = []
             for suite, _ in plan:
-                cwd = ws / suite.cwd
-                if suite.setup:
-                    code = step(side, suite, "setup", suite.setup, cwd)
-                    if code is None:
-                        return finish("timeout")
-                    if code != 0:
-                        return finish(tag(f"setup failed at {side}", suite))
-                code = step(side, suite, "test", commands[suite.name], cwd)
+                code = step(side, suite, "test", commands[suite.name], ws / suite.cwd)
                 if code is None:
                     return finish("timeout")
                 if code != 0:
                     failed.append(suite.name)
+                    if side == "base":
+                        failed_base.append(f"base-{suite.name}-test" if multi else "base-test")
                     if side == "merge":
                         return finish(tag("fails at merge", suite))
             if side == "base" and not failed:
                 return finish("passes at base")
+        res.warnings = (skip_marker_warnings(repo, c, [f for _, fs in plan for f in fs])
+                        + compile_only_warning(res, failed_base))
         return finish()
     finally:
         if keep:

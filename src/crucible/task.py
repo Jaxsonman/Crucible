@@ -57,6 +57,7 @@ class Task:
     source: str | None = None  # mined tasks: PR URL, or `commit:<merge sha>`
     max_budget_usd: float | None = None  # per-attempt cap; `crucible run --max-budget-usd` wins
     source_lines: int | None = None  # mined tasks: counted changed lines of the source change
+    check_timeout_minutes: int | None = None  # None: `crucible run` uses its 300 s default
 
     @property
     def repo_path(self) -> Path:
@@ -212,6 +213,8 @@ def load_task(path: str | Path) -> Task:
 
     timeout = _positive_int(fm, "timeout_minutes", 30, fail)
     max_turns = _positive_int(fm, "max_turns", 100, fail)
+    check_minutes = (_positive_int(fm, "check_timeout_minutes", 0, fail)
+                     if "check_timeout_minutes" in fm else None)
 
     sections = _sections(body)
     for name in SECTIONS:
@@ -244,6 +247,7 @@ def load_task(path: str | Path) -> Task:
         source=source,
         max_budget_usd=None if max_budget is None else float(max_budget),
         source_lines=source_lines,
+        check_timeout_minutes=check_minutes,
     )
 
 

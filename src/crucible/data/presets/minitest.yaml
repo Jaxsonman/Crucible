@@ -1,0 +1,24 @@
+# Minitest / Test::Unit. Rails' `bin/rails test` and `rake test` are convention-driven and take
+# at most paths in newer versions, so the portable form is plain ruby: put test/ and lib/ on the
+# load path and require each named file (minitest/autorun at the top of the file runs them at exit).
+name: minitest
+markers:
+  - {glob: test/test_helper.rb}
+  - {glob: Gemfile, contains: '(?m)^\s*gem\s+[''"]minitest'}
+  - {glob: Rakefile, contains: 'TestTask'}
+evidence: ["test/**/*_test.rb", "test/**/test_*.rb", "**/test/**/*_test.rb", "**/test/**/test_*.rb"]
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/*_test.rb"
+runnable:
+  - "*_test.rb"
+  - "test_*.rb"
+setup: ""
+test_command: ruby -Itest -Ilib -e 'ARGV.each { |f| require File.expand_path(f) }' {tests}
+variants:
+  - when: [Gemfile]
+    setup: bundle install --quiet
+    test_command: bundle exec ruby -Itest -Ilib -e 'ARGV.each { |f| require File.expand_path(f) }' {tests}
+notes: >-
+  test/test_helper.rb also matches test_*.rb and is loaded as a "test" when changed (harmless).
+  Rails apps need their database prepared in setup.

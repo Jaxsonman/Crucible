@@ -1,0 +1,54 @@
+# Playwright Test. `playwright test <file> ...` runs the files whose absolute path matches any
+# argument (positional arguments are regular expressions, so a path with [id] or other regex
+# characters can select nothing). The browsers are installed in setup. A suite in its own
+# directory (e2e/ with its own playwright.config) owns its specs over an enclosing Jest or Vitest
+# suite because it is deeper; in one directory the first suite listed owns shared *.spec.* files.
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it, `{suite_cd}` the `cd` back). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
+name: playwright
+markers:
+  - {glob: "playwright.config.*"}
+test_paths:
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/e2e/**"
+  - "{suite_dir}/tests/**"
+  - "{suite_dir}/**/*-snapshots/**"
+runnable:
+  - "{suite_dir}/**/*.spec.{ts,js,mjs,cjs,mts,cts}"
+setup:
+  - npm install --no-package-lock --silent
+  - npx playwright install
+test_command: npx playwright test {tests}
+variants:
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup:
+      - "{lock_cd}pnpm install --frozen-lockfile"
+      - "{suite_cd}pnpm exec playwright install"
+    test_command: pnpm exec playwright test {tests}
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+      - "{suite_cd}yarn playwright install"
+    test_command: yarn playwright test {tests}
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup:
+      - "{lock_cd}bun install --frozen-lockfile"
+      - "{suite_cd}bunx playwright install"
+    test_command: bunx playwright test {tests}
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup:
+      - "{lock_cd}npm ci --silent"
+      - "{suite_cd}npx playwright install"
+    test_command: npx playwright test {tests}
+notes: >-
+  Needs the browsers (installed in setup; system libraries may need `playwright install --with-deps`
+  as root). A webServer in playwright.config starts the app itself. Specs outside the config's
+  testDir select nothing.

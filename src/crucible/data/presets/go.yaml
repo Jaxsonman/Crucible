@@ -1,0 +1,18 @@
+# Go. `go test <pkg-dir>` runs one package; test files are not individual targets, so each
+# changed _test.go file selects its directory (`./pkg`). Paths are relative to the suite cwd and
+# `./` keeps a directory from being read as a flag. -count=1 bypasses the test result cache so
+# a verification run always executes the tests.
+name: go
+markers:
+  - {glob: go.mod}
+evidence: ["**/*_test.go"]
+test_paths:
+  - "{suite_dir}/**/*_test.go"
+  - "{suite_dir}/**/testdata/**"
+runnable:
+  - "*_test.go"
+setup: go mod download
+test_command: go test -count=1 {tests|dir|unique|prefix:./}
+notes: >-
+  A changed file under testdata/ is a test file but selects no package. Needs cgo or build tags
+  for some repos: add them to test_command.

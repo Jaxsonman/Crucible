@@ -1,0 +1,50 @@
+# Vitest. `vitest run <file> ...` runs once (no watch mode) and treats positional arguments as
+# substring filters on the file path, so the repo-relative file names select those files.
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
+name: vitest
+markers:
+  - {glob: package.json, contains: '"vitest"\s*:'}
+  - {glob: "vitest.config.*"}
+# a repo that lists both is usually mid-migration to Vitest
+supersedes: [jest]
+test_paths:
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*.spec.*"
+  - "{suite_dir}/**/__tests__/**"
+  - "{suite_dir}/**/__snapshots__/**"
+  - "{suite_dir}/**/__mocks__/**"
+runnable:
+  - "{suite_dir}/**/*.{test,spec}.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"
+  - "{suite_dir}/**/__tests__/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"
+  - "!**/__snapshots__/**"
+setup: npm install --no-package-lock --silent
+test_command: npx vitest run {tests}
+variants:
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup: "{lock_cd}pnpm install --frozen-lockfile"
+    test_command: pnpm exec vitest run {tests}
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+    test_command: yarn vitest run {tests}
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup: "{lock_cd}bun install --frozen-lockfile"
+    test_command: bunx vitest run {tests}
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup: "{lock_cd}npm ci --silent"
+    test_command: npx vitest run {tests}
+notes: >-
+  Positional arguments are substring filters, not exact paths: src/a.test.ts also selects
+  src/a.test.tsx and other files containing that text, so a few extra tests may run. `vitest run`
+  never starts watch mode. Vitest's default include is only *.test/*.spec files; files under
+  __tests__ are runnable here as for Jest, so list them in the project's `include` or narrow
+  `runnable`. A changed snapshot alone has nothing runnable and is rejected.

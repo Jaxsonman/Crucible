@@ -1,0 +1,19 @@
+# Elixir ExUnit. `mix test <file> ...` runs the named test files (any number of them).
+name: mix
+markers:
+  # an umbrella project builds its apps from the root
+  - {glob: mix.exs, contains: 'apps_path', aggregator: true}
+  - {glob: mix.exs}
+evidence: ["**/test/**/*_test.exs"]
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/test/**"
+runnable:
+  - "*_test.exs"
+setup: mix local.hex --force --if-missing && mix local.rebar --force --if-missing && mix deps.get
+env:
+  MIX_ENV: test
+test_command: mix test {tests}
+notes: >-
+  Umbrella projects resolve paths per app; if calibration reports "no tests", run mix from the
+  app directory instead. Setup installs Hex and rebar (needed on a fresh machine) and runs with MIX_ENV=test.

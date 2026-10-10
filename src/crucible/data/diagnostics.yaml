@@ -1,0 +1,375 @@
+# Diagnosis hints for `crucible mine calibrate`: regex over a step's log + exit code -> hint.
+# Contributors add rows here (plus a sample log in tests/test_mine_diagnostics.py; a test fails
+# for a row without one). Keep every hint pointing at a concrete mine.yaml field.
+#
+# A rule has: id (unique), category, hint, and `pattern` (regex searched in the log, MULTILINE,
+# case-sensitive unless it starts with (?i)) and/or `exit` (list of exit codes). When both are
+# given, both must match. Optional: `stage` (setup | test | list of them), `status`
+# (no-tests-ran: the rule says the runner found no tests; it turns a rejected sample into that
+# suite status), `unless` (regex: the row does not apply to a log it matches, e.g. a "no test
+# files" line for one package while other packages ran tests). A row with a `status` also never
+# applies when the log matches a `ran_tests` pattern (test counts are present). `suppresses`
+# (list of row ids): a root-cause row hides those generic symptom rows when it matches (a Ruby
+# LoadError before "0 examples" explains the empty run; do not also say "no tests ran").
+
+# Patterns showing that tests really ran (pass/fail counts).
+ran_tests:
+  - '^ok\s+\S+\s+(?:[\d.]+s|\(cached\))(?!.*no tests to run)'   # go test (not "[no tests to run]")
+  - '^--- (?:PASS|FAIL):'                           # go test: a test ran (not "[build failed]")
+  - 'Tests run: [1-9]'                               # maven surefire
+  - '^Tests:\s+.*\b[1-9]\d* (?:passed|failed)'      # jest (the Tests: line, not Test Suites:)
+  - '^(?!\s*Test Suites:).*\b[1-9]\d* (?:passed|failed)\b'   # pytest, vitest, ...
+  - '\b[1-9]\d* tests? completed'                   # gradle
+  - '\b[1-9]\d* examples?, '                        # rspec
+
+rules:
+  - id: runner-exit-127
+    category: missing-tool
+    exit: [127]
+    hint: >-
+      Exit 127: the runner (or a tool it calls) is not installed, or `cwd` is wrong. Install it
+      in the suite's `setup`, fix `cwd`, or correct the executable in `test_command`. If the
+      toolchain is not installed on this host, run it in a container through a wrapper script in
+      `.crucible/scripts/` (`test_command: bash "$CRUCIBLE_SCRIPTS/run-tests.sh" {tests}`).
+
+  - id: command-not-found
+    category: missing-tool
+    pattern: 'command not found|is not recognized as an internal or external command'
+    hint: >-
+      A command was not found: install the tool in the suite's `setup`, point `test_command` at
+      the right executable (for example `./gradlew`, `npx`, `bundle exec`), or fix `cwd`.
+
+  - id: runner-file-missing
+    category: missing-tool
+    pattern: '^(?:\S+: )*(?:line \d+: )?\S+: No such file or directory|^(?:\S+: )?exec: .+: not found|exec: "[^"]+": executable file not found'
+    hint: >-
+      A script or binary run by `setup` / `test_command` (or by a wrapper script it calls) does
+      not exist at that path. Check `cwd` (paths are relative to it) and the file name; a
+      wrapper belongs in `.crucible/scripts/` and is run as `bash "$CRUCIBLE_SCRIPTS/<name>"`.
+
+  - id: permission-denied
+    category: permission
+    pattern: 'Permission denied|EACCES'
+    hint: >-
+      Permission denied: run the script through its interpreter (`bash ./run-tests.sh`) or chmod
+      it in `setup`; do not rely on exec bits. Avoid installs that need root: use a local
+      prefix, venv or `--user`.
+
+  - id: exit-126
+    category: permission
+    exit: [126]
+    hint: >-
+      Exit 126: the command exists but is not executable. Run it via its interpreter in
+      `test_command` (`bash ./script.sh`) or chmod it in `setup`.
+
+  - id: pytest-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    exit: [5]
+    pattern: 'no tests ran|collected 0 items'
+    hint: >-
+      pytest exit 5, no tests collected: the files passed to the runner are not tests it
+      collects. Check `runnable` and `test_command` (is `{tests}` given, from the right `cwd`?),
+      and `python_files` / `testpaths` in the repo's pytest config.
+
+  - id: no-tests-generic
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: '(?i)\bno tests ran\b|collected 0 items'
+    hint: >-
+      The runner ran no tests: the selected files were not picked up. Check `runnable`, the
+      `{tests}` placeholder and its filters in `test_command`, and `cwd`.
+
+  - id: pytest-path-not-found
+    category: wrong-path
+    pattern: 'ERROR: file or directory not found|ERROR: not found: '
+    hint: >-
+      pytest cannot find the test path: it is probably relative to the wrong directory. Check
+      `cwd` and the `module:` / `dir` filters in `test_command`.
+
+  - id: jest-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No tests found'
+    unless: '^Tests:\s+.*\b[1-9]\d* (?:passed|failed)'
+    hint: >-
+      jest found no tests for the given files: check `runnable` (extensions, directories),
+      `cwd` (jest resolves paths from its root), and jest's `testMatch` / `roots`.
+
+  - id: vitest-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No test files found, exiting with code'
+    hint: >-
+      vitest matched none of the given files: check `runnable`, `cwd` (the vitest project root)
+      and the `include` globs in the repo's vitest config.
+
+  - id: mocha-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'Error: No test files found'
+    hint: >-
+      mocha found no files: check `runnable` and that `test_command` passes `{tests}` (and the
+      repo's `.mocharc` spec / extension settings) from the right `cwd`.
+
+  - id: maven-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No tests were executed|No tests to run|No tests were run'
+    unless: 'Tests run: [1-9]'
+    hint: >-
+      Maven ran no tests: `-Dtest=` takes class names (`{tests|stem|join:,}`); check `runnable`
+      (`**/*Test.java`, `*Tests.java`, `*IT.java`), `cwd` (module directory) and
+      `-DfailIfNoTests=false` / `-Dsurefire.failIfNoSpecifiedTests=false` in `test_command`.
+
+  - id: gradle-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No tests found for given includes'
+    unless: '\b[1-9]\d* tests? completed|Tests run: [1-9]'
+    hint: >-
+      Gradle matched no tests for `--tests`: pass fully qualified class names
+      (`{tests|module:src/test/java|prefix:--tests }`), check `module_root` and the Gradle
+      subproject in `cwd`.
+
+  - id: go-no-test-files
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'no test files'
+    unless: '^ok\s+\S+\s+(?:[\d.]+s|\(cached\))(?!.*no tests to run)|^--- (?:PASS|FAIL):'
+    hint: >-
+      go found no test files in the package: check `runnable` (`**/*_test.go`) and that
+      `test_command` passes the package directories (`{tests|dir|unique|prefix:./}`) from the
+      module root (`cwd`).
+
+  - id: go-no-tests-to-run
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: '\[no tests to run\]'
+    hint: >-
+      go ran no tests (`[no tests to run]`): the `-run` filter or the packages given matched
+      no test function. Check `runnable`, the `{tests}` placeholder filters in `test_command`,
+      and `cwd` (the module root).
+
+  - id: go-package-not-found
+    category: wrong-path
+    pattern: 'cannot find package|directory not found|no Go files in'
+    hint: >-
+      go cannot find the package: `cwd` must be the directory holding go.mod (or use the right
+      module path) and the `dir` filter output must be relative to it.
+
+  - id: cargo-no-test-target
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'no test target named'
+    hint: >-
+      cargo has no such test target: integration tests are named after their file in `tests/`.
+      Check `runnable`, `cwd` (the crate or workspace member) and the `--test` argument in
+      `test_command`; or run the whole suite with no placeholder.
+
+  - id: rspec-no-examples
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: '\b0 examples, 0 failures|No examples found'
+    hint: >-
+      rspec ran 0 examples: check `runnable` (`spec/**/*_spec.rb`), `cwd`, and that the files
+      from `{tests}` are given to `bundle exec rspec`.
+
+  - id: phpunit-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No tests executed'
+    hint: >-
+      phpunit ran no tests: check `runnable` (`*Test.php`), `cwd` (where phpunit.xml lives) and
+      that `test_command` passes `{tests}` to phpunit.
+
+  - id: dotnet-no-match
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'No test matches the given testcase filter'
+    hint: >-
+      dotnet test matched no tests: the `--filter` expression must use names that exist (for
+      example `FullyQualifiedName~` with the class names from `{tests|stem}`); check `runnable`
+      and `cwd` (solution or test project).
+
+  - id: mix-no-tests
+    category: no-tests-ran
+    status: no-tests-ran
+    pattern: 'There are no tests to run'
+    hint: >-
+      mix test found no tests: check `runnable` (`test/**/*_test.exs`), `cwd` (the umbrella app
+      directory) and that `{tests}` is passed to `mix test`.
+
+  - id: python-import-error
+    category: missing-dependency
+    pattern: 'ModuleNotFoundError|ImportError: (?:No module|cannot import)'
+    hint: >-
+      A Python import failed: install the dependency in `setup` (requirements, an extra such as
+      `.[test]`), set `env: {PYTHONPATH: .}` (or `src`), or fix `cwd` / `module_root` so the
+      package is importable.
+
+  - id: java-class-missing
+    category: missing-dependency
+    pattern: 'ClassNotFoundException|NoClassDefFoundError|cannot find symbol|package \S+ does not exist'
+    hint: >-
+      Java cannot resolve a class: build the dependencies first in `setup` (for example
+      `mvn -q install -DskipTests`, or `./gradlew classes testClasses`), and check `cwd`
+      (module directory) and `module_root`.
+
+  - id: node-module-missing
+    category: missing-dependency
+    pattern: 'Cannot find module|ERR_MODULE_NOT_FOUND|Cannot find package'
+    hint: >-
+      Node cannot find a module: run the repo's install in `setup` (`npm ci`, `pnpm install
+      --frozen-lockfile`, `yarn install --immutable`) in the right `cwd` (workspace root for
+      monorepos), and build workspace packages the tests import.
+
+  - id: missing-env-keyerror
+    category: missing-env
+    pattern: "KeyError: '[A-Z][A-Z0-9_]+'"
+    hint: >-
+      The code reads an environment variable that is not set: add it under the suite's `env:`
+      with a dummy value (never a real secret).
+
+  - id: missing-env-message
+    category: missing-env
+    pattern: '(?i)environment variable \S+ (?:is )?(?:not set|missing|required|undefined)|missing required environment|ImproperlyConfigured'
+    hint: >-
+      A required setting or environment variable is missing: add it under `env:` with a dummy
+      value (for Django, `DJANGO_SETTINGS_MODULE` and `SECRET_KEY=dummy...`); never a real
+      secret.
+
+  - id: db-connection-refused
+    category: service-unavailable
+    pattern: "could not connect to server|ECONNREFUSED|[Cc]onnection refused|Can't connect to (?:MySQL|local)|connection to server at .* failed"
+    hint: >-
+      A service (database, queue, cache) is not reachable. Prefer the repo's own test setup:
+      start it in `setup` (`docker compose up -d --wait db`), or switch the tests to the
+      in-memory/SQLite option via `env:` (dummy credentials only).
+
+  - id: timeout-setup
+    category: timeout
+    stage: setup
+    pattern: 'timed out after [0-9.]+s and was killed'
+    hint: >-
+      Setup hit its time limit: raise the suite's `setup_timeout` (seconds, default 1800) or
+      make `setup` cheaper (frozen installs, no builds you do not need).
+
+  - id: timeout-test
+    category: timeout
+    stage: test
+    pattern: 'timed out after [0-9.]+s and was killed'
+    hint: >-
+      The test step hit its time limit: raise the suite's `timeout` (seconds, default 600) or
+      `--timeout S`, or narrow the command to the selected files so it does not run the whole
+      suite or wait on a missing service.
+
+  - id: jvm-no-java-toolchain
+    category: toolchain
+    pattern: 'Cannot find a Java installation|No matching toolchains? found|Unable to download toolchain'
+    hint: >-
+      Gradle needs a JDK this machine does not have (see `languageVersion=N` in the log). Set
+      `JAVA_HOME` to a matching JDK under the suite's `env`, or run the build in a container
+      through a wrapper script in `.crucible/scripts/` (`test_command: bash
+      "$CRUCIBLE_SCRIPTS/run-tests.sh" {tests}`).
+
+  - id: jvm-version-mismatch
+    category: toolchain
+    pattern: 'release version \d+ not supported|invalid (?:target|source) release|Unsupported class file major version|UnsupportedClassVersionError|class file version \d+'
+    hint: >-
+      The JDK on this host does not match what the build needs (too old for the target release,
+      or too new for the build tooling). Set `JAVA_HOME` under the suite's `env` to a matching
+      JDK, or use a container wrapper script in `.crucible/scripts/`.
+
+  - id: lombok-accessors-missing
+    category: toolchain
+    suppresses: [java-class-missing]
+    # main code only: a hidden test calling a getter the fix adds is the normal fail-before case
+    pattern: '(?s)src/main/[^\n]*cannot find symbol.{0,300}?symbol:\s+method (?:(?:get|set|is)[A-Z]\w*\(\)|builder\(\))'
+    hint: >-
+      Accessors missing in main code: if they come from Lombok, the JDK is probably newer than the build supports;
+      set `JAVA_HOME` in `env` to the JDK version the project targets (see the comment in
+      `mine.yaml`).
+
+  - id: lombok-new-jdk
+    category: toolchain
+    suppresses: [java-class-missing]
+    pattern: '(?is)ExceptionInInitializerError.*lombok|lombok.*ExceptionInInitializerError|symbol:\s+method (?:get|set|is)[A-Z]\w*\(.*lombok|lombok.*symbol:\s+method (?:get|set|is)[A-Z]\w*\('
+    hint: >-
+      Lombok failed to process the sources, which usually means the JDK is newer than this
+      Lombok version supports. Set `JAVA_HOME` under the suite's `env` to the JDK the project
+      builds with (see its CI), or use a container wrapper script in `.crucible/scripts/`.
+
+  - id: ruby-load-error
+    category: toolchain
+    suppresses: [rspec-no-examples, no-tests-generic]
+    pattern: 'LoadError: cannot load such file|cannot load such file --'
+    hint: >-
+      The runner errored before tests ran (LoadError): a gem or file could not be loaded, often
+      because the Ruby version does not match the project's (`.ruby-version`) or the gems are
+      not installed. Install them in `setup` (`bundle config set --local path vendor/bundle && bundle install`), use an
+      older Ruby on `PATH` via `env`, or run in a container wrapper script in
+      `.crucible/scripts/`.
+
+  - id: node-engine-mismatch
+    category: toolchain
+    pattern: 'Unsupported engine|The engine "node" is incompatible'
+    hint: >-
+      The Node version on this host does not satisfy the package's `engines`. Put a matching
+      Node first on `PATH` via the suite's `env`, or run in a container wrapper script in
+      `.crucible/scripts/`.
+
+  - id: compile-error-jvm
+    category: compile
+    pattern: 'COMPILATION ERROR|error: (?:cannot find symbol|package \S+ does not exist|incompatible types)|Compilation failed|^e: file://'
+    hint: >-
+      The code does not compile. At base this is expected when the tests use code the PR adds
+      (a weak task: prefer candidates that fail by assertion); at merge, fix `setup` / `env`
+      (JDK, dependencies) so the build works.
+
+  - id: compile-error-ts
+    category: compile
+    pattern: 'error TS\d+:|TSError: '
+    hint: >-
+      TypeScript type errors. At base this is expected when the tests use types or exports the
+      PR adds (a weak task); at merge, check the `setup` build step and `cwd`.
+
+  - id: compile-error-go
+    category: compile
+    pattern: '\[build failed\]|^\S+\.go:\d+:\d+: (?:undefined|cannot use)'
+    hint: >-
+      Go build failure. At base this is expected when the tests use symbols the PR adds (a weak
+      task); at merge, check `cwd` (the module root), `setup` and build tags in `test_command`.
+
+  - id: compile-error-other
+    category: compile
+    pattern: 'error\[E\d+\]|error CS\d+:'
+    hint: >-
+      Compilation failed (Rust/C#). At base this is expected when the tests use items the PR
+      adds (a weak task); at merge, check `setup`, `cwd` and the toolchain.
+
+# Hints keyed by the suite status that calibrate computed (no log needed).
+status_hints:
+  not-selective: >-
+    Every sampled PR passes at its base commit, so the command is not running (or not
+    distinguishing) the selected tests. Check that `test_command` uses `{tests}` (or
+    `$CRUCIBLE_TEST_FILES` in a wrapper under `.crucible/scripts/`), that `runnable` matches the
+    changed files, and that `cwd` is right.
+  no-tests-ran: >-
+    The runner reports no tests for the selected files: fix `runnable`, the `{tests}` placeholder
+    filters in `test_command`, or `cwd`.
+  failing: >-
+    The tests fail at the merge commit for every sample: read the log tail, then adjust `setup`,
+    `env`, `cwd` or `test_command` (the runner may need a service or a build step first).
+  setup-failed: >-
+    `setup` fails at HEAD in a clean checkout: read the log tail and fix the install/build
+    command, or the toolchain it assumes.
+  timeout: >-
+    A step hit its time limit: raise `timeout` / `setup_timeout` in the suite or pass
+    `--timeout S`.
+  mixed: >-
+    The samples fail in different ways: fix the first one in the sample list, then rerun.
+  no-candidates: >-
+    No recent PR in the walked history changes runnable tests owned by this suite, so there is
+    nothing to calibrate against yet. Not a failure; check `test_paths` / `runnable`, or raise
+    `--limit`.

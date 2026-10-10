@@ -102,7 +102,7 @@ def run_attempt(
     prompt_sha: str,
     max_budget_usd: float,
     keep_workspaces: bool,
-    check_timeout_s: float = checker.DEFAULT_TIMEOUT_S,
+    check_timeout_s: float | None = None,
     judge_config: Config | None = None,
 ) -> tuple[records.Record, bool]:
     """Run and record one attempt. Returns (record, interrupted)."""
@@ -148,7 +148,7 @@ def run_attempt(
         )
     if ws is not None and not interrupted:
         try:
-            check = checker.run_check(task, ws, check_timeout_s)
+            check = checker.run_check(task, ws, checker.timeout_for(task, check_timeout_s))
         except KeyboardInterrupt:
             interrupted = True
             res = ExecResult(

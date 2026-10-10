@@ -1,0 +1,45 @@
+# Node's built-in test runner: detected when package.json's `test` script runs `node --test`.
+# `node --test <file> ...` runs exactly the files named (no extra flags such as --import tsx
+# from the script are added; put them in test_command if the tests need them).
+# Package manager: the lockfile decides (pnpm-lock.yaml, yarn.lock, bun.lockb/bun.lock,
+# package-lock.json), looked for in the suite directory and then up to the repo root (a workspace
+# root); install runs in the lockfile's directory (`{lock_cd}` is the `cd` into it). With no
+# lockfile, `npm install --no-package-lock` keeps the tree free of a generated lockfile.
+name: node-test
+markers:
+  - {glob: package.json, contains: '(?s)"scripts"\s*:\s*\{[^{}]*?"test"\s*:\s*"[^"]*\bnode\b[^"]*--test\b'}
+test_paths:
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/*.test.*"
+  - "{suite_dir}/**/*-test.*"
+  - "{suite_dir}/**/*_test.*"
+  - "{suite_dir}/**/test-*.*"
+runnable:
+  # node's default discovery patterns
+  - "{suite_dir}/**/*.test.{js,mjs,cjs}"
+  - "{suite_dir}/**/*-test.{js,mjs,cjs}"
+  - "{suite_dir}/**/*_test.{js,mjs,cjs}"
+  - "{suite_dir}/**/test-*.{js,mjs,cjs}"
+  - "{suite_dir}/**/test.{js,mjs,cjs}"
+  - "{suite_dir}/**/test/**/*.{js,mjs,cjs}"
+setup: npm install --no-package-lock --silent
+test_command: node --test {tests}
+variants:
+  - when: [pnpm-lock.yaml]
+    ancestors: true
+    setup: "{lock_cd}pnpm install --frozen-lockfile"
+  - when: [yarn.lock]
+    ancestors: true
+    setup:
+      - first:
+          - {when: [.yarnrc.yml], run: "{lock_cd}yarn install --immutable"}
+          - "{lock_cd}yarn install --frozen-lockfile"
+  - when: [bun.lockb, bun.lock]
+    ancestors: true
+    setup: "{lock_cd}bun install --frozen-lockfile"
+  - when: [package-lock.json, npm-shrinkwrap.json]
+    ancestors: true
+    setup: "{lock_cd}npm ci --silent"
+notes: >-
+  TypeScript tests need a loader flag (for example --import tsx) in test_command, as in the
+  package's own test script.

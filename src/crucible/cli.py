@@ -1,9 +1,12 @@
 """Crucible command line interface."""
 
 import argparse
+import difflib
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from crucible import (
@@ -18,6 +21,7 @@ from crucible import (
     runner,
     workspace,
 )
+from crucible.mine import calibrate as mine_calibrate
 from crucible.mine import candidates as mine_candidates
 from crucible.mine import config as mine_config
 from crucible.mine import gh as mine_gh
@@ -88,7 +92,7 @@ def _init(args: argparse.Namespace) -> int:
 
 def _task_validate(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
     except TaskError as e:
         print(e, file=sys.stderr)
         return 1
@@ -132,9 +136,33 @@ def _budget(args: argparse.Namespace, task) -> tuple[float, str]:
     return DEFAULT_MAX_BUDGET_USD, "default"
 
 
+def _task_path(arg: str) -> Path:
+    """The task directory for `arg`: the path itself, or a bare task id resolved against
+    `<home>/tasks/` (also when a same-named directory in the cwd is not a task). A bare id
+    that is neither raises TaskError listing the available tasks."""
+    path = Path(arg)
+    if "/" in arg or os.sep in arg or (path / "task.md").is_file():
+        return path
+    try:
+        tasks = paths.tasks_dir()
+    except paths.CrucibleHomeError:
+        return path
+    if (tasks / arg).is_dir():
+        return tasks / arg
+    if path.exists():
+        return path  # not a task either: let load_task say what is wrong with it
+    names = sorted(p.name for p in tasks.iterdir() if (p / "task.md").is_file()) \
+        if tasks.is_dir() else []
+    msg = f"no task named {arg} in {tasks} (available: "
+    msg += (", ".join(names[:10]) + (", \u2026" if len(names) > 10 else "")) if names else "none"
+    close = difflib.get_close_matches(arg, names, n=1)
+    msg += ")" + (f"; did you mean {close[0]}?" if close else "")
+    raise TaskError(msg)
+
+
 def _run(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         cfgs = (
             configs.parse_configs(args.configs) if args.configs else configs.load_named(args.matrix)
         )
@@ -164,7 +192,7 @@ def _run(args: argparse.Namespace) -> int:
     if budget <= 0:
         print("--max-budget-usd must be positive", file=sys.stderr)
         return 1
-    if args.check_timeout <= 0:
+    if args.check_timeout is not None and args.check_timeout <= 0:
         print("--check-timeout must be positive", file=sys.stderr)
         return 1
     prompt_text = prompt.build_prompt(task)
@@ -493,6 +521,9 @@ def _mine(args: argparse.Namespace) -> int:
     if args.verify is not None and not args.verify:
         print("--verify needs at least one candidate id", file=sys.stderr)
         return 2
+    note = mine_calibrate.note(cfg.suites)
+    if note:
+        print(note, file=sys.stderr)
     try:
         kept, excluded = _mine_collect(args, top, cfg)
         if args.verify:
@@ -501,6 +532,7 @@ def _mine(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
     labels = [mine_verify.verified_label(c, cfg.suites) for c in kept]
+    _limit_hint(args, kept, excluded)
     if args.json:
         print(json.dumps({
             "candidates": [{**c.to_dict(), "verified": v} for c, v in zip(kept, labels)],
@@ -516,30 +548,113 @@ def _mine(args: argparse.Namespace) -> int:
     return 0
 
 
+def _limit_hint(args, kept, excluded) -> None:
+    """Few candidates among many exclusions after a walk that hit `--limit`: older history was
+    not scanned."""
+    scanned = len(kept) + len(excluded)
+    if scanned >= args.limit and len(kept) < 5 and len(excluded) > 2 * len(kept):
+        print(f"hint: {len(kept)} candidate(s) among {scanned} scanned ({len(excluded)} "
+              f"excluded); raise --limit (now {args.limit}) to scan further back",
+              file=sys.stderr)
+
+
+def _print_calibration(report) -> None:
+    rows = [["suite", "status", "setup", "samples", "detail"]]
+    for s in report.suites:
+        setup = ("none" if not s.setup.log and s.setup.ok
+                 else f"{'ok' if s.setup.ok else 'FAILED'} {s.setup.seconds:.1f}s")
+        done = sum(x.outcome == "verified" for x in s.samples)
+        rows.append([s.name, s.status, setup, f"{done}/{len(s.samples)} verified", s.detail])
+    widths = [max(len(r[j]) for r in rows) for j in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(cell.ljust(w) for cell, w in zip(r, widths)).rstrip())
+    for s in report.suites:
+        if s.status == "ok":
+            continue
+        print(f"\n{s.name}: {s.status}")
+        if not s.setup.ok:
+            print(f"  setup log: {s.setup.log}")
+        for x in s.samples:
+            if x.outcome != "verified":
+                log = list(x.logs.values())[-1] if x.logs else "-"
+                print(f"  {x.id}: {x.reason} (log {log})")
+        for h in s.hints:
+            print(f"  hint [{h.id}]: {h.hint}")
+        if s.status == "no-candidates":
+            print("  warning: nothing to sample; the suite is untested")
+
+
+def _mine_calibrate(args: argparse.Namespace) -> int:
+    setup = _mine_setup(args)
+    if isinstance(setup, int):
+        return setup
+    top, _, cfg = setup
+    if not cfg.suites:
+        print("no suites configured in mine.yaml; nothing to calibrate", file=sys.stderr)
+        return 1
+    unknown = [n for n in args.suite or [] if n not in {s.name for s in cfg.suites}]
+    if unknown:
+        print(f"unknown suite(s): {', '.join(unknown)} (configured: "
+              f"{', '.join(s.name for s in cfg.suites)})", file=sys.stderr)
+        return 2
+    try:
+        kept, _ = _mine_collect(args, top, cfg)
+        report = mine_calibrate.calibrate(
+            top, cfg.suites, kept, names=args.suite, n=args.candidates, timeout=args.timeout,
+            force=args.force)
+    except (mine_candidates.MineGitError, workspace.WorkspaceError,
+            mine_verify.ScriptsLinkError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    mine_calibrate.save(report, cfg.suites)
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        _print_calibration(report)
+    return 0 if report.ok else 1
+
+
 def _mine_verify(args, top: Path, cfg, kept, excluded) -> int:
     """Verify the requested candidates. Exit 1 if any id was skipped (unknown or excluded);
     a rejection is a normal outcome and exits 0."""
     by_id = {c.id: c for c in kept}
     why = {e.candidate.id: e.reason for e in excluded}
     results, skipped = [], False
-    for cid in dict.fromkeys(args.verify):
+    wanted = list(dict.fromkeys(args.verify))
+    for i, cid in enumerate(wanted, 1):
         c = by_id.get(cid)
         if c is None:
             reason = f"excluded: {why[cid]}" if cid in why else "not in the candidate list"
             print(f"{cid}: skipped ({reason})", file=sys.stderr)
             skipped = True
             continue
+        started = time.monotonic()
         try:
             r = mine_verify.verify_candidate(
                 top, c, mine_verify.involved_suites(c, cfg.suites), timeout=args.timeout, keep=args.keep, force=args.force)
+        except mine_verify.ScriptsLinkError as e:
+            print(e, file=sys.stderr)
+            return 1
         except (mine_candidates.MineGitError, workspace.WorkspaceError) as e:
             print(f"{cid}: skipped ({e})", file=sys.stderr)
             skipped = True
             continue
         results.append(r)
+        took = "" if r.cached else f" in {time.monotonic() - started:.0f}s"
+        label = "verified" if r.verified else f"rejected: {r.reason}"
+        print(f"[{i}/{len(wanted)}] {cid}: {label}{' (cached)' if r.cached else took}",
+              file=sys.stderr, flush=True)
+        log, hints = mine_verify.rejection_diagnosis(r)
+        r.hints = [h.to_dict() for h in hints]
         if not args.json:
             detail = "verified" if r.verified else f"rejected: {r.reason}"
             print(f"{cid}: {detail}" + (" (cached)" if r.cached else ""))
+            if log:
+                print(f"  log: {log}")
+            for h in hints:
+                print(f"  hint [{h.id}]: {h.hint}")
+            for w in r.warnings:
+                print(f"  warning: {w}")
             for d in r.kept:
                 print(f"  kept {d}")
     if args.json:
@@ -599,8 +714,12 @@ def _mine_scaffold(args: argparse.Namespace) -> int:
         suites = mine_verify.involved_suites(c, cfg.suites)
         r = mine_verify.cached_result(c, suites)
         if r is None:
-            print(f"cannot scaffold {args.id}: not verified; run `crucible mine --verify {c.id}`",
-                  file=sys.stderr)
+            if mine_verify.has_stale_cache(c):
+                print(f"cannot scaffold {args.id}: config changed since verification; "
+                      f"re-run --verify {c.id} (`crucible mine --verify {c.id}`)", file=sys.stderr)
+            else:
+                print(f"cannot scaffold {args.id}: not verified; run "
+                      f"`crucible mine --verify {c.id}`", file=sys.stderr)
             return 1
         if not r.verified:
             print(f"cannot scaffold {args.id}: rejected by verification ({r.reason})",
@@ -612,6 +731,10 @@ def _mine_scaffold(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
     print(f"created {task_dir / 'task.md'}")
+    needs = mine_scaffold.recorded_requires(task_dir)
+    if needs:
+        print(f"warning: this task requires {', '.join(needs)} on the machine that runs it "
+              "(recorded as `requires` in .mine.json)", file=sys.stderr)
     print("fill in the What / Why / Acceptance criteria sections, then run "
           f"`crucible mine prove {task_dir}`")
     return 0
@@ -634,7 +757,7 @@ def _print_flags(flags) -> None:
 
 def _mine_leakcheck(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         flags = _leak_flags(task)
     except (TaskError, mine_scaffold.ScaffoldError, mine_candidates.MineGitError,
             paths.CrucibleHomeError, workspace.WorkspaceError) as e:
@@ -652,7 +775,7 @@ def _mine_leakcheck(args: argparse.Namespace) -> int:
 
 def _mine_prove(args: argparse.Namespace) -> int:
     try:
-        task = load_task(Path(args.task_dir))
+        task = load_task(_task_path(args.task_dir))
         result = mine_scaffold.prove_task(task, args.timeout)
         flags = _leak_flags(task) if result.ok else []
     except (TaskError, mine_scaffold.ScaffoldError, mine_candidates.MineGitError,
@@ -668,10 +791,11 @@ def _mine_prove(args: argparse.Namespace) -> int:
     if result.ok:
         secs = result.merge_seconds
         print(f"proven: {result.task_id}" + ("" if secs is None else f" (merge check {secs:.1f}s)"))
-        if secs is not None and secs > checker.DEFAULT_TIMEOUT_S:
-            print(f"warning: merge check took {secs:.1f}s, over the default --check-timeout of "
-                  f"{checker.DEFAULT_TIMEOUT_S:g}s; raise --check-timeout when running this task",
-                  file=sys.stderr)
+        limit = checker.timeout_for(task)
+        if secs is not None and secs > limit:
+            print(f"warning: merge check took {secs:.1f}s, over the task's check timeout of "
+                  f"{limit:g}s; raise check_timeout_minutes in task.md or pass --check-timeout "
+                  f"when running this task", file=sys.stderr)
         return 0
     print(f"not proven: {result.task_id}: {result.failure}", file=sys.stderr)
     if result.log:
@@ -726,8 +850,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--max-budget-usd", type=float, default=None,
                            help="per-attempt spend cap in USD (default: the task's "
                                 "max_budget_usd, else 5.0)")
-            p.add_argument("--check-timeout", type=float, default=checker.DEFAULT_TIMEOUT_S,
-                           help="seconds before a hanging check is killed (default 300)")
+            p.add_argument("--check-timeout", type=float, default=None,
+                           help="seconds before a hanging check is killed (default: the task's "
+                                "check_timeout_minutes, else 300)")
             p.add_argument("--judge", action="store_true",
                            help="judge each attempt against the acceptance criteria")
             p.add_argument("--judge-config", help=f"judge model:effort (default {judge.DEFAULT_CONFIG})")
@@ -760,7 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
                                help="local: history to walk (default HEAD); gh: only PRs "
                                     "merged into this base branch (default all)")
                 q.add_argument("--limit", type=int, default=dflt(mine_candidates.DEFAULT_LIMIT),
-                               help="PRs / commits to walk (default 300)")
+                               help="max PRs (gh) or commits (local) scanned, newest first "
+                                    "(default 300); raise it when few candidates are found")
                 q.add_argument("--max-lines", type=_positive_int, default=dflt(None),
                                help="override max_changed_lines from mine.yaml")
                 q.add_argument("--local", action="store_true", default=dflt(False),
@@ -776,10 +902,26 @@ def build_parser() -> argparse.ArgumentParser:
                            help="with --verify: ignore cached results and run again")
             p.add_argument("--keep", action="store_true",
                            help="with --verify: keep the workspace dirs and print their paths")
-            p.add_argument("--timeout", type=float, default=mine_verify.DEFAULT_TIMEOUT_S,
-                           help="with --verify: seconds allowed per step (default 600)")
+            p.add_argument("--timeout", type=float, default=None,
+                           help="with --verify: seconds allowed for each test step, overriding "
+                                "the suites' `timeout` (default: per suite, 600)")
             p.set_defaults(func=_mine)
-            mine_sub = p.add_subparsers(dest="mine_command", metavar="{show,scaffold,prove,leakcheck}")
+            mine_sub = p.add_subparsers(
+                dest="mine_command", metavar="{calibrate,show,scaffold,prove,leakcheck}")
+            ca = mine_sub.add_parser(
+                "calibrate", help="Prove each suite's config runs the repo's tests; diagnose it")
+            ca.add_argument("--candidates", type=_positive_int,
+                            default=mine_calibrate.DEFAULT_CANDIDATES, metavar="N",
+                            help="candidates to verify per suite (default 3)")
+            ca.add_argument("--suite", action="append", metavar="NAME",
+                            help="only this suite (repeatable; default all)")
+            ca.add_argument("--timeout", type=float, default=argparse.SUPPRESS,
+                            help="seconds allowed for each test step, overriding the suites' "
+                                 "`timeout` (setup keeps `setup_timeout`)")
+            ca.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
+                            help="ignore cached verification results and run again")
+            common(ca, hidden=True)
+            ca.set_defaults(func=_mine_calibrate)
             sh = mine_sub.add_parser("show", help="One candidate with its test and non-test diffs")
             sh.add_argument("id", help="candidate id (PR number or short SHA)")
             common(sh, hidden=True)
@@ -794,8 +936,9 @@ def build_parser() -> argparse.ArgumentParser:
             pr = mine_sub.add_parser(
                 "prove", help="Prove a finished mined task's check: fails at ref, passes at merge")
             pr.add_argument("task_dir")
-            pr.add_argument("--timeout", type=float, default=mine_verify.DEFAULT_TIMEOUT_S,
-                            help="seconds allowed per check run (default 600)")
+            pr.add_argument("--timeout", type=float, default=None,
+                            help="seconds allowed per check run (default: recorded at scaffold "
+                                 "time as the suites' setup + test timeouts, else 600)")
             pr.add_argument("--allow-leaks", action="store_true",
                             help="do not fail when the task text leaks the solution")
             pr.set_defaults(func=_mine_prove)

@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -47,7 +47,7 @@ class Candidate:
     test_files: list[FileChange]
     other_files: list[FileChange]
     lines_changed: int  # added + deleted over every changed file
-    suites: list[str]  # suites owning the test files, config order (first matching suite owns a file)
+    suites: list[str]  # suites owning the test files, config order (see `owning_suite`)
     suggested_kind: str
     source: str  # PR URL, or `commit:<merge sha>` without gh
     url: str | None = None
@@ -185,16 +185,28 @@ def suggest_kind(labels: list[str], branch: str | None, title: str) -> str:
     return "feature"
 
 
+def _depth(suite: Suite) -> int:
+    return 0 if suite.cwd == "." else len(PurePosixPath(suite.cwd).parts)
+
+
 def owning_suite(path: str, suites: list[Suite]) -> str | None:
-    """The first suite (config order) whose `test_paths` match `path`."""
-    return next((s.name for s in suites if path_matches(path, s.test_paths)), None)
+    """The suite owning test file `path`: among the suites whose `test_paths` match, the one
+    with the deepest `cwd`; within that depth, one whose `runnable` rule accepts the file (so a
+    broad glob never takes a file another suite can run); then config order. A file nobody can
+    run (a helper, a fixture) goes to the first of the deepest matching suites."""
+    matching = [s for s in suites if path_matches(path, s.test_paths)]
+    if not matching:
+        return None
+    deepest = max(_depth(s) for s in matching)
+    tier = [s for s in matching if _depth(s) == deepest]
+    return next((s for s in tier if s.is_runnable(path)), tier[0]).name
 
 
 def split_files(
     changes: list[FileChange], suites: list[Suite]
 ) -> tuple[list[FileChange], list[FileChange], list[str]]:
     """(test files, other files, suites owning test files in config order). A test file
-    matches some suite's `test_paths`; the first matching suite owns it."""
+    matches some suite's `test_paths`; `owning_suite` picks the owner."""
     tests, other, owners = [], [], set()
     for f in changes:
         owner = owning_suite(f.path, suites)

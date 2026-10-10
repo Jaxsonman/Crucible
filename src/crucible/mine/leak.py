@@ -72,29 +72,83 @@ def _is_comment_hash(text: str, i: int) -> bool:
     return i == 0 or text[i - 1] in " \t\n"
 
 
-def strip_non_code(lines: list[str]) -> str:
+@dataclass(frozen=True)
+class CommentSyntax:
+    line: tuple[str, ...]
+    block: tuple[tuple[str, str], ...] = ()
+
+
+_C_LIKE = CommentSyntax(("//",), (("/*", "*/"),))
+# Unknown extension: the permissive union (what the check always did).
+DEFAULT_SYNTAX = CommentSyntax(("#", "//"), (("/*", "*/"),))
+_HASH = CommentSyntax(("#",))
+_DASH = CommentSyntax(("--",))
+_SQL = CommentSyntax(("--",), (("/*", "*/"),))
+# Markup files embed scripts and styles, so they take `<!-- -->` plus the C-like comments.
+_MARKUP = CommentSyntax(("//",), (("<!--", "-->"), ("/*", "*/")))
+_LUA = CommentSyntax(("--",), (("--[[", "]]"),))
+SYNTAX_BY_EXT: dict[str, CommentSyntax] = {
+    **dict.fromkeys(
+        ["py", "rb", "sh", "bash", "zsh", "yaml", "yml", "toml", "pl", "pm", "r", "ps1", "mk", "cmake", "tf"], _HASH),
+    **dict.fromkeys(
+        ["java", "kt", "kts", "scala", "go", "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "cs", "swift", "dart", "c", "h", "cc", "cpp", "cxx", "hpp", "m", "groovy", "gradle", "scss", "less"], _C_LIKE),
+    "php": CommentSyntax(("//", "#"), (("/*", "*/"),)),
+    "css": CommentSyntax((), (("/*", "*/"),)),
+    "sql": _SQL,
+    **dict.fromkeys(["hs", "elm"], _DASH),
+    "lua": _LUA,
+    **dict.fromkeys(["html", "htm", "xhtml", "xml", "vue", "jsp", "svelte", "astro"], _MARKUP),
+}
+# Haskell and Elm: `--` followed by one of these is an operator (`-->`, `--|`), not a comment.
+_OPERATOR_CHARS = frozenset("!#$%&*+./<=>?@\\^|~:")
+
+
+def comment_syntax(ext: str | None) -> CommentSyntax:
+    """The comment syntax for a file extension (without the dot, any case); the permissive
+    default for an unknown one or None."""
+    return SYNTAX_BY_EXT.get((ext or "").lower().lstrip("."), DEFAULT_SYNTAX)
+
+
+def _line_comment_at(text: str, i: int, syntax: CommentSyntax, ext: str | None) -> bool:
+    for marker in syntax.line:
+        if not text.startswith(marker, i):
+            continue
+        if marker == "#":
+            if _is_comment_hash(text, i):
+                return True
+        elif marker == "--" and (ext or "").lower() in ("hs", "elm"):
+            if text[i + 2:i + 3] not in _OPERATOR_CHARS:
+                return True
+        else:
+            return True
+    return False
+
+
+def strip_non_code(lines: list[str], ext: str | None = None) -> str:
     """Added lines with string literals (incl. triple-quoted/docstrings and JS template
-    strings) and comments (`#`, `//`, `/* */`) blanked out. Approximate, language-agnostic:
-    a construct that isn't closed where it should be (a one-line string on its line, a
-    multi-line one or `/* */` by the end of the text) is kept as code, so a stray quote
-    or `/*` never swallows real code."""
+    strings) and comments blanked out. Comment syntax follows the file extension `ext`
+    (`py`: `#`; C-like languages: `//` and `/* */`; `sql`: `--` and `/* */`; `html`/`xml`:
+    `<!-- -->`; ...; unknown: `#`, `//` and `/* */`), see `SYNTAX_BY_EXT`. Approximate: a
+    construct that isn't closed where it should be (a one-line string on its line, a
+    multi-line one or a block comment by the end of the text) is kept as code, so a stray
+    quote or `/*` never swallows real code."""
+    syntax = comment_syntax(ext)
     text = "\n".join(lines)
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
-        two = text[i:i + 2]
-        if (ch == "#" and _is_comment_hash(text, i)) or two == "//":
+        block = next((b for b in syntax.block if text.startswith(b[0], i)), None)
+        end = text.find(block[1], i + len(block[0])) if block else -1
+        if block and end >= 0:  # a closed block comment (checked first: Lua `--[[` vs `--`)
+            i = end + len(block[1])
+            out.append(" ")
+        elif _line_comment_at(text, i, syntax, ext):
             while i < n and text[i] != "\n":
                 i += 1
-        elif two == "/*":
-            end = text.find("*/", i + 2)
-            if end < 0:
-                out.append(ch)
-                i += 1
-            else:
-                i = end + 2
-                out.append(" ")
+        elif block:  # never closed: kept as code
+            out.append(ch)
+            i += 1
         elif ch in "\"'`":
             triple = text[i:i + 3] == ch * 3
             q = ch * 3 if triple else ch
@@ -222,8 +276,10 @@ def check_text(repo: Path, base: str, merge: str, cfg: MineConfig,
     tests, other, _ = candidates.split_files(changes, cfg.suites)
     other = [f for f in other if not path_matches(f.path, cfg.exclude_paths)]
     paths = [f.path for f in other]
-    diff = candidates.diff_text(repo, base, merge, paths)
-    added = added_lines(diff)
+    # Added lines per file: comment syntax (and so what counts as code) depends on its extension.
+    by_file = {f.path: added_lines(candidates.diff_text(repo, base, merge, [f.path]))
+               for f in other}
+    added = [ln for lines in by_file.values() for ln in lines]
     # Names the hidden tests use are interface, not leaks.
     test_added = added_lines(candidates.diff_text(
         repo, base, merge, [f.path for f in tests if f.status != "deleted"]))
@@ -233,7 +289,8 @@ def check_text(repo: Path, base: str, merge: str, cfg: MineConfig,
     quotes = [q for q in quoted_lines(added, _base_lines(repo, base, paths))
               if q not in test_norm and q not in {x.rstrip(":;,{ ") for x in test_norm}]
     all_tokens = {t for ln in added for t in IDENT.findall(ln)}
-    code_tokens = set(IDENT.findall(strip_non_code(added)))
+    code_tokens = {t for p, lines in by_file.items()
+                   for t in IDENT.findall(strip_non_code(lines, Path(p).suffix))}
     added_blob = "\n".join(added)
     flags: list[Flag] = []
     introduced: dict[str, bool] = {}

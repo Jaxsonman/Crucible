@@ -13,6 +13,16 @@ from crucible.task import Task
 DEFAULT_TIMEOUT_S = 300.0
 
 
+def timeout_for(task: Task, cli_seconds: float | None = None) -> float:
+    """Seconds one check run may take: the CLI's `--check-timeout` if given, else the task's
+    `check_timeout_minutes`, else `DEFAULT_TIMEOUT_S`."""
+    if cli_seconds is not None:
+        return cli_seconds
+    if task.check_timeout_minutes:
+        return task.check_timeout_minutes * 60.0
+    return DEFAULT_TIMEOUT_S
+
+
 @dataclass
 class CheckResult:
     ran: bool = False

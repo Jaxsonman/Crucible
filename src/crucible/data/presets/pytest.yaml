@@ -1,0 +1,77 @@
+# pytest. `pytest <file> <file> ...` runs exactly the files named, any number of them. Setup makes
+# a virtualenv in the suite directory (.venv, so nothing touches the system Python), installs the
+# requirements files that exist and then the project itself (with a test or dev extra when one is
+# declared; a missing extra only makes pip warn), and finally pytest in case none of them listed
+# it. A uv.lock, poetry.lock or Pipfile.lock switches to that tool (`uv run pytest`,
+# `poetry run pytest`, `pipenv run python -m pytest`).
+name: pytest
+markers:
+  # an explicit pytest config means the repo really uses pytest, even next to a manage.py
+  - {glob: pytest.ini, wins_over: [django]}
+  - {glob: pyproject.toml, contains: '^\[tool\.pytest', wins_over: [django]}
+  - {glob: setup.cfg, contains: '^\[tool:pytest\]', wins_over: [django]}
+  - {glob: tox.ini, contains: '^\[pytest\]', wins_over: [django]}
+  # a bare conftest.py is a hint only: Django keeps priority, and a conftest.py-only directory
+  # (typically `tests/`) folds into the nearest enclosing python project
+  - {glob: conftest.py, weak: true}
+  # pytest named as a dependency or in a test command (comment lines ignored)
+  - {glob: pyproject.toml, contains: '^[^#\n]*["'']pytest\b|^\s*pytest\s*='}
+  - {glob: "requirements*.txt", contains: '(?i)^\s*pytest\b'}
+  - {glob: "requirements/*.txt", contains: '(?i)^\s*pytest\b'}
+  - {glob: setup.cfg, contains: '(?i)^[^#;\n]*\bpytest\b'}
+  - {glob: setup.py, contains: '^[^#\n]*["'']pytest\b'}
+  - {glob: tox.ini, contains: '(?i)^[^#;\n]*\bpytest\b'}
+  - {glob: Pipfile, contains: '(?i)^\s*pytest\b'}
+  # test files under tests/ or test/ next to any python project file
+  - glob: "{pyproject.toml,setup.py,setup.cfg,Pipfile,tox.ini,requirements*.txt}"
+    evidence: ["**/tests/**/test_*.py", "**/tests/**/*_test.py", "**/test/**/test_*.py", "**/test/**/*_test.py"]
+project_files: [pytest.ini, pyproject.toml, setup.cfg, setup.py, manage.py, Pipfile, tox.ini, "requirements*.txt"]
+test_paths:
+  - "{suite_dir}/tests/**"
+  - "{suite_dir}/test/**"
+  - "{suite_dir}/**/test_*.py"
+  - "{suite_dir}/**/*_test.py"
+  - "{suite_dir}/**/conftest.py"
+runnable:
+  - "{suite_dir}/**/test_*.py"
+  - "{suite_dir}/**/*_test.py"
+setup:
+  - python3 -m venv .venv && .venv/bin/python -m pip install -q -U pip
+  - {when: [requirements.txt], run: .venv/bin/python -m pip install -q -r requirements.txt}
+  - {when: [requirements-dev.txt], run: .venv/bin/python -m pip install -q -r requirements-dev.txt}
+  - {when: [requirements-test.txt], run: .venv/bin/python -m pip install -q -r requirements-test.txt}
+  - {when: [requirements/test.txt], run: .venv/bin/python -m pip install -q -r requirements/test.txt}
+  - {when: [requirements/dev.txt], run: .venv/bin/python -m pip install -q -r requirements/dev.txt}
+  - first:
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*test\s*=|["'']test["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[test]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*tests\s*=|["'']tests["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[tests]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*testing\s*=|["'']testing["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[testing]"
+      - when: [pyproject.toml, setup.cfg, setup.py]
+        contains: '(?m)^\s*dev\s*=|["'']dev["'']\s*:'
+        run: .venv/bin/python -m pip install -q -e ".[dev]"
+      - {when: [setup.py], run: .venv/bin/python -m pip install -q -e .}
+      - when: [pyproject.toml]
+        contains: '^\[(?:project|build-system)\]'
+        run: .venv/bin/python -m pip install -q -e .
+  - .venv/bin/python -m pip install -q pytest
+test_command: .venv/bin/python -m pytest {tests}
+variants:
+  - when: [uv.lock]
+    setup: uv sync --frozen
+    test_command: uv run pytest {tests}
+  - when: [poetry.lock]
+    setup: poetry install --no-interaction
+    test_command: poetry run pytest {tests}
+  - when: [Pipfile.lock]
+    setup: pipenv install --dev --deploy
+    test_command: pipenv run python -m pytest {tests}
+notes: >-
+  pytest takes file paths directly. Fixtures, data and helpers under tests/ or test/ are test
+  files but are not passed to pytest. The venv lives in the suite directory (.venv); a repo that
+  needs system libraries, a database or extra index URLs needs more in setup.

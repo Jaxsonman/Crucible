@@ -59,18 +59,44 @@ suites:
     test_paths: ["backend/**/tests/**", "backend/**/test_*.py"]
     cwd: backend
     setup: pip install -q -r requirements.txt
-    test_command: python manage.py test {modules}   # {tests} and/or {modules}
-    module_root: backend
+    test_command: python manage.py test {tests|module:backend}   # any language: see below
     # regression_command: python manage.py test   # optional: whole suite, runs at check time
 exclude_paths: ["**/*.lock", "docs/**", "*.md"]
 max_changed_lines: 800
 ```
 
+`test_command` takes `{tests}` (the PR's changed test files) with optional filters
+(`{tests|stem|join:,}`, `{tests|module:src/test/java|prefix:--tests }`, `{tests|dir|unique}`) or no
+placeholder to run the whole suite. A suite may also set `runnable` (globs of the test files to
+pass to the runner), `timeout` / `setup_timeout`, and wrapper scripts in `.crucible/scripts/`
+(available as `$CRUCIBLE_SCRIPTS`; the changed files arrive in `$CRUCIBLE_TEST_FILES`). Details in
+`docs/design.md`.
+
+**Works in any language.** Three layers, each proven by running the repo's own tests:
+
+1. *Detection* guesses the suites from marker files using data-file presets (`src/crucible/data/presets/`):
+   pytest, django, jest, vitest, mocha, playwright, node-test, maven, gradle (Java and Kotlin), go,
+   cargo, rspec, minitest, phpunit, dotnet and mix, plus generic `npm test` / `make test`
+   fallbacks. Only a first guess.
+2. *Discovery*: the skill reads how the repo really runs its tests (CI configs, Makefile or other
+   task runner, package scripts, README, compose files), corrects `mine.yaml` and, when a runner
+   can't take file lists, writes a wrapper under `.crucible/scripts/`.
+3. *Calibration*: `crucible mine calibrate [--json]` runs setup at HEAD and verifies a few recent
+   candidates per suite, then reports a status (`ok`, `setup-failed`, `no-tests-ran`,
+   `not-selective`, `failing`, `timeout`, `no-candidates`, `mixed`) with log tails and hints naming
+   the `mine.yaml` field to change. The skill loops on it (at most 5 rounds) before mining.
+
+A new test runner is one YAML file: see "Adding a preset" in [CONTRIBUTING.md](CONTRIBUTING.md).
+Tested recipes for toolchains that are awkward on a host (Go via Docker, Gradle with JDK
+toolchains, Maven with `JAVA_HOME`, Ruby with `vendor/bundle`) are in
+[docs/mining-recipes.md](docs/mining-recipes.md).
+
 The same steps work by hand (add `--local` to skip `gh`):
 
 ```bash
 crucible mine [--json] [--show-excluded]          # list candidates (first run writes mine.yaml)
-crucible mine --verify 12 15 --timeout 600        # tests fail at base, pass at merge
+crucible mine calibrate [--candidates 3] [--json] # prove mine.yaml runs the tests; diagnose
+crucible mine --verify 12 15 [--timeout 600]      # tests fail at base, pass at merge
 crucible mine show 12 --json                      # PR text plus test and non-test diffs
 crucible mine scaffold 12 [--task-id s] [--kind bugfix]   # write .crucible/tasks/<slug>/
 crucible mine leakcheck .crucible/tasks/<slug>    # flag text that gives away the fix
