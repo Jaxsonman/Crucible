@@ -1,6 +1,6 @@
 [project]
 name = "crucible"
-version = "0.1.0"
+version = "1.0.0"
 description = "Benchmark Claude model/effort configurations on your own tasks."
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Jaxson Mansouri" }]
 keywords = ["claude", "benchmark", "evaluation", "llm", "claude-code", "cli"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",

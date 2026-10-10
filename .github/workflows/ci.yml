@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` covers a retargeted base branch, which changes what the version is compared to.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -27,12 +29,33 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest -q
 
+  # Every pull request must raise the version and record it in CHANGELOG.md.
+  # Dependabot's dependency PRs are exempt; a maintainer bumps the version when releasing them.
+  version:
+    name: version
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Check the version against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}  # via env, never interpolated into the script
+        run: |
+          git fetch --no-tags origin "$BASE_REF"
+          uv run --no-project python scripts/check_version.py "origin/$BASE_REF"
+
   # Single stable status check for branch protection: require `ci`.
   ci:
     name: ci
     if: always()
-    needs: [test]
+    needs: [test, version]
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if the test matrix did not succeed
-        run: test "${{ needs.test.result }}" = "success"
+      - name: Fail if the test matrix or the version check did not succeed
+        run: |
+          test "${{ needs.test.result }}" = "success"
+          # Skipped (push to main, Dependabot) is fine; failed or cancelled is not.
+          test "${{ needs.version.result }}" = "success" || test "${{ needs.version.result }}" = "skipped"

@@ -823,3 +823,15 @@ reason}` (exit code unchanged). Tuned to avoid false positives:
 
 `crucible mine prove` runs it after the check proves out and exits 1 (`not proven: <id>: task
 text leaks the solution`) on flags unless `--allow-leaks`, which still prints them.
+
+## Versioning
+
+Semantic Versioning, starting at 1.0.0. `pyproject.toml` is the only source of the version;
+`crucible.__version__` and `crucible --version` read it from the installed package metadata, and
+`.claude-plugin/plugin.json`, `uv.lock` and the top `CHANGELOG.md` section must match it
+(`scripts/check_version.py`, tested in `tests/test_version.py`). The public interface is the CLI,
+the task, config, `mine.yaml` and `record.json` formats, and the plugin skills. Every pull request
+raises the version (the CI `version` job compares against the base branch and is part of the `ci`
+status check), so merging to `main` is the release; PRs opened by Dependabot are exempt
+(they merge without a release unless a maintainer adds a bump). The bump rules are
+in `CONTRIBUTING.md`.

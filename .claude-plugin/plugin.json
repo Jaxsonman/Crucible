@@ -1,6 +1,6 @@
 {
   "name": "crucible",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Benchmark Claude model and effort configurations on your own real tasks, from inside any git repo.",
   "author": {"name": "Jaxson Mansouri"},
   "repository": "https://github.com/Jaxsonman/Crucible",
