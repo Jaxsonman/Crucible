@@ -69,18 +69,20 @@ def test_record_schema_and_order(crucible_home):
     (batch,) = batches(crucible_home)
     r = json.loads((batch / "opus-high-1" / "record.json").read_text())
     assert list(r) == [
-        "schema_version", "task_id", "task_kind", "batch_id", "attempt", "config",
-        "resolved_model", "prompt_sha256", "baseline_sha", "started_at", "wall_seconds",
-        "status", "error", "num_turns", "session_id", "subtype", "reported_duration_ms",
-        "tokens", "tokens_by_model", "cost_usd", "check", "judge", "success",
+        "schema_version", "task_id", "task_kind", "task_source_lines", "batch_id", "attempt",
+        "config", "resolved_model", "prompt_sha256", "baseline_sha", "started_at",
+        "wall_seconds", "status", "error", "num_turns", "session_id", "subtype",
+        "reported_duration_ms", "tokens", "tokens_by_model", "cost_usd", "check", "judge",
+        "success",
     ]
+    assert r["task_source_lines"] is None
     assert r["schema_version"] == 1 and r["task_id"] == "example-fizzbuzz"
     assert r["task_kind"] == "feature" and r["batch_id"] == batch.name
     assert r["attempt"] == 1 and r["config"] == {"model": "opus", "effort": "high"}
     assert r["resolved_model"] == "claude-opus-5-5"
     assert r["status"] == "completed" and r["error"] is None
     assert r["success"] is False  # stub fizzbuzz fails the example check (see test_check.py)
-    assert list(r["check"]) == ["ran", "passed", "exit_code", "seconds"]
+    assert list(r["check"]) == ["ran", "passed", "exit_code", "seconds", "timed_out"]
     assert r["check"]["ran"] is True and r["check"]["passed"] is False
     assert r["judge"]["ran"] is False and r["judge"]["passed"] is None
     assert r["tokens"] == {"input": 1200, "output": 600, "cache_creation": 2400, "cache_read": 3600}
@@ -293,6 +295,68 @@ def test_unexpected_exception_is_recorded_and_batch_continues(crucible_home, mon
     assert by["sonnet"]["status"] == "completed"
     (batch,) = batches(crucible_home)
     assert (batch / "opus-high-1" / "output.json").is_file()
+
+
+def test_dry_run_says_whether_task_has_a_check(crucible_home, capsys):
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run"]) == 0
+    assert "check: ./check.sh" in capsys.readouterr().out.splitlines()
+    md = crucible_home / "tasks" / "example-fizzbuzz" / "task.md"
+    md.write_text(md.read_text().replace("check: ./check.sh\n", ""))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run"]) == 0
+    assert "check: none" in capsys.readouterr().out.splitlines()
+
+
+def set_front(home, extra: str) -> None:
+    """Add front-matter lines to the copied example task (after `max_turns: 30`)."""
+    md = home / "tasks" / "example-fizzbuzz" / "task.md"
+    md.write_text(md.read_text().replace("max_turns: 30\n", f"max_turns: 30\n{extra}"))
+
+
+def test_task_max_budget_used_unless_flag_given(crucible_home, tmp_path, monkeypatch):
+    set_front(crucible_home, "max_budget_usd: 1.25\n")
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.25"
+    # an explicit flag wins, even when it equals the CLI default
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium",
+                 "--max-budget-usd", "5"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_default_budget_without_task_value(crucible_home, tmp_path, monkeypatch):
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:medium"]) == 0
+    argv = json.loads(argv_file.read_text())
+    assert argv[argv.index("--max-budget-usd") + 1] == "5.0"
+
+
+def test_dry_run_shows_effective_budget(crucible_home, capsys):
+    def dry(*extra):
+        assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low", "--dry-run",
+                     *extra]) == 0
+        return capsys.readouterr().out.splitlines()
+
+    assert "max budget per attempt: $5 (default)" in dry()
+    set_front(crucible_home, "max_budget_usd: 1.25\n")
+    assert "max budget per attempt: $1.25 (task)" in dry()
+    assert "max budget per attempt: $0.5 (--max-budget-usd)" in dry("--max-budget-usd", "0.5")
+
+
+def test_non_positive_budget_flag_rejected(crucible_home, capsys):
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low",
+                 "--max-budget-usd", "0"]) == 1
+    assert "--max-budget-usd must be positive" in capsys.readouterr().err
+
+
+def test_record_carries_task_source_lines(crucible_home):
+    set_front(crucible_home, "source_lines: 42\n")
+    assert main(["run", task_dir(crucible_home), "--configs", "sonnet:low"]) == 0
+    (r,) = records.load_records("example-fizzbuzz")
+    assert r["task_source_lines"] == 42
 
 
 def test_bare_task_id_resolves_against_the_tasks_dir(crucible_home, capsys):

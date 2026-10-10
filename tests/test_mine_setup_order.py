@@ -47,7 +47,7 @@ def test_check_script_runs_setup_before_installing_hidden_tests(repo, newmod, cr
     fill(d)
     capsys.readouterr()
     assert main(["mine", "prove", str(d)]) == 0
-    assert capsys.readouterr().out.strip() == f"proven: {d.name}"
+    assert capsys.readouterr().out.startswith(f"proven: {d.name}")
 
 
 def test_setup_still_gets_test_files_env(repo, newmod, crucible_home, tmp_path):

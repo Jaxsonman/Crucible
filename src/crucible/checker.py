@@ -30,6 +30,7 @@ class CheckResult:
     exit_code: int | None = None
     seconds: float | None = None
     log: str = ""
+    timed_out: bool = False  # killed after `timeout_s`; `passed` is False, no exit code
 
     def as_record(self) -> dict:
         return {
@@ -37,6 +38,7 @@ class CheckResult:
             "passed": self.passed,
             "exit_code": self.exit_code,
             "seconds": None if self.seconds is None else round(self.seconds, 3),
+            "timed_out": self.timed_out,
         }
 
 
@@ -71,6 +73,7 @@ def run_check(task: Task, workspace: Path, timeout_s: float = DEFAULT_TIMEOUT_S)
         return CheckResult(
             ran=True, passed=False, seconds=time.monotonic() - start,
             log=f"{out}\ncheck timed out after {timeout_s}s and was killed\n",
+            timed_out=True,
         )
     except BaseException:
         executor._terminate_group(proc)

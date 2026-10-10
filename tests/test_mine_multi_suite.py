@@ -131,7 +131,7 @@ def test_scaffold_prove_and_check_runs_both_suites(repo, crucible_home, capsys):
     fill(d)
     capsys.readouterr()
     assert main(["mine", "prove", str(d)]) == 0
-    assert capsys.readouterr().out.strip() == f"proven: {d.name}"
+    assert capsys.readouterr().out.startswith(f"proven: {d.name} (merge check ")
 
     def run_check(ref):
         return _check(repo, d, ref)

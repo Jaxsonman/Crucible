@@ -171,15 +171,15 @@ def test_runs_in_empty_temp_dir_with_three_turns(crucible_home, monkeypatch):
     assert not cwd.exists()  # temp dir cleaned up
 
 
-def test_failing_criterion_gives_judge_false_and_success_false(crucible_home, monkeypatch):
+def test_failing_criterion_gives_judge_false_but_check_decides_success(crucible_home, monkeypatch):
     n = len(criteria(crucible_home))
     monkeypatch.setenv("FAKE_CLAUDE_RESULT", verdict(crucible_home, [True] * (n - 1) + [False]))
     assert run(crucible_home, "--judge") == 0
     r = only_record()
-    assert r["check"]["passed"] is True  # check passes; the judge alone fails it
+    assert r["check"]["passed"] is True
     assert r["judge"]["passed"] is False
     assert r["judge"]["criteria_passed"] == n - 1 and r["judge"]["criteria_total"] == n
-    assert r["success"] is False
+    assert r["success"] is True  # the check ran, so its verdict is success; the judge is advisory
 
 
 def test_code_fenced_verdict_is_accepted(crucible_home, monkeypatch):

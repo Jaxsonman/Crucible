@@ -21,6 +21,7 @@ from test_mine_verify import (  # noqa: F401
 from crucible import checker
 from crucible.cli import main
 from crucible.mine import scaffold as sc
+from crucible.mine.config import Suite
 from crucible.task import load_task
 
 FAKE = Path(__file__).parent / "fake_claude.py"
@@ -74,6 +75,9 @@ def test_scaffold_writes_task_and_validate_fails_only_on_placeholders(
     assert fm["source"] == f"commit:{repo.sha['fix']}"
     assert fm["check"] == "./check.sh" and fm["kind"] == "bugfix"
     assert fm["timeout_minutes"] == 30 and fm["max_turns"] == 100
+    # counted lines of the `fix add` commit: src/calc.py 1+1, tests/test_calc.py 4,
+    # tests/helpers.py 1
+    assert fm["source_lines"] == 7
     assert (d / fm["repo"]).resolve() == repo.path
     assert (d / "hidden_tests/tests/test_calc.py").is_file()
     assert (d / "hidden_tests/tests/helpers.py").is_file()
@@ -89,16 +93,31 @@ def test_scaffold_writes_task_and_validate_fails_only_on_placeholders(
     assert main(["task", "validate", str(d)]) == 0
     assert capsys.readouterr().out.strip() == f"ok: {d.name}"
     assert load_task(d).source == f"commit:{repo.sha['fix']}"
+    assert load_task(d).source_lines == 7
 
 
 def test_prove_passes_then_always_green_check_fails(mined, capsys):
     fill(mined)
     capsys.readouterr()
     assert main(["mine", "prove", str(mined)]) == 0
-    assert capsys.readouterr().out.strip() == f"proven: {mined.name}"
+    cap = capsys.readouterr()
+    assert re.fullmatch(rf"proven: {mined.name} \(merge check \d+\.\ds\)", cap.out.strip())
+    assert "warning" not in cap.err  # well under the default --check-timeout
     (mined / "check.sh").write_text("#!/bin/sh\nexit 0\n")
     assert main(["mine", "prove", str(mined)]) == 1
     assert "passes at base" in capsys.readouterr().err
+
+
+def test_prove_warns_when_merge_check_exceeds_check_timeout(mined, monkeypatch, capsys):
+    fill(mined)
+    monkeypatch.setattr(checker, "timeout_for", lambda task, cli_seconds=None: 0.0)
+    capsys.readouterr()
+    assert main(["mine", "prove", str(mined)]) == 0
+    cap = capsys.readouterr()
+    assert re.fullmatch(rf"proven: {mined.name} \(merge check \d+\.\ds\)", cap.out.strip())
+    assert re.search(r"warning: merge check took \d+\.\ds, over the task's check timeout "
+                     r"of 0s; raise check_timeout_minutes in task.md or pass --check-timeout",
+                     cap.err)
 
 
 def test_prove_fails_at_merge_and_shows_log_tail(mined, capsys):
@@ -242,3 +261,73 @@ def test_run_with_fake_claude_has_clean_workspace(mined, crucible_home, monkeypa
     rec = json.loads((batch / "sonnet-medium-1" / "record.json").read_text())
     assert rec["check"]["ran"] is True
     assert rec["check"]["passed"] is False  # fake claude did not fix add
+
+
+def run_script(tmp_path, suites, files, **env):
+    """Generate check.sh for `suites` and run it in a fresh workspace with no hidden tests."""
+    task = tmp_path / "task"
+    (task / "hidden_tests").mkdir(parents=True, exist_ok=True)
+    (task / "check.sh").write_text(sc.check_script(suites, files))
+    ws = tmp_path / "ws"
+    for s in suites if isinstance(suites, list) else [suites]:
+        (ws / s.cwd).mkdir(parents=True, exist_ok=True)
+    return subprocess.run(["bash", str(task / "check.sh")], cwd=ws, capture_output=True,
+                          text=True, check=False,
+                          env={"PATH": os.environ["PATH"], "CRUCIBLE_TASK_DIR": str(task), **env})
+
+
+REG_SUITE = Suite("py", ["tests/**"], "echo tests {tests}; exit $TRC",
+                  regression_command="echo regression-ran; exit $RRC")
+
+
+def test_single_suite_without_regression_is_unchanged():
+    script = sc.check_script(Suite("py", ["tests/**"], "echo tests {tests}"), ["tests/test_a.py"])
+    assert script.rstrip().splitlines()[-1] == "exec bash -c 'echo tests tests/test_a.py'"
+    assert "regression" not in script
+
+
+@pytest.mark.parametrize("trc,rrc,expected", [("0", "0", 0), ("0", "3", 3), ("1", "3", 1),
+                                              ("1", "0", 1)])
+def test_single_suite_runs_regression_after_tests(tmp_path, trc, rrc, expected):
+    r = run_script(tmp_path, REG_SUITE, ["tests/test_a.py"], TRC=trc, RRC=rrc)
+    assert r.returncode == expected
+    assert "== regression py ==" in r.stdout and "regression-ran" in r.stdout
+    assert r.stdout.index("tests tests/test_a.py") < r.stdout.index("regression-ran")
+
+
+def test_setup_failure_exits_97_before_regression(tmp_path):
+    s = Suite("py", ["tests/**"], "echo tests {tests}", setup="false",
+              regression_command="echo regression-ran")
+    r = run_script(tmp_path, s, ["tests/test_a.py"])
+    assert r.returncode == 97 and "regression-ran" not in r.stdout
+    assert sc.SETUP_FAILED in r.stderr
+
+
+def test_multi_suite_regression_failures_are_collected(tmp_path):
+    files = ["a/tests/test_a.py", "b/tests/test_b.py"]
+    a = Suite("a", ["a/**"], "echo a-tests", cwd="a",
+              regression_command="echo a-regression; exit 4")
+    b = Suite("b", ["b/**"], "echo b-tests; exit $BRC", cwd="b")
+    r = run_script(tmp_path, [a, b], files, BRC="0")
+    assert r.returncode == 4
+    assert "a-regression" in r.stdout and "b-tests" in r.stdout  # b still ran
+    assert r.stdout.count("== suite") == 2 and "== regression a ==" in r.stdout
+    assert run_script(tmp_path, [a, b], files, BRC="6").returncode == 4  # first failure wins
+    b_bad_setup = Suite("b", ["b/**"], "echo b-tests", cwd="b", setup="false")
+    assert run_script(tmp_path, [a, b_bad_setup], files).returncode == 97
+
+
+def test_failing_regression_makes_prove_fail_at_merge(repo, crucible_home, capsys):
+    (crucible_home / "mine.yaml").write_text(
+        mine_yaml(f"{PY} -m pytest -q -p no:cacheprovider {{tests}}")
+        + '    regression_command: "echo regression-ran; exit 5"\n')
+    cid = ids(repo, "fix")[0]
+    assert verify("--verify", cid) == 0
+    assert scaffold(cid) == 0
+    d = tasks(crucible_home) / f"commit-{cid}-fix-add"
+    assert "regression-ran" in (d / "check.sh").read_text()
+    fill(d)
+    capsys.readouterr()
+    assert main(["mine", "prove", str(d)]) == 1
+    err = capsys.readouterr().err
+    assert "fails at merge" in err and "regression-ran" in err

@@ -378,6 +378,89 @@ def test_detected_suite_names_are_safe(tmp_path):
     assert names and all(mc.SUITE_NAME_RE.match(n) for n in names)
 
 
+def with_regression(cmd: str) -> str:
+    return GOOD.replace("    module_root: backend\n",
+                        f"    module_root: backend\n    regression_command: {cmd}\n")
+
+
+def test_regression_command_loads_and_is_optional(tmp_path):
+    s = load(tmp_path, with_regression("python manage.py test")).suites[0]
+    assert s.regression_command == "python manage.py test"
+    assert s.to_dict()["regression_command"] == "python manage.py test"
+    plain = load(tmp_path, GOOD).suites[0]
+    assert plain.regression_command == "" and "regression_command" not in plain.to_dict()
+
+
+@pytest.mark.parametrize("cmd,needle", [
+    ("python -m pytest {tests}", "{tests}"),
+    ("python manage.py test {modules}", "{modules}"),
+])
+def test_regression_command_rejects_placeholders(tmp_path, cmd, needle):
+    errs = errors_of(tmp_path, with_regression(cmd))
+    assert any(e.startswith("suites[0].regression_command: must not contain placeholders")
+               and needle in e for e in errs)
+
+
+def test_regression_command_must_be_a_string(tmp_path):
+    errs = errors_of(tmp_path, with_regression("[a, b]"))
+    assert any("suites[0].regression_command: must be a string" in e for e in errs)
+
+
+def test_regression_command_allows_shell_variables(tmp_path):
+    s = load(tmp_path, with_regression('"echo ${HOME}"')).suites[0]
+    assert s.regression_command == "echo ${HOME}"
+
+
+@pytest.mark.parametrize("files,runner", [
+    ({"pyproject.toml": "[tool.pytest.ini_options]\n"}, "pytest"),
+    ({"manage.py": ""}, "manage.py test"),
+    ({"package.json": json.dumps({"devDependencies": {"vitest": "^1"}})}, "vitest run"),
+    ({"package.json": json.dumps({"devDependencies": {"jest": "^1"}})}, "jest"),
+])
+def test_suggest_regression_per_stack(tmp_path, files, runner):
+    for rel, text in files.items():
+        write(tmp_path, rel, text)
+    [s] = mc.detect_suites(tmp_path)
+    suggestion = mc.suggest_regression(s)
+    # the detected test command with its test selection dropped
+    assert suggestion.endswith(runner) and s.test_command.startswith(suggestion)
+    assert s.regression_command == ""  # suggested, never switched on by detection
+
+
+def test_written_default_suggests_regression_commented_out(tmp_path):
+    write(tmp_path, "backend/manage.py")
+    write(tmp_path, "frontend/package.json", pkg("vitest"))
+    out = tmp_path / "mine.yaml"
+    mc.write_default(out, tmp_path)
+    text = out.read_text()
+    assert "  # regression_command: .venv/bin/python manage.py test\n" in text
+    assert "  # regression_command: npx vitest run\n" in text
+    assert "whole suite" in text and "prove" in text
+    assert [s.regression_command for s in mc.load_config(out).suites] == ["", ""]
+    out.write_text(text.replace("  # regression_command:", "  regression_command:"))
+    assert [s.regression_command for s in mc.load_config(out).suites] == [
+        ".venv/bin/python manage.py test", "npx vitest run"]
+
+
+def test_empty_template_mentions_regression_command(tmp_path):
+    out = tmp_path / "mine.yaml"
+    mc.write_default(out, tmp_path)
+    assert "regression_command:" in out.read_text()
+
+
+def test_suggestion_in_default_file_works_when_uncommented(tmp_path):
+    write(tmp_path, "pyproject.toml", "[tool.pytest.ini_options]\n")
+    out = tmp_path / "mine.yaml"
+    [detected] = mc.write_default(out, tmp_path)
+    suggestion = mc.suggest_regression(detected)
+    marker = f"  # regression_command: {suggestion}\n"
+    text = out.read_text()
+    assert suggestion and marker in text
+    out.write_text(text.replace(marker, f"  regression_command: {suggestion}\n"))
+    [loaded] = mc.load_config(out).suites
+    assert loaded.regression_command == suggestion
+
+
 # --- brace alternation in globs ---
 
 @pytest.mark.parametrize("path,patterns,expected", [

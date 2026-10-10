@@ -84,6 +84,11 @@ def _suite_prelude(suite: Suite, files: list[str]) -> list[str]:
     return lines
 
 
+def _collect_rc() -> str:
+    """The shell line that keeps the first non-zero exit code of the last command (`$code`)."""
+    return '[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code'
+
+
 def _command(suite: Suite, files: list[str]) -> str:
     try:
         return verify.build_command(suite, files)
@@ -93,11 +98,14 @@ def _command(suite: Suite, files: list[str]) -> str:
 
 def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: bool = False) -> str:
     """The task's `check.sh`: self-contained, run with the workspace as cwd. It runs every suite's
-    setup first (a failure exits 97 at once), then installs the hidden tests once, then runs each
-    suite's test command, exactly what `verify` ran (`bash -c`, same placeholder filling, only
-    that suite's runnable files). One suite exec's its test command. Several suites each run in
-    a subshell (own env and cwd); test failures are collected so every suite runs, and the
-    script exits with the first failing code. Every step gets `CRUCIBLE_TEST_FILES` and
+    setup first (a failure exits 97 at once), then installs the hidden tests once (a failed copy
+    exits 98), then runs each suite's test command, exactly what `verify` ran (`bash -c`, same
+    placeholder filling, only that suite's runnable files). One suite without a
+    regression_command exec's its test command; with one, the test command runs via `bash -c`
+    with its exit code kept and the regression command follows. Several suites each run in a
+    subshell (own env and cwd); test failures are collected so every suite runs, and the script
+    exits with the first failing code. A suite's optional regression_command runs after its
+    tests in the same cwd and env. Every step gets `CRUCIBLE_TEST_FILES` and
     `CRUCIBLE_TEST_FILES_CWD` (the suite's runnable files, as in `verify`); with `scripts` the
     task's own `scripts/` dir is exported as `CRUCIBLE_SCRIPTS`."""
     suites = verify.as_suites(suites)
@@ -139,7 +147,15 @@ def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: b
                       f'echo "{SETUP_FAILED}" >&2; exit {SETUP_EXIT}; }}']
         lines += install
         lines += prelude
-        lines.append(f"exec bash -c {shlex.quote(_command(suite, runnable))}")
+        test_cmd = _command(suite, runnable)
+        if not suite.regression_command:
+            lines.append(f"exec bash -c {shlex.quote(test_cmd)}")
+            return "\n".join(lines) + "\n"
+        lines.append(f"bash -c {shlex.quote(test_cmd)}; rc=$?")
+        lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+        lines.append(f"bash -c {shlex.quote(suite.regression_command)}; code=$?")
+        lines.append(_collect_rc())
+        lines.append('exit "$rc"')
         return "\n".join(lines) + "\n"
     for suite, files in plan:
         if suite.setup:
@@ -154,7 +170,12 @@ def check_script(suites: Suite | list[Suite], runnable: list[str], *, scripts: b
         lines.append(f"echo {shlex.quote(f'== suite {suite.name} ==')}")
         cmd = _command(suite, files)
         lines.append(f"( {pre}; bash -c {shlex.quote(cmd)} ); code=$?")
-        lines.append('[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code')
+        lines.append(_collect_rc())
+        if suite.regression_command:
+            lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+            lines.append(
+                f"( {pre}; bash -c {shlex.quote(suite.regression_command)} ); code=$?")
+            lines.append(_collect_rc())
     lines.append('exit "$rc"')
     return "\n".join(lines) + "\n"
 
@@ -227,10 +248,13 @@ def scaffold_task_dir(
     tasks_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir()
     try:
-        check_s = sum(s.setup_timeout + s.timeout for s in suites)
+        # setup + tests, and the tests' limit again for a whole-suite regression run
+        check_s = sum(s.setup_timeout + s.timeout * (2 if s.regression_command else 1)
+                      for s in suites)
         extra = (f"source: {json.dumps(c.source)}\n"
-                 f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n"
-                 f"check_timeout_minutes: {max(1, math.ceil(check_s / 60))}\n")
+                 + (f"source_lines: {c.size}\n" if c.size > 0 else "")
+                 + f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n"
+                 + f"check_timeout_minutes: {max(1, math.ceil(check_s / 60))}\n")
         (task_dir / "task.md").write_text(
             repo_task_md(slug, repo_relative(repo.resolve(), task_dir), c.base,
                          kind or c.suggested_kind, extra),
@@ -261,6 +285,7 @@ class ProveResult:
     task_id: str
     failure: str = ""  # e.g. "passes at base"
     log: str = ""
+    merge_seconds: float | None = None  # how long the check took at the merge commit
 
     def tail(self) -> str:
         return "\n".join(self.log.rstrip("\n").splitlines()[-LOG_TAIL:])
@@ -342,7 +367,7 @@ def prove_task(task: Task, timeout: float | None = None) -> ProveResult:
     if not after.passed:
         why = "setup failed at merge" if SETUP_FAILED in after.log else "fails at merge"
         return ProveResult(False, task.id, why, after.log)
-    return ProveResult(True, task.id)
+    return ProveResult(True, task.id, merge_seconds=after.seconds)
 
 
 __all__ = [

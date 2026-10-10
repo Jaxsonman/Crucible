@@ -12,6 +12,7 @@ from pathlib import Path
 from crucible import (
     __version__,
     aggregate,
+    checker,
     configs,
     judge,
     paths,
@@ -121,6 +122,20 @@ def _task_new(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_MAX_BUDGET_USD = 5.0
+
+
+def _budget(args: argparse.Namespace, task) -> tuple[float, str]:
+    """Per-attempt cap and where it came from: the flag when given on the command line (its
+    argparse default is None, so `--max-budget-usd 5` still counts as given), else the task's
+    `max_budget_usd`, else the default."""
+    if args.max_budget_usd is not None:
+        return args.max_budget_usd, "--max-budget-usd"
+    if task.max_budget_usd is not None:
+        return float(task.max_budget_usd), "task"
+    return DEFAULT_MAX_BUDGET_USD, "default"
+
+
 def _task_path(arg: str) -> Path:
     """The task directory for `arg`: the path itself, or a bare task id resolved against
     `<home>/tasks/` (also when a same-named directory in the cwd is not a task). A bare id
@@ -173,7 +188,8 @@ def _run(args: argparse.Namespace) -> int:
     if args.repeat < 1:
         print("--repeat must be at least 1", file=sys.stderr)
         return 1
-    if args.max_budget_usd <= 0:
+    budget, budget_from = _budget(args, task)
+    if budget <= 0:
         print("--max-budget-usd must be positive", file=sys.stderr)
         return 1
     if args.check_timeout is not None and args.check_timeout <= 0:
@@ -184,6 +200,8 @@ def _run(args: argparse.Namespace) -> int:
     attempts = runner.plan(cfgs, args.repeat)
     if args.dry_run:
         print(f"task {task.id}  prompt sha256 {sha}")
+        print(f"check: {task.check or 'none'}")
+        print(f"max budget per attempt: ${budget:g} ({budget_from})")
         for a in attempts:
             print(f"planned: {a.config.label} #{a.n}")
         return 0
@@ -192,7 +210,7 @@ def _run(args: argparse.Namespace) -> int:
     for a in attempts:
         try:
             rec, interrupted = runner.run_attempt(
-                task, batch_id, a, prompt_text, sha, args.max_budget_usd, args.keep_workspaces,
+                task, batch_id, a, prompt_text, sha, budget, args.keep_workspaces,
                 args.check_timeout, judge_cfg,
             )
         except FileExistsError as e:
@@ -233,12 +251,26 @@ def _fmt_num(value, fmt: str) -> str:
     return "—" if value is None else format(value, fmt)
 
 
+def _fmt_ci(row: dict) -> str | None:
+    ci = row.get("success_ci")
+    return None if not ci else f"{ci[0] * 100:.0f}–{ci[1] * 100:.0f}%"
+
+
+def _fmt_rate(row: dict) -> str:
+    """`100% (44–100%)`: the success rate and its 95% Wilson interval; `—` when unknown."""
+    if row["success_rate"] is None:
+        return "—"
+    ci = _fmt_ci(row)
+    return f"{row['success_rate']:.0%}" + (f" ({ci})" if ci else "")
+
+
 REPORT_COLUMNS = [
     ("Config", lambda r: r["config"]),
     ("Attempts", lambda r: str(r["attempts"])),
     ("Successes", lambda r: str(r["successes"])),
-    ("Success rate", lambda r: _fmt_num(r["success_rate"], ".0%")),
+    ("Success rate", _fmt_rate),
     ("Unknown", lambda r: str(r["unknown"])),
+    ("Stopped", lambda r: str(r["stopped"])),
     ("Median time (s)", lambda r: _fmt_num(r["median_wall_seconds"], ".1f")),
     ("Time range (s)", lambda r: "—" if r["min_wall_seconds"] is None
         else f"{r['min_wall_seconds']:.1f}–{r['max_wall_seconds']:.1f}"),
@@ -247,6 +279,7 @@ REPORT_COLUMNS = [
     ("Cost/success", lambda r: "—" if r["cost_per_success"] is None
         else f"${r['cost_per_success']:.4f}"),
     ("Unpriced", lambda r: str(r["unpriced"])),
+    ("Judge≠check", lambda r: str(r["judge_disagreements"])),
 ]
 
 
@@ -261,17 +294,37 @@ def format_report_table(rows: list[dict], columns=REPORT_COLUMNS) -> str:
     return "\n".join(lines)
 
 
+def _pool_warnings(rows: list[dict]) -> list[str]:
+    """One line per row whose label pooled attempts from more than one resolved model."""
+    return [
+        f"warning: {r['config']} pools {len(r['resolved_models'])} models: "
+        f"{', '.join(r['resolved_models'])}"
+        for r in rows if len(r.get("resolved_models") or []) > 1
+    ]
+
+
+def _print_pool_warnings(rows: list[dict], file=None) -> None:
+    """Print the pooling warnings; `file` defaults to the current sys.stdout (resolved per call)."""
+    for line in _pool_warnings(rows):
+        print(line, file=file or sys.stdout)
+
+
 def _evidence(row: dict) -> str:
     known = row["attempts"] - row["unknown"]
     cost = "—" if row["median_cost"] is None else f"${row['median_cost']:.4f}"
+    cps = "—" if row["cost_per_success"] is None else f"${row['cost_per_success']:.4f}"
     return (
         f"{row['tasks']} tasks, {row['attempts']} attempts, "
-        f"success {_fmt_num(row['success_rate'], '.0%')} ({row['successes']}/{known} known), "
-        f"median cost {cost}, median time {_fmt_num(row['median_wall_seconds'], '.1f')}s"
+        f"success {_fmt_num(row['success_rate'], '.0%')} ({row['successes']}/{known} known, "
+        f"95% CI {_fmt_ci(row) or '—'}), "
+        f"median cost {cost}, cost per success {cps}, "
+        f"median time {_fmt_num(row['median_wall_seconds'], '.1f')}s"
     )
 
 
 def _format_recommendation(rec: dict) -> list[str]:
+    if rec["status"] == "no_common_tasks":
+        return ["Recommendation: none; no task was attempted by every config"]
     lines = []
     if rec["status"] == "recommended":
         lines.append(f"Recommendation: {rec['config']}")
@@ -320,15 +373,20 @@ def _cross_task_report(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"min_attempts": args.min_attempts, "threshold": args.threshold,
                           "kinds": reports}, indent=2))
+        for rep in reports:
+            _print_pool_warnings(rep["configs"], sys.stderr)
         return 0
     for i, rep in enumerate(reports):
         if i:
             print()
         print(f"## Kind: {rep['kind']}  ({rep['tasks']} tasks, {rep['attempts']} attempts)")
         print()
+        print(f"Compared on {len(rep['common_tasks'])} of {rep['tasks']} tasks attempted by "
+              "every config")
         print("\n".join(_format_recommendation(rep["recommendation"])))
         print()
         print(format_report_table(rep["configs"], KIND_COLUMNS))
+        _print_pool_warnings(rep["configs"])
     return 0
 
 
@@ -362,6 +420,7 @@ def _report(args: argparse.Namespace) -> int:
         print(json.dumps({**summary, "configs": rows}, indent=2))
         if warning:
             print(warning, file=sys.stderr)
+        _print_pool_warnings(rows, sys.stderr)
         return 0
     print(
         f"Task: {summary['task_id']}  kind: {summary['kind'] or '—'}  "
@@ -371,6 +430,7 @@ def _report(args: argparse.Namespace) -> int:
         print(warning)
     print()
     print(format_report_table(rows))
+    _print_pool_warnings(rows)
     return 0
 
 
@@ -729,7 +789,13 @@ def _mine_prove(args: argparse.Namespace) -> int:
                   f"({len(flags)} flag(s)); rewrite it or pass --allow-leaks", file=sys.stderr)
             return 1
     if result.ok:
-        print(f"proven: {result.task_id}")
+        secs = result.merge_seconds
+        print(f"proven: {result.task_id}" + ("" if secs is None else f" (merge check {secs:.1f}s)"))
+        limit = checker.timeout_for(task)
+        if secs is not None and secs > limit:
+            print(f"warning: merge check took {secs:.1f}s, over the task's check timeout of "
+                  f"{limit:g}s; raise check_timeout_minutes in task.md or pass --check-timeout "
+                  f"when running this task", file=sys.stderr)
         return 0
     print(f"not proven: {result.task_id}: {result.failure}", file=sys.stderr)
     if result.log:
@@ -781,7 +847,9 @@ def build_parser() -> argparse.ArgumentParser:
             group.add_argument("--configs", help="comma-separated model:effort list")
             group.add_argument("--matrix", help="named matrix (configs/<name>.yaml)")
             p.add_argument("--repeat", type=int, default=1, help="attempts per config")
-            p.add_argument("--max-budget-usd", type=float, default=5.0)
+            p.add_argument("--max-budget-usd", type=float, default=None,
+                           help="per-attempt spend cap in USD (default: the task's "
+                                "max_budget_usd, else 5.0)")
             p.add_argument("--check-timeout", type=float, default=None,
                            help="seconds before a hanging check is killed (default: the task's "
                                 "check_timeout_minutes, else 300)")

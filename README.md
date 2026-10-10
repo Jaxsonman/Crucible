@@ -36,9 +36,10 @@ Tasks and results live in your repo's `.crucible/`. `crucible` commands find the
 them; delete `results/` from `.crucible/.gitignore` to share results too. Defaults for pricing and
 configs are bundled; `.crucible/pricing.yaml` and `.crucible/configs/*.yaml` override them.
 
-Every attempt is capped by `--max-budget-usd` (default 5.0 per attempt; judge runs add cost, so
-pass a lower cap for cheap trials). Only a real `crucible run` spends money, and the slash
-commands never start one without you asking.
+Every attempt is capped by `--max-budget-usd` (else the task's `max_budget_usd`, else 5.0 per
+attempt; judge runs add cost, so pass a lower cap for cheap trials). `--dry-run` prints the
+effective cap. Only a real `crucible run` spends money, and the slash commands never start one
+without you asking.
 
 Safety: as in standalone use, every attempt runs `claude` with `--permission-mode
 bypassPermissions`, so the agent can run any shell command as you. Only benchmark tasks you
@@ -59,6 +60,7 @@ suites:
     cwd: backend
     setup: pip install -q -r requirements.txt
     test_command: python manage.py test {tests|module:backend}   # any language: see below
+    # regression_command: python manage.py test   # optional: whole suite, runs at check time
 exclude_paths: ["**/*.lock", "docs/**", "*.md"]
 max_changed_lines: 800
 ```
@@ -169,10 +171,12 @@ tracker connected (GitHub, Jira, ...), it reads the ticket itself; otherwise pas
 
 ```bash
 # preview the plan without calling claude
-uv run crucible run tasks/example-fizzbuzz --configs sonnet:low,sonnet:medium --repeat 1 --judge --max-budget-usd 1 --dry-run
+uv run crucible run tasks/example-fizzbuzz --configs sonnet:low,sonnet:medium --repeat 1 \
+  --judge --max-budget-usd 1 --dry-run
 
 # run for real
-uv run crucible run tasks/example-fizzbuzz --configs sonnet:low,sonnet:medium --repeat 1 --judge --max-budget-usd 1
+uv run crucible run tasks/example-fizzbuzz --configs sonnet:low,sonnet:medium --repeat 1 \
+  --judge --max-budget-usd 1
 ```
 
 `--configs` is a comma-separated `model:effort` list (or use `--matrix <name>` for
@@ -191,20 +195,33 @@ separately from the attempt's cost. To judge attempts that were recorded without
 uv run crucible judge example-fizzbuzz [--batch <batch-id>]
 ```
 
-An attempt's `success` is true only if every verdict produced (check, judge) passed, and is
-unknown if neither produced a verdict.
+An attempt's `success` is false if it did not complete (error or timeout); otherwise it is the
+check's verdict when the check produced one, else the judge's, and unknown if neither did. When
+a check exists the judge is advisory: the report counts the attempts where the two disagree in
+its `Judge≠check` column.
 
 ## Report
 
 ```bash
 uv run crucible report example-fizzbuzz   # one task: every config side by side
-uv run crucible report                    # across tasks, grouped by task kind, with a recommendation
+uv run crucible report                    # across tasks, by task kind, with a recommendation
 ```
 
 Options: `--batch`, `--json`, and for the cross-task report `--kind`, `--min-attempts`
 (default 3) and `--threshold` (default 0.8). With fewer than `--min-attempts` attempts per
 config the report says "no config meets the bar" and lists the best candidates instead.
 Reports re-price every attempt from the recorded tokens and the current `pricing.yaml`.
+
+Reading the table: `Success rate` shows a 95% Wilson interval (`100% (44–100%)` for 3 of 3),
+`Stopped` counts attempts ended by a timeout, turn cap or budget cap, or whose check was killed
+by `--check-timeout` (default 300 s; a whole-suite `regression_command` must finish within it, or
+raise the timeout); stopped attempts are still failures. `Judge≠check` counts judge/check
+disagreements. A warning follows the table when one config
+label pooled several model versions. The recommendation ranks configs that clear the bar by
+cost per success (failed attempts included). The cross-task report compares configs only on
+the tasks every config attempted and says so (`Compared on N of M tasks attempted by every
+config`); when there is no such task it prints `Recommendation: none; no task was attempted by
+every config` instead of a recommendation.
 
 ### Computed vs reported cost
 

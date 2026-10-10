@@ -25,7 +25,7 @@ DEFAULT_EXCLUDE = [
 SUITE_NAME_MAX = 64
 SUITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SUITE_KEYS = {"name", "test_paths", "cwd", "setup", "test_command", "module_root", "env",
-               "runnable", "timeout", "setup_timeout"}
+               "runnable", "timeout", "setup_timeout", "regression_command"}
 # A changed test file is *runnable* (passed to the test command) when its name matches this or
 # it lives under a `__tests__` directory: the rule used when a suite has no `runnable` globs.
 _RUNNABLE_NAME = re.compile(r"(?:test_.*\.py|.*_test\.py|tests\.py|.*\.(?:test|spec)\.[^.]+)\Z")
@@ -67,6 +67,7 @@ class Suite:
     runnable: list[str] | None = None  # None: the built-in rule (`default_is_runnable`)
     timeout: float = DEFAULT_TEST_TIMEOUT_S
     setup_timeout: float = DEFAULT_SETUP_TIMEOUT_S
+    regression_command: str = ""  # optional whole-suite command run after the PR's tests
 
     def is_runnable(self, path: str) -> bool:
         """Is this changed test file passed to the test command?"""
@@ -92,6 +93,8 @@ class Suite:
         if self.setup:
             d["setup"] = self.setup
         d["test_command"] = self.test_command
+        if self.regression_command:
+            d["regression_command"] = self.regression_command
         if self.module_root is not None:
             d["module_root"] = self.module_root
         if self.env:
@@ -279,6 +282,22 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
         runnable = runnable or None
     timeout = _seconds(raw, "timeout", DEFAULT_TEST_TIMEOUT_S, where, errors)
     setup_timeout = _seconds(raw, "setup_timeout", DEFAULT_SETUP_TIMEOUT_S, where, errors)
+    regression = raw.get("regression_command") or ""
+    if not isinstance(regression, str):
+        errors.append(f"{where}.regression_command: must be a string")
+        regression = ""
+    else:
+        try:
+            found = sorted({p.source for p in placeholders.parse(regression).placeholders})
+        except placeholders.PlaceholderError as e:
+            errors.append(f"{where}.regression_command: {e}")
+        else:
+            if found:
+                errors.append(
+                    f"{where}.regression_command: must not contain placeholders "
+                    f"({', '.join('{' + p + '}' for p in found)}); it runs the whole suite"
+                )
+        regression = regression.strip()
     env = raw.get("env") or {}
     if not isinstance(env, dict):
         errors.append(f"{where}.env: must be a mapping of NAME: value")
@@ -304,7 +323,7 @@ def _parse_suite(raw, where: str, errors: list[str]) -> Suite | None:
     if len(errors) > start:
         return None
     return Suite(name, test_paths, command, cwd, setup, module_root, clean_env, runnable,
-                 timeout, setup_timeout)
+                 timeout, setup_timeout, regression)
 
 
 def load_config(path: Path) -> MineConfig:
@@ -352,6 +371,23 @@ def detect_suites(repo_root: Path) -> list[Suite]:
     return [d.suite for d in detect.detect(repo_root)]
 
 
+# Runners that run the whole suite when given no test selection. For these, the detected
+# test_command minus its trailing selection is the suggested regression_command.
+_WHOLE_SUITE_RUNNER = re.compile(r"(?:^|[\s/])(?:pytest|manage\.py test|vitest run|jest)(?:\s|\Z)")
+_TRAILING_SELECTION = re.compile(r"\s+(?:--runTestsByPath\s+)?\{(?:tests|modules)\}\s*\Z")
+
+
+def suggest_regression(suite: Suite) -> str:
+    """The whole-suite `regression_command` suggested for a detected stack ('' if none)."""
+    cmd = _TRAILING_SELECTION.sub("", suite.test_command)
+    if cmd == suite.test_command or not _WHOLE_SUITE_RUNNER.search(cmd):
+        return ""
+    try:
+        return "" if placeholders.parse(cmd).placeholders else cmd
+    except placeholders.PlaceholderError:
+        return ""
+
+
 _DETECTED_HEADER = """\
 # AUTO-DETECTED by `crucible mine` from its framework presets. Every suite below is a first
 # guess: check each line (the test_paths globs, the setup and test commands, and env: names +
@@ -373,6 +409,7 @@ _TEMPLATE_HEADER = """\
 #         # {{tests}}: changed test files relative to cwd; filters after `|` reshape them:
 #         # module:<root> stem dir unique prefix:<s> suffix:<s> join:<sep>. No placeholder at
 #         # all runs the whole suite. See docs/design.md ("Placeholders").
+#     regression_command: python manage.py test   # optional; whole suite, no placeholders
 #     module_root: backend               # optional; {{modules}} = {{tests|module:<module_root>}}
 #     runnable: ["**/*Test.java"]        # optional; which changed test files are passed to the runner
 #     timeout: 600                       # optional, seconds for the test step
@@ -385,11 +422,20 @@ exclude_paths: {exclude}
 # Candidates changing more lines than this are excluded.
 max_changed_lines: {max_lines}
 """
+_REGRESSION_NOTE = """\
+  # regression_command: {cmd}
+  #   optional: runs the whole suite at check time, after the PR's tests (no placeholders);
+  #   the check fails if it fails. `crucible mine prove` rejects a task whose regression fails
+  #   at the merge commit, so exclude pre-existing failures in the command or remove the line.
+  #   It gets the suite's `timeout` again in the task's check_timeout_minutes, so the whole
+  #   suite must finish within that, or raise `timeout`.
+"""
 
 
 def render_default(suites: list[Suite], comments: dict[str, list[str]] | None = None) -> str:
     """The commented mine.yaml text `crucible mine` writes on first use. `comments` maps a
-    suite name to the comment lines written above it (where the guess came from)."""
+    suite name to the comment lines written above it (where the guess came from). Each suite
+    is followed by its suggested `regression_command`, commented out."""
     exclude = json.dumps(DEFAULT_EXCLUDE)
     tail = _TAIL.format(exclude=exclude, max_lines=DEFAULT_MAX_LINES)
     if not suites:
@@ -401,6 +447,9 @@ def render_default(suites: list[Suite], comments: dict[str, list[str]] | None = 
         parts += [f"# {ln}\n".replace("# \n", "#\n") for ln in (comments or {}).get(s.name, [])]
         parts.append(yaml.safe_dump([s.to_dict()], sort_keys=False, default_flow_style=None,
                                     width=100))
+        cmd = suggest_regression(s)
+        if cmd:
+            parts.append(_REGRESSION_NOTE.format(cmd=cmd))
     return "".join(parts) + tail
 
 

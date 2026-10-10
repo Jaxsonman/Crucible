@@ -64,6 +64,7 @@ def test_correct_fizzbuzz_passes_check(crucible_home, monkeypatch):
     r = only_record()
     assert r["check"]["ran"] is True and r["check"]["passed"] is True
     assert r["check"]["exit_code"] == 0 and r["check"]["seconds"] > 0
+    assert r["check"]["timed_out"] is False
     assert r["success"] is True
     assert "all assertions passed" in (attempt_dir(crucible_home) / "check.log").read_text()
 
@@ -81,7 +82,8 @@ def test_no_check_means_not_ran_and_success_null(crucible_home):
     md.write_text(md.read_text().replace("check: ./check.sh\n", ""))
     assert run(crucible_home) == 0
     r = only_record()
-    assert r["check"] == {"ran": False, "passed": None, "exit_code": None, "seconds": None}
+    assert r["check"] == {"ran": False, "passed": None, "exit_code": None, "seconds": None,
+                          "timed_out": False}
     assert r["success"] is None
     assert not (attempt_dir(crucible_home) / "check.log").exists()
 
@@ -96,6 +98,7 @@ def test_hanging_check_is_killed_and_recorded_failed(crucible_home, tmp_path):
     r = only_record()
     assert r["check"]["ran"] is True and r["check"]["passed"] is False
     assert r["check"]["exit_code"] is None and r["success"] is False
+    assert r["check"]["timed_out"] is True
     assert 2 <= r["check"]["seconds"] < 20
     assert "timed out" in (attempt_dir(crucible_home) / "check.log").read_text()
     pid = int(pid_file.read_text())

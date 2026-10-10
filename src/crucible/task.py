@@ -1,8 +1,10 @@
 """Task document parsing and validation. See docs/design.md (Task document)."""
 
+import math
 import os
 import re
 import subprocess
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +20,7 @@ id: {id}
 kind: feature
 repo: fixture
 # check: ./check.sh
+# max_budget_usd: 2.0   # optional per-attempt cap in USD; --max-budget-usd overrides it
 ---
 
 ## What
@@ -52,6 +55,8 @@ class Task:
     criteria: list[str]
     task_dir: Path
     source: str | None = None  # mined tasks: PR URL, or `commit:<merge sha>`
+    max_budget_usd: float | None = None  # per-attempt cap; `crucible run --max-budget-usd` wins
+    source_lines: int | None = None  # mined tasks: counted changed lines of the source change
     check_timeout_minutes: int | None = None  # None: `crucible run` uses its 300 s default
 
     @property
@@ -86,7 +91,9 @@ def _sections(body: str) -> dict[str, str]:
             out.setdefault(current, [])
         elif current is not None:
             out[current].append(line)
-    return {k: "\n".join(v).strip() for k, v in out.items()}
+    # Strip blank lines and trailing space but keep the first line's own indent: `_criteria`
+    # needs it to tell a uniformly indented list from a nested one.
+    return {k: re.sub(r"\A(?:[ \t]*\n)+", "", "\n".join(v).rstrip()) for k, v in out.items()}
 
 
 def _positive_int(fm: dict, key: str, default: int, fail) -> int:
@@ -94,6 +101,43 @@ def _positive_int(fm: dict, key: str, default: int, fail) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         fail(f"`{key}` must be a positive integer, got {value!r}")
     return value
+
+
+def _criteria(text: str) -> tuple[list[str], bool]:
+    """Parse the Acceptance criteria section. Returns (criteria, stray).
+
+    A bullet (`-` or `*`) starts a criterion unless it is nested: a bullet indented at least
+    2 columns more than the open criterion's own bullet (`  - sub` under `- parent`) is a
+    continuation and keeps its `- ` text. Any other non-blank line also continues the open
+    criterion (Markdown lazy continuation), joined with one space after stripping its
+    whitespace. A blank line closes the open criterion. `stray` is True when a non-blank line
+    had no open criterion to continue.
+
+    Tabs are expanded to 4 columns (`expandtabs`) and the text is then dedented
+    (`textwrap.dedent`, common leading whitespace of the non-blank lines), so a list whose
+    top-level bullets are all indented alike, with spaces or tabs, still has one criterion per
+    bullet. This relies on `_sections` keeping the first line's indent.
+    """
+    text = textwrap.dedent(text.expandtabs(4))
+    criteria: list[str] = []
+    is_open = False
+    open_indent = 0  # indent of the open criterion's own bullet
+    stray = False
+    for line in text.splitlines():
+        if not line.strip():
+            is_open = False
+            continue
+        m = BULLET_RE.match(line)
+        indent = len(line) - len(line.lstrip())
+        if m and (not is_open or indent < open_indent + 2):
+            criteria.append(m.group(1))
+            is_open = True
+            open_indent = indent
+        elif is_open:
+            criteria[-1] += " " + line.strip()
+        else:
+            stray = True
+    return criteria, stray
 
 
 def load_task(path: str | Path) -> Task:
@@ -155,6 +199,18 @@ def load_task(path: str | Path) -> Task:
     if source is not None and (not isinstance(source, str) or not source.strip()):
         fail(f"`source` must be a non-empty string, got {source!r}")
 
+    max_budget = fm.get("max_budget_usd")
+    if max_budget is not None and (
+        isinstance(max_budget, bool) or not isinstance(max_budget, (int, float))
+        or not math.isfinite(max_budget) or max_budget <= 0
+    ):
+        fail(f"`max_budget_usd` must be a positive number, got {max_budget!r}")
+    source_lines = fm.get("source_lines")
+    if source_lines is not None and (
+        isinstance(source_lines, bool) or not isinstance(source_lines, int) or source_lines <= 0
+    ):
+        fail(f"`source_lines` must be a positive integer, got {source_lines!r}")
+
     timeout = _positive_int(fm, "timeout_minutes", 30, fail)
     max_turns = _positive_int(fm, "max_turns", 100, fail)
     check_minutes = (_positive_int(fm, "check_timeout_minutes", 0, fail)
@@ -164,12 +220,13 @@ def load_task(path: str | Path) -> Task:
     for name in SECTIONS:
         if name not in sections:
             fail(f"missing section '## {name}'")
-        if not sections[name]:
+        if not sections[name].strip():
             fail(f"section '## {name}' is empty")
-    criteria = [m.group(1) for line in sections["Acceptance criteria"].splitlines()
-                if (m := BULLET_RE.match(line))]
+    criteria, stray = _criteria(sections["Acceptance criteria"])
     if not criteria:
         fail("section '## Acceptance criteria' has no bullet criteria")
+    if stray:
+        fail("section '## Acceptance criteria' has text outside bullets")
     placeholders = [n for n in SECTIONS if PLACEHOLDER_RE.search(sections[n])]
     if placeholders:
         names = ", ".join(f"'## {n}'" for n in placeholders)
@@ -183,11 +240,13 @@ def load_task(path: str | Path) -> Task:
         check=check,
         timeout_minutes=timeout,
         max_turns=max_turns,
-        what=sections["What"],
-        why=sections["Why"],
+        what=sections["What"].strip(),
+        why=sections["Why"].strip(),
         criteria=criteria,
         task_dir=task_dir,
         source=source,
+        max_budget_usd=None if max_budget is None else float(max_budget),
+        source_lines=source_lines,
         check_timeout_minutes=check_minutes,
     )
 
@@ -210,7 +269,8 @@ id: {id}
 kind: {kind}
 repo: {repo}
 ref: {ref}
-{extra}check: ./check.sh
+{extra}# max_budget_usd: 2.0   # optional per-attempt cap in USD; --max-budget-usd overrides it
+check: ./check.sh
 ---
 
 ## What
