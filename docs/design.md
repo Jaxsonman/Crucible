@@ -41,7 +41,8 @@ set `CRUCIBLE_HOME` to a pytest `tmp_path` copy and never write into the real `t
 - **Task**: one unit of work, defined in `tasks/<task-id>/task.md`.
 - **Config**: a model + effort level, written `model:effort`, e.g. `opus:high`, `sonnet:medium`.
 - **Batch**: one `crucible run` invocation. Id: `YYYYMMDDTHHMMSSZ-<4 hex>` (UTC).
-- **Attempt**: one config running the task once inside a batch. `--repeat N` gives N attempts per config.
+- **Attempt**: one config running the task once inside a batch. `--repeat N` gives N attempts
+  per config.
 
 ## Task document
 
@@ -54,6 +55,8 @@ ref: main                     # git ref; required when repo is not "fixture"
 check: ./check.sh             # optional; run from the workspace root, relative to the task dir
 timeout_minutes: 30           # optional, default 30
 max_turns: 100                # optional, default 100
+max_budget_usd: 2.0           # optional per-attempt spend cap (USD); --max-budget-usd overrides it
+source_lines: 42              # optional; written by mine scaffold (counted changed lines)
 ---
 
 ## What
@@ -65,8 +68,34 @@ max_turns: 100                # optional, default 100
 ```
 
 The prompt given to every config is a fixed preamble (`src/crucible/prompt.py`) plus the
-What, Why and Acceptance criteria sections, verbatim. The prompt text and its SHA-256 are
+What, Why and Acceptance criteria sections, passed through as written except that wrapped
+criteria are joined into single lines (rules below). The prompt text and its SHA-256 are
 stored in every attempt record so identical input can be proven.
+
+Acceptance criteria are the section's bullets (`-` or `*`), used by both the agent prompt and
+the judge. A non-blank line that does not start a bullet continues the bullet before it
+(Markdown lazy continuation) and is joined to it with one space after stripping its leading
+whitespace. A bullet nested at least 2 columns deeper than the open criterion's own bullet
+(`  - sub` under `- parent`) is a continuation too and keeps its `- ` text; a bullet indented
+less than that (a sibling off by one space) starts a new criterion. Tabs are expanded to 4
+columns and the section is then dedented, so bullets that are all indented alike, with spaces
+or tabs, are still one criterion each. A blank line ends a bullet. A section with no bullet fails
+validation (`has no bullet criteria`); text that continues no bullet (before the first bullet,
+or after a blank line) fails with `has text outside bullets`. Fixing the old first-line-only parsing
+changed the prompt SHA of wrapped tasks such as `tasks/todo-list`; the report's prompt-changed
+warning covers that and no attempt was rerun.
+
+## Executor
+
+Each attempt runs the `claude` CLI headless in a fresh workspace (flags and output format in
+`docs/claude-headless.md`).
+
+**Isolation versus fidelity.** By default every attempt runs with `--safe-mode`, which drops
+CLAUDE.md, skills, hooks, auto memory and MCP servers. Attempts are therefore reproducible and
+comparable across machines, but they run without the project's own instructions: a config is
+measured on the task text alone, not on how it behaves with the team's CLAUDE.md. That is
+deliberate. `CRUCIBLE_ISOLATION=bare` swaps in the stricter `--bare`. A flag to include the
+project's CLAUDE.md at `ref` is an open follow-up.
 
 ## Results layout
 
@@ -95,6 +124,7 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
   "schema_version": 1,
   "task_id": "example-fizzbuzz",
   "task_kind": "feature",
+  "task_source_lines": null,
   "batch_id": "20261001T143000Z-a1b2",
   "attempt": 1,
   "config": {"model": "sonnet", "effort": "medium"},
@@ -112,17 +142,33 @@ least 8 characters) is replaced with `[REDACTED:<NAME>]`.
   "tokens": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0},
   "tokens_by_model": {"claude-sonnet-5-5": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}},
   "cost_usd": {"computed": 0.0, "reported": 0.0},
-  "check": {"ran": true, "passed": true, "exit_code": 0},
+  "check": {"ran": true, "passed": true, "exit_code": 0, "seconds": 41.2, "timed_out": false},
   "judge": {"ran": true, "passed": true, "criteria_passed": 4, "criteria_total": 4, "judge_config": "sonnet:medium", "judge_cost_usd": 0.0},
   "success": true
 }
 ```
 
+`task_source_lines` copies the task's optional `source_lines` (null when absent), so results
+can later be broken down by task size; no report uses it yet.
+
 `success` (`records.compute_success`), evaluated in this order:
 1. `status` is not `completed` → `false`.
-2. Neither check nor judge produced a verdict (`check.ran` false and `judge.passed` null or
-   judge not run) → `null` (unknown), never `true`.
-3. Otherwise `true` only if every verdict produced is a pass.
+2. The check ran and produced a verdict (`check.ran` and `check.passed` not null) →
+   `check.passed`.
+3. Else the judge ran and produced a verdict (`judge.ran` and `judge.passed` not null) →
+   `judge.passed`.
+4. Else `null` (unknown), never `true`.
+
+When a check produced a verdict it decides; the judge is advisory beside it, because it is an
+uncalibrated model grade and ANDing it in let a judge false negative fail a passing check.
+Reports recompute `success` from each record with `compute_success` and never read the stored
+field (the same way they re-price cost from tokens), so older records follow this rule without
+being edited; `judge.apply` and `runner.build_record` still store it for convenience. Report
+rows count `judge_disagreements` (`records.judge_disagrees`: the check and the judge both
+produced a verdict and they differ), shown in the `Judge≠check` column. The judge's own verdict
+stays in `judge.json` and in the record's `judge` block. `crucible run --dry-run` prints
+`check: <path>` or `check: none`, and the run skill adds `--judge` only for tasks without a
+check or when the user asks.
 
 ## Tokens and cost
 
@@ -140,6 +186,59 @@ Model matching (`pricing.match_model(model_id)`): exact ID, else the `pricing.ya
 whose ID is the longest prefix of `model_id` (handles date or variant suffixes), else
 unpriced. `cost_usd.reported` is whatever
 the `claude` CLI reported, kept for cross-checking.
+
+## Reports
+
+`crucible report` aggregates attempt records per config (`aggregate.summarize_config`),
+grouped by the `model:effort` label. Every number is recomputed from the records: cost from
+`tokens_by_model`, success from `compute_success`.
+
+**Success-rate interval.** Each row carries `success_ci`, the 95% Wilson score interval
+`[low, high]` of successes over attempts with a known result (null when there are none). With
+z = 1.96 and p = k/n: centre = (p + z²/2n) / (1 + z²/n), half = z·√(p(1−p)/n + z²/4n²) /
+(1 + z²/n), and the interval is centre ± half clamped to [0, 1]. Tables show it in the
+`Success rate` cell (`100% (44–100%)`) and recommendation evidence repeats it, so 3 passes out
+of 3 reads as "somewhere between 44% and 100%", not as certainty. Pure stdlib (`math.sqrt`).
+
+**Recommendation.** `aggregate.recommend` picks from per-config rows. A config qualifies with
+at least `min_attempts` (default 3) attempts of known result, a success rate of at least
+`threshold` (default 0.8) and a non-null `cost_per_success`. Qualifiers are ranked by
+`cost_per_success` (total priced cost of every attempt ÷ priced successes), then median wall
+time, then label; unknown values sort last. The question a recommendation answers is "what
+does a passing result cost", and failed attempts are part of that cost, so a config that is
+cheap per attempt but fails often can lose to a pricier one that passes every time.
+`median_cost` stays in the table. If nothing qualifies, `best_effort` is the highest success
+rate (ties by the same key). Evidence lines show the interval, median cost and cost per
+success.
+
+**Resolved models.** Rows are grouped by the `model:effort` label, never by `resolved_model`
+(errored attempts have none and must stay in their label's row). Each row lists
+`resolved_models`, the sorted distinct non-null `resolved_model` values. When there is more than
+one, the report prints `warning: <label> pools N models: a, b` after the table (on stderr with
+`--json`), because an alias such as `sonnet` can move to a newer model between batches.
+
+**Stopped attempts.** `stopped` counts attempts that a limit ended: `status` `timeout`, or
+`subtype` `error_max_turns` or `error_max_budget_usd`, or a check killed by `--check-timeout`
+(`check.timed_out`, additive and optional: older records read as not timed out; the attempt
+is otherwise an ordinary completion) (`aggregate.is_stopped`). The `Stopped`
+column follows `Unknown`. Stopped attempts still count as failures in the success rate (the
+config did not deliver), but the reader can see that a limit, not the model, ended them.
+`crucible run` caps each attempt at `--max-budget-usd` when the flag is given, else at the
+task's `max_budget_usd`, else at 5.0; `--dry-run` prints the effective cap and its source
+(`max budget per attempt: $1.25 (task)`). `crucible task new` templates show the field
+commented out.
+
+**Kind reports.** The cross-task report (`crucible report` without a task id) groups records
+by `task_kind`. Each kind prints the pooled per-config table (`configs`: every attempt in the
+kind, each row with `tasks`), but recommends only from `comparable`: rows aggregated over the
+kind's `common_tasks`, the task ids attempted by every config that has at least one attempt in
+that kind, so a config that only ran the easy task is not compared with one that ran them all.
+The text prints `Compared on N of M tasks attempted by every config` before the recommendation
+lines. With no common task (for example each config ran a different task) `comparable` is
+empty, the recommendation status is `no_common_tasks` with a null config, and the report says
+`Recommendation: none; no task was attempted by every config`. `--json` adds `common_tasks` and
+`comparable` to each kind; the recommendation's `evidence`, `runner_up` and `best_effort` are
+`comparable` rows.
 
 ## Mining
 
@@ -171,6 +270,7 @@ suites:                         # one per test stack; a repo may have several
     cwd: backend                # where setup and test commands run, relative to repo root
     setup: pip install -q -r requirements.txt   # optional
     test_command: python manage.py test {modules}
+    regression_command: python manage.py test   # optional; whole suite, no placeholders
     module_root: backend        # optional; enables {modules} (dotted paths, .py stripped)
     env: {DJANGO_SECRET_KEY: dummy-not-secret}   # names + dummy values only
   - name: frontend
@@ -185,12 +285,14 @@ max_changed_lines: 800
 Loaded and validated by `mine/config.py` (`load_config`, raising `MineConfigError` with one
 message per problem, each naming its field, e.g. `suites[0].test_command: required`).
 `test_command` must contain `{tests}` and/or `{modules}`; any other placeholder is an error, and
-`{modules}` needs `module_root`. `cwd` and `module_root` must stay inside the repo. `env`
-values longer than 7 characters whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
-`PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`, so `PATH` is fine) must
-start with `dummy`; and any value that is a URL with embedded credentials
-(`scheme://user:pass@host`) is rejected unless the password starts with `dummy` (guard against
-pasting real secrets). Unknown fields are errors (non-string keys are reported too).
+`{modules}` needs `module_root`. `regression_command` is optional, a plain command with no
+placeholders (`{tests}` or `{modules}` in it is an error). `cwd` and `module_root` must stay
+inside the repo. `env` values longer than 7 characters whose names contain `KEY`, `TOKEN`,
+`SECRET`, `PASSWORD`, `PASSWD`, `PRIVATE` or `CREDENTIAL` (or a whole `_`-separated word `PAT`,
+so `PATH` is fine) must start with `dummy`; and any value that is a URL with embedded
+credentials (`scheme://user:pass@host`) is rejected unless the password starts with `dummy`
+(guard against pasting real secrets). Unknown fields are errors (non-string keys are reported
+too).
 `exclude_paths` and `max_changed_lines` default to the values above when omitted.
 
 `detect_suites(repo_root)` looks in the repo root and one level down for pytest (`pytest.ini`,
@@ -202,6 +304,12 @@ Vitest and Jest (`package.json` dependencies), and returns suites with sensible 
 first `crucible mine` writes a commented `mine.yaml` saying it was auto-detected and must be
 checked (or, with nothing detected, a commented template with empty `suites`), prints the path
 and exits 0 without overwriting an existing file; an invalid file prints its errors and exits 1.
+Each detected stack gets a suggested `regression_command` (`config.suggest_regression`: pytest
+`python -m pytest -q`, Django `python manage.py test`, Vitest `npx vitest run`, Jest
+`npx jest`), written commented out under its suite with a note that it runs the whole suite at
+check time and that `prove` rejects a task whose regression fails at the merge commit (so
+pre-existing failures must be excluded or the line removed). Detected suites themselves keep an
+empty `regression_command`, so the written file loads back to exactly the detected suites.
 
 ### Candidates (`mine/candidates.py`)
 
@@ -210,7 +318,10 @@ and exits 0 without overwriting an existing file; an invalid file prints its err
 (added + deleted over every changed file), `counted_lines` (the same, skipping non-test files
 that match `exclude_paths`, so lockfiles, docs and generated files do not count; test files
 always count; this is what `max_changed_lines`/`--max-lines` is compared with, and the
-"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning the test files, config order; each test file is owned by the first suite whose `test_paths` match it; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional `url`, `labels`, `branch`, `issues`, `body`.
+"N lines changed (max M)" exclusion reason reports it), `suites` (names of the suites owning
+the test files, config order; each test file is owned by the first suite whose `test_paths`
+match it; JSON also keeps `suite`, the first entry), `suggested_kind`, `source`, and optional
+`url`, `labels`, `branch`, `issues`, `body`.
 File lists come from `git diff --name-status/--numstat -z --no-renames base merge` (a rename is a
 delete plus an add; binary files count 0 lines). Sources build candidates with `make_candidate`;
 `filter_candidates` applies the exclusions. `crucible mine --json` prints
@@ -240,8 +351,9 @@ local source; `--local` forces it.
 
 `crucible mine show <id> [--json]` prints one candidate (listed or excluded, either source) plus
 `test_diff` and `non_test_diff` (the diffs base->merge of its test and non-test files) and
-`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional subcommand (`show`, `scaffold`,
-`prove`, `leakcheck`) and shares `--branch --limit --max-lines --local --json` with it.
+`excluded` (reason or null). `--max-lines` must be at least 1. `mine` takes an optional
+subcommand (`show`, `scaffold`, `prove`, `leakcheck`) and shares
+`--branch --limit --max-lines --local --json` with it.
 
 ### Verification (`mine/verify.py`)
 
@@ -268,11 +380,12 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   fresh dir under `paths.work_dir()/mine/`, overlay the PR's test files at their merge versions
   (added and modified are written with their git mode, so `100755` stays executable and `120000`
   becomes a symlink; deleted are removed; a write whose parent directory is a symlink, or that
-  resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run `setup` (if any) in the suite `cwd`,
-  then the test command, which must exit non-zero. Then export merge to another fresh dir, setup,
-  same command, which must exit zero. Setup and tests run via `bash -c` in their own process
-  group, with `os.environ` plus the suite `env`, each step killed after `--timeout` seconds
-  (default 600). Dirs are removed afterwards unless `--keep`, which prints their paths.
+  resolves outside the workspace, is refused and rejects with `unsafe path (symlink)`), run
+  `setup` (if any) in the suite `cwd`, then the test command, which must exit non-zero. Then
+  export merge to another fresh dir, setup, same command, which must exit zero. Setup and tests
+  run via `bash -c` in their own process group, with `os.environ` plus the suite `env`, each
+  step killed after `--timeout` seconds (default 600). Dirs are removed afterwards unless
+  `--keep`, which prints their paths.
 - **Placeholders.** `{tests}`: runnable files relative to the suite `cwd`. `{modules}`: the same
   files relative to `module_root`, `.py` stripped, `/` turned into `.`. Each path is
   shell-quoted with `shlex.quote`. A suite with `module_root` rejects a candidate whose runnable
@@ -281,10 +394,13 @@ skipped (exit 1 after the others ran). A rejection is a normal outcome (exit 0).
   `setup failed at base|merge` (setup failing is never counted as "fails before"), `timeout`,
   `test outside module_root` or `no runnable tests`.
 - **Cache.** `<home>/mine/verify/<merge sha>.json` (outcome, reason, suite, `suite_hash`,
-  command, timings, log paths) with the step logs beside it (`<merge>.<base|merge>-<setup|test>.log`; with several suites `<merge>.<side>-<suite>-<setup|test>.log`).
-  An entry is reused only while the involved suites' settings are unchanged (one suite: its
-  `settings_hash()`, so older entries stay valid; several: a hash over every suite's hash); `--force` reruns. `timeout` and `setup failed at ...` are transient and never cached (the logs
-  are still written), so a rerun with a longer `--timeout` or fixed setup really runs.
+  command, timings, log paths) with the step logs beside it
+  (`<merge>.<base|merge>-<setup|test>.log`; with several suites
+  `<merge>.<side>-<suite>-<setup|test>.log`). An entry is reused only while the involved
+  suites' settings are unchanged (one suite: its `settings_hash()`, so older entries stay
+  valid; several: a hash over every suite's hash); `--force` reruns. `timeout` and
+  `setup failed at ...` are transient and never cached (the logs are still written), so a
+  rerun with a longer `--timeout` or fixed setup really runs.
 - The listing gets a `verified` column (`yes`, `no: <reason>`, blank) and a `verified` JSON field
   (the same string, or null) read from the cache.
 
@@ -303,7 +419,9 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   homes; `repo` from `task.repo_relative`, here the relative path from the task dir to the repo
   root, so it also works when the home is not inside the repo). Front matter: `id`, `kind`
   (given or suggested), `repo`, `ref` = base SHA, `source` (PR URL or `commit:<merge>`),
-  `timeout_minutes: 30`, `max_turns: 100`, `check: ./check.sh`, and `_(...)_` placeholders in the
+  `source_lines` (the candidate's counted lines, the same number the `max_changed_lines` filter
+  used; omitted when 0), `timeout_minutes: 30`, `max_turns: 100`, `check: ./check.sh`, and
+  `_(...)_` placeholders in the
   three sections, so an unedited task fails `crucible task validate`.
 - **`hidden_tests/`.** The PR's test files (all changed test files, runnable or not) at their
   merge versions at repo-relative paths (git modes kept: exec bit, symlinks; `check.sh`'s `tar`
@@ -313,26 +431,41 @@ An already-scaffolded candidate is excluded as "already mined", so it cannot be 
   in its own subshell (own `env` and `cwd`), printing `== suite <name> ==` before each. A setup
   failure exits 97 immediately; test failures are collected so every suite runs, and the
   script exits with the first failing code. `prove` is unchanged.
+- **Regression suite.** When a suite has `regression_command`, `check.sh` runs it after that
+  suite's PR tests, in the same `cwd` and `env`, printing `== regression <name> ==` first. Its
+  exit code is collected like a test failure (the script exits with the first failing code,
+  and every suite still runs); a setup failure still exits 97 before anything else. A
+  single-suite task without one still `exec`s its test command, byte for byte as before.
+  A regression that fails at the merge commit shows up in `prove` as `fails at merge`. At run
+  time the check is killed after `--check-timeout` (default 300 s, `prove` allows 600 s), so a
+  whole-suite regression must finish within it or the timeout must be raised; `prove` prints
+  the merge check's duration and warns when it exceeds the default.
 - **`check.sh`** (mode 755), generated from the suite, run by `checker.run_check` with the
   workspace as cwd and `CRUCIBLE_TASK_DIR` set (falls back to the script's own directory). It
   copies `hidden_tests/` (minus `DELETED`) over the workspace with `tar`, removes the `DELETED`
   paths, exports the suite `env`, `cd`s to the suite `cwd`, runs `setup` and then exec's the test
-  command, each via `bash -c '<quoted command>'`, with the `{tests}`/`{modules}` filled by
+  command (unless `regression_command` is set, in which case the test command runs via
+  `bash -c` with its exit code kept and the regression command follows), each via
+  `bash -c '<quoted command>'`, with the `{tests}`/`{modules}` filled by
   `verify.build_command` from `verify.runnable_files`, exactly what `--verify` ran. A failing
   setup prints `crucible-check: setup failed` and exits 97 (so `prove` never counts a broken
   install as "fails before"); a failed copy exits 98.
-- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`) records the merge
-  SHA deterministically. The workspace never contains `.crucible/`, so a hidden file in the task
-  dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only `task.md`.
+- **`.mine.json`** in the task dir (`id`, `base`, `merge`, `suite`, `suites`, `source`) records
+  the merge SHA deterministically. The workspace never contains `.crucible/`, so a hidden file
+  in the task dir does not leak. `task.md` only needs `source`; `mined_tasks` reads only
+  `task.md`.
 
 `crucible mine prove <task-dir> [--timeout S]` loads the finished task (so placeholders must be
 filled), exports `ref` with `workspace.export_tree` into a fresh dir under `paths.work_dir()/mine/`
 and runs the task's own `check.sh` through `checker.run_check`: it must fail. It then does the
 same on the merge commit, where it must pass. The merge SHA comes from `.mine.json`, else a
 `commit:` source, else (tasks without `.mine.json` and a PR-URL source) the verify cache entry
-whose `id` is the PR number in the URL and whose `base` equals `ref`. Prints `proven: <id>` and
-exits 0; otherwise prints `not proven: <id>: <reason>` and the last 40 log lines on stderr and
-exits 1. Reasons: `passes at base`, `fails at merge`, `setup failed at base|merge`,
+whose `id` is the PR number in the URL and whose `base` equals `ref`. Prints
+`proven: <id> (merge check 12.3s)` and exits 0, with `warning: merge check took 612.0s, over the
+default --check-timeout of 300s; raise --check-timeout when running this task` on stderr when
+the merge check outlasted `checker.DEFAULT_TIMEOUT_S`; otherwise prints
+`not proven: <id>: <reason>` and the last 40 log lines on stderr and exits 1. Reasons:
+`passes at base`, `fails at merge`, `setup failed at base|merge`,
 `check did not finish at base` (timeout). `task.py` accepts an optional `source:` string and
 exposes it as `Task.source`.
 

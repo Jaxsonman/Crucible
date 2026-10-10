@@ -54,6 +54,7 @@ def build_record(
         "schema_version": 1,
         "task_id": task.id,
         "task_kind": task.kind,
+        "task_source_lines": task.source_lines,
         "batch_id": batch_id,
         "attempt": attempt.n,
         "config": {"model": attempt.config.model, "effort": attempt.config.effort},

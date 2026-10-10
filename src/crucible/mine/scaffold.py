@@ -49,13 +49,21 @@ def _suite_prelude(suite: Suite) -> list[str]:
     return lines
 
 
+def _collect_rc() -> str:
+    """The shell line that keeps the first non-zero exit code of the last command (`$code`)."""
+    return '[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code'
+
+
 def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
     """The task's `check.sh`: self-contained, run with the workspace as cwd. It installs the
     hidden tests once, then for each suite runs exactly the setup and test command `verify`
     ran (`bash -c`, same placeholder filling, only that suite's runnable files). One suite
-    exec's its test command. Several suites each run in a subshell (own env and cwd); a setup
-    failure exits 97 at once, test failures are collected so every suite runs, and the script
-    exits with the first failing code."""
+    without a regression_command exec's its test command; with one, the test command runs via
+    `bash -c` with its exit code kept and the regression command follows. Several suites each
+    run in a subshell (own env and cwd); a setup failure exits 97 at once, test failures are
+    collected so every suite runs, and the script exits with the first failing code. A suite's
+    optional regression_command runs after its tests in the same cwd and env. A failed copy of
+    the hidden tests exits 98."""
     suites = verify.as_suites(suites)
     plan = verify.suite_plan_for(suites, runnable)
     names = ", ".join(repr(s.name) for s in suites)
@@ -81,7 +89,15 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
         if suite.setup:
             lines.append(f'bash -c {shlex.quote(suite.setup)} || {{ echo "{SETUP_FAILED}" >&2; '
                          f"exit {SETUP_EXIT}; }}")
-        lines.append(f"exec bash -c {shlex.quote(verify.build_command(suite, runnable))}")
+        test_cmd = verify.build_command(suite, runnable)
+        if not suite.regression_command:
+            lines.append(f"exec bash -c {shlex.quote(test_cmd)}")
+            return "\n".join(lines) + "\n"
+        lines.append(f"bash -c {shlex.quote(test_cmd)}; rc=$?")
+        lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+        lines.append(f"bash -c {shlex.quote(suite.regression_command)}; code=$?")
+        lines.append(_collect_rc())
+        lines.append('exit "$rc"')
         return "\n".join(lines) + "\n"
     lines.append("rc=0")
     for suite, files in plan:
@@ -92,7 +108,12 @@ def check_script(suites: Suite | list[Suite], runnable: list[str]) -> str:
                          f'echo {shlex.quote(f"{SETUP_FAILED} ({suite.name})")} >&2; exit {SETUP_EXIT}; }}')
         cmd = verify.build_command(suite, files)
         lines.append(f"( {pre}; bash -c {shlex.quote(cmd)} ); code=$?")
-        lines.append('[ "$code" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$code')
+        lines.append(_collect_rc())
+        if suite.regression_command:
+            lines.append(f"echo {shlex.quote(f'== regression {suite.name} ==')}")
+            lines.append(
+                f"( {pre}; bash -c {shlex.quote(suite.regression_command)} ); code=$?")
+            lines.append(_collect_rc())
     lines.append('exit "$rc"')
     return "\n".join(lines) + "\n"
 
@@ -131,7 +152,8 @@ def scaffold_task_dir(
     task_dir.mkdir()
     try:
         extra = (f"source: {json.dumps(c.source)}\n"
-                 f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
+                 + (f"source_lines: {c.size}\n" if c.size > 0 else "")
+                 + f"timeout_minutes: {DEFAULT_TIMEOUT_MINUTES}\nmax_turns: {DEFAULT_MAX_TURNS}\n")
         (task_dir / "task.md").write_text(
             repo_task_md(slug, repo_relative(repo.resolve(), task_dir), c.base,
                          kind or c.suggested_kind, extra),
@@ -157,6 +179,7 @@ class ProveResult:
     task_id: str
     failure: str = ""  # e.g. "passes at base"
     log: str = ""
+    merge_seconds: float | None = None  # how long the check took at the merge commit
 
     def tail(self) -> str:
         return "\n".join(self.log.rstrip("\n").splitlines()[-LOG_TAIL:])
@@ -219,7 +242,7 @@ def prove_task(task: Task, timeout: float = verify.DEFAULT_TIMEOUT_S) -> ProveRe
     if not after.passed:
         why = "setup failed at merge" if SETUP_FAILED in after.log else "fails at merge"
         return ProveResult(False, task.id, why, after.log)
-    return ProveResult(True, task.id)
+    return ProveResult(True, task.id, merge_seconds=after.seconds)
 
 
 __all__ = [

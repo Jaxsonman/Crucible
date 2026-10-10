@@ -236,3 +236,121 @@ def test_example_check_passes_on_correct_solution(crucible_home, tmp_path):
 def test_example_hidden_script_not_in_fixture():
     assert not (EXAMPLE / "fixture" / "hidden_test.py").exists()
     assert sys.version_info >= (3, 12)
+
+
+def criteria_body(criteria_text: str) -> str:
+    return f"\n## What\n\nDo it.\n\n## Why\n\nBecause.\n\n## Acceptance criteria\n\n{criteria_text}"
+
+
+def test_wrapped_bullet_is_one_criterion(crucible_home):
+    body = criteria_body(
+        "- `add` trims the title. An empty title\n"
+        "  raises `ValueError`.\n"
+        "- Second bullet\n"
+        "continues lazily here.\n"
+    )
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == [
+        "`add` trims the title. An empty title raises `ValueError`.",
+        "Second bullet continues lazily here.",
+    ]
+
+
+def test_nested_bullet_is_a_continuation(crucible_home):
+    body = criteria_body("- Parent text\n  - sub one\n  * sub two\n- Next\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["Parent text - sub one * sub two", "Next"]
+
+
+def test_tab_indented_bullet_stay_separate(crucible_home):
+    body = criteria_body("\t- a\n    - b\n")  # a tab counts as 4 columns
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["a", "b"]
+
+
+def test_sibling_indented_one_space_is_a_new_criterion(crucible_home):
+    body = criteria_body("- a\n - b\n- c\n")  # one space is not a nested level (needs 2)
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["a", "b", "c"]
+
+
+def test_blank_line_ends_a_bullet(crucible_home):
+    body = criteria_body("- First\n\n- Second\n  wrapped\n")
+    assert load_task(make_task(crucible_home, body=body)).criteria == ["First", "Second wrapped"]
+
+
+def test_text_before_first_bullet_is_error(crucible_home):
+    body = criteria_body("Some intro prose.\n- First\n")
+    with pytest.raises(TaskError, match="'## Acceptance criteria' has text outside bullets"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_text_after_blank_line_is_error(crucible_home):
+    body = criteria_body("- First\n\nA trailing paragraph.\n")
+    with pytest.raises(TaskError, match="text outside bullets"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_criteria_only_continuation_text_has_no_bullets(crucible_home):
+    body = criteria_body("  indented prose\n  more prose\n")
+    with pytest.raises(TaskError, match="has no bullet criteria"):
+        load_task(make_task(crucible_home, body=body))
+
+
+def test_committed_todo_list_criteria_are_whole():
+    t = load_task(REPO_ROOT / "tasks" / "todo-list")
+    assert len(t.criteria) == 6
+    assert t.criteria[0] == (
+        "`add` trims leading and trailing whitespace from the title. An empty or "
+        "whitespace-only title raises `ValueError`."
+    )
+    assert "- " + t.criteria[0] in build_prompt(t)
+
+
+def test_max_budget_usd_optional_positive_number(crucible_home):
+    assert load_task(make_task(crucible_home)).max_budget_usd is None
+    d = make_task(crucible_home, name="t2",
+                  front="id: t2\nkind: x\nrepo: fixture\nmax_budget_usd: 1.5")
+    assert load_task(d).max_budget_usd == 1.5
+    d = make_task(crucible_home, name="t3",
+                  front="id: t3\nkind: x\nrepo: fixture\nmax_budget_usd: 2")
+    assert load_task(d).max_budget_usd == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "lots", "true", ".nan", ".inf"])
+def test_max_budget_usd_must_be_positive_number(crucible_home, value):
+    d = make_task(crucible_home, front=f"id: t1\nkind: x\nrepo: fixture\nmax_budget_usd: {value}")
+    with pytest.raises(TaskError, match="max_budget_usd"):
+        load_task(d)
+
+
+def test_templates_show_commented_budget(crucible_home):
+    from crucible.task import repo_task_md
+
+    assert main(["task", "new", "demo"]) == 0
+    assert "# max_budget_usd:" in (crucible_home / "tasks" / "demo" / "task.md").read_text()
+    assert "# max_budget_usd:" in repo_task_md("x", "../..", "abc123")
+
+
+def test_source_lines_optional_positive_int(crucible_home):
+    assert load_task(make_task(crucible_home)).source_lines is None
+    front = "id: t2\nkind: x\nrepo: fixture\nsource_lines: 120"
+    d = make_task(crucible_home, name="t2", front=front)
+    assert load_task(d).source_lines == 120
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "many", "true", "1.5"])
+def test_source_lines_must_be_positive_int(crucible_home, value):
+    d = make_task(crucible_home, front=f"id: t1\nkind: x\nrepo: fixture\nsource_lines: {value}")
+    with pytest.raises(TaskError, match="source_lines"):
+        load_task(d)
+
+
+def test_uniformly_indented_bullets_are_separate_criteria(crucible_home):
+    body = criteria_body("  - First\n  - Second\n    wrapped\n  * Third\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["First", "Second wrapped", "Third"]
+
+
+def test_nested_bullet_under_indented_parent_still_joins(crucible_home):
+    body = criteria_body("  - Parent\n    - sub one\n  - Next\n")
+    t = load_task(make_task(crucible_home, body=body))
+    assert t.criteria == ["Parent - sub one", "Next"]

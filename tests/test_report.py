@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import yaml
 
 from crucible import aggregate
@@ -10,7 +11,8 @@ M = 1_000_000
 
 def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:medium", n=1,
                 success=True, wall=10.0, tokens_by_model=None, sha="sha-one", kind="feature",
-                computed=999.0):
+                computed=999.0, check=None, judge=None, resolved_model=None, status="completed",
+                subtype="success", check_timed_out=False):
     model, effort = config.split(":")
     slug = f"{model}-{effort}-{n}"
     d = home / "results" / task / batch / slug
@@ -18,13 +20,20 @@ def make_record(home, task="t1", batch="20261001T000000Z-aaaa", config="sonnet:m
     tbm = tokens_by_model or {"claude-sonnet-5-5": {"input": M}}
     tbm = {m: {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0, **t}
            for m, t in tbm.items()}
+    if check is None:  # reports recompute success from the check, so derive it from `success`
+        check = {"ran": success is not None, "passed": success,
+                 "exit_code": None if success is None else (0 if success else 1)}
+        if check_timed_out:  # a killed check has no exit code
+            check.update(passed=False, exit_code=None, timed_out=True)
     rec = {
         "schema_version": 1, "task_id": task, "task_kind": kind, "batch_id": batch, "attempt": n,
         "config": {"model": model, "effort": effort}, "prompt_sha256": sha,
-        "wall_seconds": wall, "status": "completed",
+        "resolved_model": resolved_model, "wall_seconds": wall, "status": status,
+        "subtype": subtype,
         "tokens": {"input": sum(t["input"] for t in tbm.values()), "output": 0,
                    "cache_creation": 0, "cache_read": 0},
         "tokens_by_model": tbm, "cost_usd": {"computed": computed, "reported": 0.0},
+        "check": check, "judge": judge or {"ran": False, "passed": None},
         "success": success,
     }
     (d / "record.json").write_text(json.dumps(rec))
@@ -71,13 +80,13 @@ def test_two_configs_three_attempts(crucible_home, capsys):
     assert [r["Config"] for r in rows] == ["sonnet:medium", "opus:high"]
     s, o = rows
     assert (s["Attempts"], s["Successes"], s["Unknown"], s["Unpriced"]) == ("3", "2", "0", "0")
-    assert s["Success rate"] == "67%"
+    assert s["Success rate"] == "67% (21–94%)"
     assert s["Median time (s)"] == "20.0" and s["Time range (s)"] == "10.0–30.0"
     assert s["Median tokens"] == "2,000,000"
     assert s["Median cost"] == "$4.0000"
     assert s["Cost/success"] == "$6.0000"  # (2+4+6) / 2 successes
     assert (o["Attempts"], o["Successes"]) == ("3", "0")
-    assert o["Success rate"] == "0%"
+    assert o["Success rate"] == "0% (0–56%)"
     assert o["Median time (s)"] == "30.0" and o["Time range (s)"] == "10.0–40.0"
     assert o["Median tokens"] == "2,000,000"
     assert o["Median cost"] == "$8.0000"
@@ -128,7 +137,7 @@ def test_unknown_success_rate(crucible_home, capsys):
     assert h["Success rate"] == "—" and h["Unknown"] == "3" and h["Successes"] == "0"
     assert h["Cost/success"] == "—"
     s = rows["sonnet:low"]
-    assert s["Success rate"] == "50%" and s["Unknown"] == "1" and s["Attempts"] == "3"
+    assert s["Success rate"] == "50% (9–91%)" and s["Unknown"] == "1" and s["Attempts"] == "3"
 
 
 def test_unpriced_excluded_from_cost(crucible_home, capsys):
@@ -221,18 +230,125 @@ def test_json_matches_table(crucible_home, capsys):
     rows = parse_table(out)
     assert rows[0]["Median cost"] == f"${s['median_cost']:.4f}"
     assert rows[0]["Cost/success"] == f"${s['cost_per_success']:.4f}"
-    assert rows[0]["Success rate"] == f"{s['success_rate']:.0%}"
+    assert rows[0]["Success rate"] == f"{s['success_rate']:.0%} (21–94%)"
+    assert s["success_ci"] == pytest.approx([0.2076549551264879, 0.9385096847238394])
+    assert o["success_ci"] == pytest.approx([0.0, 0.5615060804490177])
     assert rows[1]["Median cost"] == f"${o['median_cost']:.4f}"
 
 
 def test_sort_by_rate_then_cost():
     def rec(cfg, ok, inp):
         m, e = cfg.split(":")
-        return {"config": {"model": m, "effort": e}, "success": ok, "wall_seconds": 1.0,
-                "tokens_by_model": sonnet(inp)}
+        return {"config": {"model": m, "effort": e}, "status": "completed",
+                "check": {"ran": ok is not None, "passed": ok}, "success": ok,
+                "wall_seconds": 1.0, "tokens_by_model": sonnet(inp)}
 
     recs = [rec("a:low", True, 3 * M), rec("b:low", True, M), rec("c:low", False, M),
             rec("d:low", None, M)]
     order = [r["config"] for r in aggregate.aggregate_configs(recs)]
     assert order == ["b:low", "a:low", "c:low", "d:low"]
 
+
+
+def test_success_recomputed_check_decides_and_disagreement_counted(crucible_home, capsys):
+    passed = {"ran": True, "passed": True, "exit_code": 0}
+    # stored success=False is what the old AND rule wrote; the report must ignore it
+    make_record(crucible_home, n=1, success=False, check=passed,
+                judge={"ran": True, "passed": False})
+    make_record(crucible_home, n=2, success=True, check=passed, judge={"ran": True, "passed": True})
+    make_record(crucible_home, n=3, success=False,
+                check={"ran": False, "passed": None, "exit_code": None},
+                judge={"ran": True, "passed": False})
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Successes"] == "2" and row["Unknown"] == "0" and row["Attempts"] == "3"
+    assert row["Judge≠check"] == "1"
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    (cfg,) = json.loads(jout)["configs"]
+    assert cfg["judge_disagreements"] == 1 and cfg["successes"] == 2
+
+
+@pytest.mark.parametrize("k,n,low,high", [
+    (3, 3, 0.43849391955098227, 1.0),
+    (2, 3, 0.2076549551264879, 0.9385096847238394),
+    (1, 1, 0.20654329147389294, 1.0),
+    (0, 1, 0.0, 0.7934567085261071),
+    (4, 5, 0.3755282641185388, 0.9637768390302125),
+])
+def test_wilson_interval(k, n, low, high):
+    lo, hi = aggregate.wilson_interval(k, n)
+    assert lo == pytest.approx(low) and hi == pytest.approx(high)
+    assert 0.0 <= lo <= k / n <= hi <= 1.0
+
+
+def test_wilson_interval_empty_is_none():
+    assert aggregate.wilson_interval(0, 0) is None
+
+
+def test_single_attempt_shows_wide_interval(crucible_home, capsys):
+    make_record(crucible_home, config="sonnet:low", n=1, success=True)
+    make_record(crucible_home, config="opus:low", n=1, success=False)
+    make_record(crucible_home, config="haiku:low", n=1, success=None)
+    _, out, _ = run_report(capsys, "t1")
+    rows = {r["Config"]: r for r in parse_table(out)}
+    assert rows["sonnet:low"]["Success rate"] == "100% (21–100%)"
+    assert rows["opus:low"]["Success rate"] == "0% (0–79%)"
+    assert rows["haiku:low"]["Success rate"] == "—"
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    by = {c["config"]: c for c in json.loads(jout)["configs"]}
+    assert by["haiku:low"]["success_ci"] is None
+    assert by["sonnet:low"]["success_ci"][1] == 1.0
+
+
+def test_label_pooling_several_models_warns(crucible_home, capsys):
+    make_record(crucible_home, config="sonnet:low", n=1, resolved_model="claude-sonnet-5-5")
+    make_record(crucible_home, config="sonnet:low", n=2, resolved_model="claude-sonnet-5-6")
+    make_record(crucible_home, config="sonnet:low", n=3, resolved_model=None, status="error",
+                success=False)
+    make_record(crucible_home, config="opus:high", n=1, resolved_model="claude-opus-5-5")
+    _, out, _ = run_report(capsys, "t1")
+    rows = {r["Config"]: r for r in parse_table(out)}
+    assert set(rows) == {"sonnet:low", "opus:high"}  # the errored attempt forms no group
+    assert rows["sonnet:low"]["Attempts"] == "3"
+    warnings = [ln for ln in out.splitlines() if ln.startswith("warning:")]
+    assert warnings == [
+        "warning: sonnet:low pools 2 models: claude-sonnet-5-5, claude-sonnet-5-6"
+    ]
+    assert out.index("warning:") > out.rindex("|")
+    _, jout, err = run_report(capsys, "t1", "--json")
+    by = {c["config"]: c for c in json.loads(jout)["configs"]}
+    assert by["sonnet:low"]["resolved_models"] == ["claude-sonnet-5-5", "claude-sonnet-5-6"]
+    assert by["opus:high"]["resolved_models"] == ["claude-opus-5-5"]
+    assert "warning: sonnet:low pools 2 models" in err
+    _, out, _ = run_report(capsys)  # cross-task report warns too
+    assert "warning: sonnet:low pools 2 models" in out
+
+
+def test_check_timeout_counts_as_stopped_and_failed(crucible_home, capsys):
+    make_record(crucible_home, n=1, success=True)
+    make_record(crucible_home, n=2, success=False, check_timed_out=True)  # ordinary completion
+    make_record(crucible_home, n=3, success=False)  # plain failure, no timed_out key at all
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Stopped"] == "1" and row["Attempts"] == "3" and row["Successes"] == "1"
+    assert row["Success rate"].startswith("33% ")
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    assert json.loads(jout)["configs"][0]["stopped"] == 1
+
+
+def test_stopped_column(crucible_home, capsys):
+    make_record(crucible_home, n=1, success=True)
+    make_record(crucible_home, n=2, success=False, status="timeout", subtype=None)
+    make_record(crucible_home, n=3, success=False, status="error", subtype="error_max_turns")
+    make_record(crucible_home, n=4, success=False, status="error",
+                subtype="error_max_budget_usd")
+    make_record(crucible_home, n=5, success=False, status="error", subtype=None)  # crash
+    _, out, _ = run_report(capsys, "t1")
+    (row,) = parse_table(out)
+    assert row["Stopped"] == "3" and row["Attempts"] == "5" and row["Successes"] == "1"
+    assert row["Success rate"].startswith("20% ")  # stopped attempts still count as failures
+    header_line = next(ln for ln in out.splitlines() if ln.startswith("|"))
+    header = [c.strip() for c in header_line.strip("|").split("|")]
+    assert header.index("Stopped") == header.index("Unknown") + 1
+    _, jout, _ = run_report(capsys, "t1", "--json")
+    assert json.loads(jout)["configs"][0]["stopped"] == 3
