@@ -34,7 +34,7 @@ build-backend = "hatchling.build"
 packages = ["src/crucible"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.5"]
+dev = ["pytest>=8", "ruff>=0.17.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
