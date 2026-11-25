@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 requires-python = ">=3.12"
-dependencies = ["pyyaml>=6"]
+dependencies = ["pyyaml>=6.0.4"]
 
 [project.urls]
 Homepage = "https://github.com/Jaxsonman/Crucible"
